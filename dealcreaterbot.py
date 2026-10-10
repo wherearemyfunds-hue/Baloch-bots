@@ -524,16 +524,11 @@ async def xxin_spam_delete_handler(event):
         sender = await event.get_sender()
         if not sender:
             return
-        # Don't delete our own messages or other bots we manage
-        if getattr(sender, 'bot', False):
-            bot_username = (getattr(sender, 'username', '') or '').lower()
-            # Still delete xxin bots even if they're bots
-            if not SPAM_NAME_PATTERN.search(bot_username):
-                return
         username = (getattr(sender, 'username', '') or '')
         first_name = getattr(sender, 'first_name', '') or ''
         last_name = getattr(sender, 'last_name', '') or ''
         full_name = f"{first_name} {last_name}".strip()
+        # Check BOTH username and display name for xxin (bots often hide it in name)
         if SPAM_NAME_PATTERN.search(username) or SPAM_NAME_PATTERN.search(full_name):
             await event.delete()
             logger.info(
