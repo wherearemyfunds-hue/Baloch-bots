@@ -93,6 +93,10 @@ NEW_SESSION = os.path.join(BASE_DIR, "escrow_new_user_session")
 OLD_SESSION = os.path.join(BASE_DIR, "escrow_old_user_session")
 BOT_SESSION = os.path.join(BASE_DIR, "escrow_bot_session")
 USERS_FILE = os.path.join(BASE_DIR, "known_users.json")
+
+# Global flag: True if the NEW user client session is valid and can create groups.
+# Set during startup; when False the bot still responds but group creation is unavailable.
+USER_CLIENT_AVAILABLE = False
 BROADCAST_SENT_FILE = os.path.join(BASE_DIR, "broadcast_sent.json")
 BROADCAST_TRIGGER_FILE = os.path.join(BASE_DIR, "TRIGGER_BROADCAST")
 BROADCAST_BOT_SENT_FILE = os.path.join(BASE_DIR, "broadcast_bot_sent.json")
@@ -559,6 +563,19 @@ async def group_link_handler(event):
     """
     user_id = event.sender_id
     logger.info(f"Group creation requested by user {user_id}")
+
+    # If the user-client session is invalid, explain instead of failing silently.
+    if not USER_CLIENT_AVAILABLE:
+        try:
+            await event.answer(
+                "⚠️ Group creation is temporarily unavailable (account session expired). "
+                "Please contact the admin to refresh it. The bot will still answer other commands.",
+                alert=True,
+            )
+        except Exception:
+            pass
+        return
+
     try:
         _sender2 = await event.get_sender()
         record_user(user_id, getattr(_sender2, "username", None))
@@ -832,18 +849,23 @@ async def main():
     bot_me = await bot_client.get_me()
     logger.info(f"Bot started: @{bot_me.username} (ID: {bot_me.id})")
 
-    # Connect NEW account (fail fast - no interactive prompts on server)
+    # Connect NEW account (graceful degradation: bot responds but group creation
+    # is unavailable until the session is refreshed)
+    global USER_CLIENT_AVAILABLE
+    USER_CLIENT_AVAILABLE = False
     await user_client.connect()
     if not await user_client.is_user_authorized():
         logger.critical(
-            "NEW account session not authorized. Refresh '%s.session' from an "
-            "interactive machine and copy it here. Refusing to start.",
+            "NEW account session NOT authorized - bot will run in LIMITED mode. "
+            "It will respond to messages but CANNOT create groups. To restore, refresh "
+            "'%s.session' via interactive login and restart.",
             NEW_SESSION,
         )
-        sys.exit(1)
-    new_me = await user_client.get_me()
-    logger.info(f"NEW account: @{new_me.username} (ID: {new_me.id}) - creates groups")
-    _chmod_600(NEW_SESSION + ".session")
+    else:
+        USER_CLIENT_AVAILABLE = True
+        new_me = await user_client.get_me()
+        logger.info(f"NEW account: @{new_me.username} (ID: {new_me.id}) - creates groups")
+        _chmod_600(NEW_SESSION + ".session")
 
     # Connect OLD account (graceful degradation: bot runs without it,
     # but groups will miss the original-account admin until re-authorized)
