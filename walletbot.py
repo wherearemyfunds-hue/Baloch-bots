@@ -102,6 +102,7 @@ def admin_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="💰 My Balance", callback_data="u_balance")],
         [InlineKeyboardButton(text="💸 Send (Admin)", callback_data="w_send")],
         [InlineKeyboardButton(text="👥 Users", callback_data="a_users")],
+        [InlineKeyboardButton(text="🤝 Deal Funds", callback_data="a_deals")],
     ])
 
 
@@ -171,6 +172,84 @@ async def cb_a_users(callback: types.CallbackQuery):
     await callback.message.answer("\n".join(lines), parse_mode="HTML")
 
 
+@dp.callback_query(F.data == "a_deals")
+async def cb_a_deals(callback: types.CallbackQuery):
+    """Show all deal escrow addresses with balances (admin only)."""
+    await callback.answer("Loading...")
+    if not _is_admin(callback.from_user.id):
+        return
+    import json
+    loop = asyncio.get_event_loop()
+    def _load():
+        try:
+            with open("/root/deal_states.json") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    states = await loop.run_in_executor(None, _load)
+    deals = [(cid, s) for cid, s in states.items() if s.get("tron_deposit_address")]
+    if not deals:
+        await callback.message.answer("🤝 No deal escrow addresses yet.")
+        return
+    lines = ["🤝 <b>Deal Escrow Funds</b>\n"]
+    kb_rows = []
+    for cid, s in deals[-10:]:  # last 10
+        addr = s["tron_deposit_address"]
+        bal = await loop.run_in_executor(None, tron_pay.get_usdt_balance, addr)
+        stage = s.get("stage", "?")
+        lines.append(f"• Chat {cid} — <b>{bal:.2f}</b> USDT ({stage})\n  <code>{addr}</code>")
+        if bal > 0.01:
+            kb_rows.append([InlineKeyboardButton(
+                text=f"💸 Withdraw {bal:.2f} from {cid}",
+                callback_data=f"deal_wd_{cid}")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
+    await callback.message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("deal_wd_"))
+async def cb_deal_withdraw(callback: types.CallbackQuery):
+    """Start manual withdraw from a deal address (admin only)."""
+    await callback.answer()
+    if not _is_admin(callback.from_user.id):
+        return
+    chat_id = callback.data[len("deal_wd_"):]
+    user_state[callback.from_user.id] = {"step": "deal_withdraw", "deal_chat_id": chat_id}
+    await callback.message.answer(
+        f"💸 <b>Withdraw from Deal {chat_id}</b>\n\nSend the destination TRON address:",
+        parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("deal_wd_confirm_"))
+async def cb_deal_wd_confirm(callback: types.CallbackQuery):
+    await callback.answer()
+    if not _is_admin(callback.from_user.id):
+        return
+    uid = callback.from_user.id
+    st = user_state.get(uid, {})
+    if callback.data == "deal_wd_confirm_no":
+        user_state.pop(uid, None)
+        await callback.message.answer("❌ Cancelled.", reply_markup=admin_menu())
+        return
+    await callback.message.answer("⏳ Broadcasting...")
+    loop = asyncio.get_event_loop()
+    def _do():
+        pk = tron_pay.get_user_private_key(st["hd_index"])
+        return tron_pay.send_usdt_from(pk, st["address"], st["amount"])
+    result = await loop.run_in_executor(None, _do)
+    user_state.pop(uid, None)
+    if result.get("ok"):
+        txid = result.get("txid", "")
+        await callback.message.answer(
+            f"✅ <b>Withdrawn!</b>\n\nTxID: <code>{txid}</code>\n"
+            f"https://tronscan.org/#/transaction/{txid}",
+            parse_mode="HTML", reply_markup=admin_menu())
+    else:
+        await callback.message.answer(
+            f"❌ Failed: {result.get('error', '?')}\n\n"
+            f"Tip: deal address needs TRX for gas!",
+            parse_mode="HTML", reply_markup=admin_menu())
+
+
 @dp.callback_query(F.data == "w_send")
 async def cb_send(callback: types.CallbackQuery):
     await callback.answer()
@@ -222,6 +301,51 @@ async def handle_text(message: types.Message):
         user_state.pop(uid, None)
         return
     text = message.text.strip()
+    if st["step"] == "deal_withdraw":
+        # Step 1: get destination address for deal withdraw
+        if not (text.startswith("T") and len(text) == 34):
+            await message.answer("❌ Invalid TRON address. Try again:")
+            return
+        st["address"] = text
+        st["step"] = "deal_withdraw_amount"
+        await message.answer("💰 Send the amount in USDT (or 'max' for full balance):")
+        return
+    if st["step"] == "deal_withdraw_amount":
+        import json
+        loop = asyncio.get_event_loop()
+        def _load():
+            try:
+                with open("/root/deal_states.json") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        states = await loop.run_in_executor(None, _load)
+        deal = states.get(st["deal_chat_id"], {})
+        deal_addr = deal.get("tron_deposit_address", "")
+        hd_index = deal.get("tron_hd_index")
+        if text.lower() == "max":
+            bal = await loop.run_in_executor(None, tron_pay.get_usdt_balance, deal_addr)
+            # Leave a tiny bit for safety, withdraw almost all
+            amt = round(bal - 0.01, 2) if bal > 0.01 else 0
+        else:
+            try:
+                amt = float(text)
+                if amt <= 0:
+                    raise ValueError
+            except ValueError:
+                await message.answer("❌ Invalid amount. Try again (or 'max'):")
+                return
+        st["amount"] = amt
+        st["deal_addr"] = deal_addr
+        st["hd_index"] = hd_index
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Confirm", callback_data="deal_wd_confirm_yes")],
+            [InlineKeyboardButton(text="❌ Cancel", callback_data="deal_wd_confirm_no")],
+        ])
+        await message.answer(
+            f"Confirm withdraw from deal:\n\n<b>{amt} USDT</b>\nFrom: <code>{deal_addr}</code>\nTo: <code>{st['address']}</code>",
+            parse_mode="HTML", reply_markup=kb)
+        return
     if st["step"] == "address":
         if not (text.startswith("T") and len(text) == 34):
             await message.answer("❌ Invalid TRON address. Try again:")
