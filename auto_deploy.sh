@@ -15,14 +15,14 @@ fi
 
 cd "$REPO_DIR" || exit 1
 
-# Naya code check karo
+# Naya code check karo (reset --hard taake local changes kabhi block na karein)
 git fetch origin main 2>/dev/null
 LOCAL=$(git rev-parse HEAD)
 REMOTE=$(git rev-parse origin/main)
 
 if [ "$LOCAL" != "$REMOTE" ]; then
   echo "[$(date)] New code found! Deploying..."
-  git pull origin main || { echo "Pull failed!"; exit 1; }
+  git reset --hard origin/main || { echo "Reset failed!"; exit 1; }
 
   # Deal Manager Bot
   cp dealmanagerbot.py /root/dealmanagerbot.py
