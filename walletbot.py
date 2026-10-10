@@ -241,7 +241,7 @@ async def cb_a_deals(callback: types.CallbackQuery):
     await callback.message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb)
 
 
-@dp.callback_query(F.data.startswith("deal_wd_"))
+@dp.callback_query(F.data.startswith("deal_wd_") & ~F.data.startswith("deal_wd_confirm_"))
 async def cb_deal_withdraw(callback: types.CallbackQuery):
     """Start manual withdraw from a deal address (admin only)."""
     await callback.answer()
