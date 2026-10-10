@@ -57,6 +57,15 @@ CRYPTOMUS_PAYMENT_API_KEY = os.environ.get("CRYPTOMUS_PAYMENT_API_KEY", "").stri
 CRYPTOMUS_PAYOUT_API_KEY = os.environ.get("CRYPTOMUS_PAYOUT_API_KEY", "").strip()
 CRYPTOMUS_API_BASE = "https://api.cryptomus.com/v1"
 
+# --- Direct TRON (USDT TRC20) — zero platform fee, only TRX gas ---
+USE_TRON = os.environ.get("USE_TRON", "false").lower() == "true"
+TRON_PRIVATE_KEY = os.environ.get("TRON_PRIVATE_KEY", "").strip()
+try:
+    import tron_pay  # noqa: F401
+    TRON_AVAILABLE = True
+except ImportError:
+    TRON_AVAILABLE = False
+
 # Payment addresses (displayed as reference in messages)
 BEP20_ADDRESS = "0xf1a0fade24678e3331eaf915840cc6cf6a831d80"
 TRC20_ADDRESS = "TV1ddqZd6KeiMc1AKpDkqDf5hcAgSiWo6t"
@@ -974,6 +983,83 @@ async def schedule_deadline_reminder(chat_id: int):
 # ==============================================
 
 async def show_payment_info(chat_id: int):
+    """Create payment info — TRON direct (zero fee) or Cryptomus invoice."""
+    if USE_TRON and TRON_AVAILABLE and TRON_PRIVATE_KEY:
+        await show_payment_info_tron(chat_id)
+        return
+    await show_payment_info_cryptomus(chat_id)
+
+
+async def show_payment_info_tron(chat_id: int):
+    """Show TRON USDT (TRC20) deposit address — zero platform fee."""
+    import tron_pay
+    state = deal_states[chat_id]
+    buyer_amount = state["buyer_amount"]
+    seller_amount = state["seller_amount"]
+    fee = state["fee"]
+
+    deposit_address = tron_pay.generate_deposit_address(str(chat_id))
+    state["tron_deposit_address"] = deposit_address
+    state["payment_order_id"] = f"tron-{abs(chat_id)}-{int(time.time())}"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Money Received (Admin Only)", callback_data="admin_confirm")]
+    ])
+
+    payment_msg = (
+        f"<b>PAYMENT INFORMATION</b>\n"
+        f"{'=' * 30}\n\n"
+        f"Buyer needs to pay: <b>{buyer_amount} USDT</b> (TRC20)\n"
+        f"Seller will receive: <b>{seller_amount} USDT</b>\n"
+        f"Escrow Fee: <b>{fee} USDT</b>\n\n"
+        f"<b>Baloch Escrow fee: 3% (minimum $3)</b>\n\n"
+        f"Send <b>exactly {buyer_amount} USDT</b> (TRC20) to:\n"
+        f"<code>{deposit_address}</code>\n\n"
+        f"⚡ <b>Zero platform fee</b> — only TRON network fee (~$0.30)!\n\n"
+        f"Payment will be <b>automatically detected</b> once confirmed on TRON.\n\n"
+        f"{'=' * 30}\n\n"
+        f"<i>Admin: tap the button or reply <b>received</b> to confirm manually if needed.</i>"
+    )
+    await bot.send_message(chat_id, payment_msg, parse_mode="HTML", reply_markup=kb)
+
+    state["stage"] = "payment_monitoring"
+    state["payment_start_time"] = time.time()
+    if chat_id in payment_monitoring_tasks:
+        payment_monitoring_tasks[chat_id].cancel()
+    task = asyncio.create_task(tron_payment_monitoring(chat_id, deposit_address, buyer_amount, duration_minutes=120))
+    payment_monitoring_tasks[chat_id] = task
+
+
+async def tron_payment_monitoring(chat_id: int, address: str, expected: float, duration_minutes: int = 120):
+    """Monitor TRON blockchain for USDT deposit."""
+    import tron_pay
+    import asyncio as aio
+    state = deal_states.get(chat_id)
+    if not state:
+        return
+    # Run blocking wait in thread to avoid blocking event loop
+    loop = aio.get_event_loop()
+    result = await loop.run_in_executor(
+        None,
+        lambda: tron_pay.wait_for_deposit(address, expected, timeout_sec=duration_minutes * 60, poll_interval=15),
+    )
+    state = deal_states.get(chat_id)
+    if not state or state.get("stage") != "payment_monitoring":
+        return
+    if result.get("ok"):
+        logger.info(f"TRON deposit detected for chat {chat_id}: {result['amount']} USDT")
+        expected = state.get("buyer_amount", 0)
+        shortfall = round(expected - result["amount"], 2)
+        await handle_payment_detected(chat_id, result["amount"], max(shortfall, 0))
+    else:
+        await bot.send_message(
+            chat_id,
+            "⏰ Payment timeout (120 min). If you already sent USDT, contact admin.",
+            parse_mode="HTML",
+        )
+
+
+async def show_payment_info_cryptomus(chat_id: int):
     """Create Cryptomus invoice and show payment information (text-based, no buttons)."""
     state = deal_states[chat_id]
     buyer_amount = state["buyer_amount"]
@@ -1045,6 +1131,32 @@ async def show_payment_info(chat_id: int):
 # ==============================================
 
 async def payout_to_seller(address: str, address_type: str, network: str, amount: float, chat_id: int) -> tuple[bool, str]:
+    """Process automatic payout — TRON direct (zero fee) or Cryptomus."""
+    if USE_TRON and TRON_AVAILABLE and TRON_PRIVATE_KEY:
+        return await payout_via_tron(address, amount, chat_id)
+    return await payout_via_cryptomus(address, address_type, network, amount, chat_id)
+
+
+async def payout_via_tron(address: str, amount: float, chat_id: int) -> tuple[bool, str]:
+    """Send USDT (TRC20) directly via TRON — only gas fee applies."""
+    import tron_pay
+    try:
+        # Basic TRON address validation
+        if not (address.startswith("T") and len(address) == 34):
+            return False, "Invalid TRON address. Must start with T (TRC20)."
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: tron_pay.send_usdt(address, amount))
+        if result.get("ok"):
+            txid = result.get("txid", "")
+            logger.info(f"TRON payout: {amount} USDT -> {address}, txid={txid}")
+            return True, f"Payout successful!\nTx ID: {txid}\nView: https://tronscan.org/#/transaction/{txid}"
+        return False, f"TRON payout failed: {result.get('error', 'unknown')}"
+    except Exception as e:
+        logger.error(f"TRON payout error: {e}")
+        return False, f"Withdrawal error: {str(e)}"
+
+
+async def payout_via_cryptomus(address: str, address_type: str, network: str, amount: float, chat_id: int) -> tuple[bool, str]:
     """Process automatic payout to seller via Cryptomus Payout API."""
     try:
         if address_type not in ("TRC20", "BEP20"):

@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""
+Direct TRON USDT (TRC20) payments — no middleman, no platform fee.
+Uses TronGrid public API + tronpy for signing.
+Only TRON gas fee applies (~$0.30-2.00 per tx).
+"""
+import logging
+import os
+import time
+
+import requests
+from tronpy import Tron
+from tronpy.keys import PrivateKey
+
+logger = logging.getLogger("tron_pay")
+
+# USDT TRC20 contract (mainnet)
+USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+TRONGRID_API = "https://api.trongrid.io"
+# USDT has 6 decimals
+USDT_DECIMALS = 6
+
+_client = None
+_master_key = None
+
+
+def _get_client() -> Tron:
+    global _client
+    if _client is None:
+        _client = Tron(network="mainnet")
+    return _client
+
+
+def _get_master_key() -> PrivateKey:
+    """Load the hot wallet private key from env (never hardcoded)."""
+    global _master_key
+    if _master_key is None:
+        hex_key = os.environ.get("TRON_PRIVATE_KEY", "").strip()
+        if not hex_key:
+            raise RuntimeError("TRON_PRIVATE_KEY not set in environment")
+        # Support 0x prefix or raw hex
+        if hex_key.startswith("0x"):
+            hex_key = hex_key[2:]
+        _master_key = PrivateKey(bytes.fromhex(hex_key))
+    return _master_key
+
+
+def get_hot_wallet_address() -> str:
+    """Return the main hot wallet TRON address."""
+    return _get_master_key().public_key.to_base58check_address()
+
+
+def generate_deposit_address(deal_id: str) -> str:
+    """
+    Generate a unique deposit address per deal.
+    Uses HD derivation from master key: m/44'/195'/0'/0/{index}
+    where index is derived from deal_id hash for determinism.
+    For simplicity v1: derive from deal_id via tronpy HD wallet if seed available,
+    else fall back to hot wallet address with deal memo tracking.
+
+    NOTE: tronpy PrivateKey from raw hex doesn't support HD derivation directly.
+    v1 uses the hot wallet address for all deposits and tracks by amount+deal_id.
+    v2 can upgrade to xpub-based unique addresses.
+    """
+    # v1: single hot wallet address, deposits tracked by expected amount
+    # This is simple and reliable. Unique addresses come in v2.
+    return get_hot_wallet_address()
+
+
+def get_usdt_balance(address: str) -> float:
+    """Get USDT (TRC20) balance for an address via TronGrid."""
+    try:
+        # Use TronGrid account info
+        resp = requests.get(
+            f"{TRONGRID_API}/v1/accounts/{address}",
+            params={"only_confirmed": "true"},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            logger.warning(f"TronGrid balance check failed: {resp.status_code}")
+            return 0.0
+        data = resp.json().get("data", [{}])[0]
+        for token in data.get("trc20", []):
+            # token is like {"TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t": "150000000"}
+            if USDT_CONTRACT in token:
+                raw = int(token[USDT_CONTRACT])
+                return raw / (10 ** USDT_DECIMALS)
+        return 0.0
+    except Exception as e:
+        logger.error(f"Balance check error: {e}")
+        return 0.0
+
+
+def get_trx_balance(address: str) -> float:
+    """Get TRX balance (for gas estimation)."""
+    try:
+        resp = requests.get(f"{TRONGRID_API}/v1/accounts/{address}", timeout=15)
+        if resp.status_code != 200:
+            return 0.0
+        data = resp.json().get("data", [{}])[0]
+        return data.get("balance", 0) / 1_000_000  # sun -> TRX
+    except Exception as e:
+        logger.error(f"TRX balance error: {e}")
+        return 0.0
+
+
+def send_usdt(to_address: str, amount_usdt: float) -> dict:
+    """
+    Send USDT (TRC20) from hot wallet to address.
+    Returns {"ok": True, "txid": ...} or {"ok": False, "error": ...}.
+    """
+    try:
+        client = _get_client()
+        priv_key = _get_master_key()
+        contract = client.get_contract(USDT_CONTRACT)
+        # USDT uses 6 decimals
+        amount_units = int(round(amount_usdt * (10 ** USDT_DECIMALS)))
+        txn = (
+            contract.functions.transfer(to_address, amount_units)
+            .with_owner(priv_key.public_key.to_base58check_address())
+            .fee_limit(100_000_000)  # 100 TRX max fee
+            .build()
+            .sign(priv_key)
+        )
+        result = txn.broadcast()
+        txid = result.get("txid", "")
+        logger.info(f"USDT sent: {amount_usdt} -> {to_address}, txid={txid}")
+        return {"ok": True, "txid": txid}
+    except Exception as e:
+        logger.error(f"USDT send failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+def wait_for_deposit(address: str, expected_usdt: float, timeout_sec: int = 7200,
+                     poll_interval: int = 10, tolerance: float = 0.01) -> dict:
+    """
+    Poll TronGrid for an incoming USDT deposit >= expected (minus tolerance).
+    Returns {"ok": True, "amount": ..., "txid": ...} on success,
+    or {"ok": False, "error": "timeout"} on timeout.
+    NOTE: v1 tracks by amount; ensure expected amounts are unique per deal
+    or use short timeouts per deal.
+    """
+    start = time.time()
+    seen_txids: set = set()
+    # Baseline: current TRC20 transfers to avoid counting old ones
+    try:
+        resp = requests.get(
+            f"{TRONGRID_API}/v1/accounts/{address}/transactions/trc20",
+            params={"limit": 20, "only_confirmed": "true",
+                    "contract_address": USDT_CONTRACT},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            for t in resp.json().get("data", []):
+                seen_txids.add(t.get("transaction_id", ""))
+    except Exception as e:
+        logger.warning(f"Baseline fetch failed: {e}")
+
+    while time.time() - start < timeout_sec:
+        try:
+            resp = requests.get(
+                f"{TRONGRID_API}/v1/accounts/{address}/transactions/trc20",
+                params={"limit": 20, "only_confirmed": "true",
+                        "contract_address": USDT_CONTRACT},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                for t in resp.json().get("data", []):
+                    txid = t.get("transaction_id", "")
+                    if txid in seen_txids:
+                        continue
+                    # Only incoming transfers (to == address)
+                    if t.get("to", "") != address:
+                        continue
+                    raw_val = t.get("value", "0")
+                    amount = int(raw_val) / (10 ** USDT_DECIMALS)
+                    if amount >= expected_usdt - tolerance:
+                        logger.info(f"Deposit detected: {amount} USDT, txid={txid}")
+                        return {"ok": True, "amount": amount, "txid": txid}
+                    seen_txids.add(txid)
+        except Exception as e:
+            logger.warning(f"Deposit poll error: {e}")
+        time.sleep(poll_interval)
+    return {"ok": False, "error": "timeout"}
+
+
+def check_txid_confirmed(txid: str) -> bool:
+    """Check if a transaction is confirmed on-chain."""
+    try:
+        resp = requests.get(f"{TRONGRID_API}/v1/transactions/{txid}", timeout=15)
+        if resp.status_code != 200:
+            return False
+        data = resp.json().get("data", [{}])[0]
+        return data.get("blockNumber") is not None
+    except Exception:
+        return False
