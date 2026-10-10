@@ -135,22 +135,30 @@ def generate_deposit_address(deal_id: str) -> str:
 
 
 def get_usdt_balance(address: str) -> float:
-    """Get USDT (TRC20) balance for an address via TronGrid."""
+    """Get USDT (TRC20) balance via contract balanceOf (most reliable)."""
     try:
-        # Use TronGrid account info
+        client = _get_client()
+        contract = client.get_contract(USDT_CONTRACT)
+        # Call balanceOf directly on the contract
+        result = contract.functions.balanceOf(address)
+        # tronpy returns int for uint256
+        raw = int(result)
+        return raw / (10 ** USDT_DECIMALS)
+    except Exception as e:
+        logger.warning(f"Contract balanceOf failed, trying REST: {e}")
+    # Fallback to REST API
+    try:
         resp = _get_with_retry(
             f"{TRONGRID_API}/v1/accounts/{address}",
             params={"only_confirmed": "true"},
         )
         if resp.status_code != 200:
-            logger.warning(f"TronGrid balance check failed: {resp.status_code}")
             return 0.0
         data_list = resp.json().get("data", [])
         if not data_list:
-            return 0.0  # Address has no activity yet
+            return 0.0
         data = data_list[0]
         for token in data.get("trc20", []):
-            # token is like {"TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t": "150000000"}
             if USDT_CONTRACT in token:
                 raw = int(token[USDT_CONTRACT])
                 return raw / (10 ** USDT_DECIMALS)
