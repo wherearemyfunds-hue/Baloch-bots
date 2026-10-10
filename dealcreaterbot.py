@@ -504,6 +504,44 @@ async def invite_and_promote(invite_client, channel, username_or_id, rank, label
         return False
 
 
+# ==================== XXIN SPAM AUTO-DELETE ====================
+# Deletes messages from senders whose username or display name contains "xxin"
+# (case-insensitive). Requires the bot to be admin with delete rights in the group.
+# Set SPAM_DELETE_GROUPS env var (comma-separated) to limit which groups are watched;
+# empty = all groups the bot is in.
+SPAM_NAME_PATTERN = re.compile(os.environ.get("SPAM_NAME_PATTERN", r"xxin"), re.IGNORECASE)
+_env_spam_groups = os.environ.get("SPAM_DELETE_GROUPS", "").strip()
+SPAM_DELETE_GROUPS = [s.strip() for s in _env_spam_groups.split(",") if s.strip()]
+
+@bot_client.on(events.NewMessage(chats=SPAM_DELETE_GROUPS if SPAM_DELETE_GROUPS else None))
+async def xxin_spam_delete_handler(event):
+    """Delete XXIN spam bot messages in groups."""
+    # Only in groups/supergroups, not private chats
+    if not event.is_group:
+        return
+    try:
+        sender = await event.get_sender()
+        if not sender:
+            return
+        # Don't delete our own messages or other bots we manage
+        if getattr(sender, 'bot', False):
+            bot_username = (getattr(sender, 'username', '') or '').lower()
+            # Still delete xxin bots even if they're bots
+            if not SPAM_NAME_PATTERN.search(bot_username):
+                return
+        username = (getattr(sender, 'username', '') or '')
+        first_name = getattr(sender, 'first_name', '') or ''
+        last_name = getattr(sender, 'last_name', '') or ''
+        full_name = f"{first_name} {last_name}".strip()
+        if SPAM_NAME_PATTERN.search(username) or SPAM_NAME_PATTERN.search(full_name):
+            await event.delete()
+            logger.info(
+                f"Deleted XXIN spam from @{username or sender.id} in chat {event.chat_id}"
+            )
+    except Exception as e:
+        logger.warning(f"Failed to delete XXIN spam: {e}")
+
+
 # ==================== BOT HANDLERS ====================
 
 @bot_client.on(events.NewMessage(pattern=r"^/start$"))

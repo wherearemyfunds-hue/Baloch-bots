@@ -2468,57 +2468,6 @@ async def handle_role_guess_no(callback: CallbackQuery):
 # AI-POWERED DEAL NEGOTIATION HANDLER
 # ==============================================
 
-# ---- XXIN spam auto-delete ----
-# Deletes messages from senders whose username or display name contains "xxin"
-# (case-insensitive). Requires the bot to be admin with delete rights.
-# Set SPAM_DELETE_GROUPS env var (comma-separated chat IDs or @usernames) to limit
-# which groups are watched; empty = all groups the bot is in.
-SPAM_NAME_PATTERN = re.compile(
-    os.environ.get("SPAM_NAME_PATTERN", r"xxin"), re.IGNORECASE
-)
-_env_spam_groups = os.environ.get("SPAM_DELETE_GROUPS", "").strip()
-SPAM_DELETE_GROUPS = [s.strip() for s in _env_spam_groups.split(",") if s.strip()]
-
-def _is_spam_sender(message: types.Message) -> bool:
-    """Check if the message sender looks like an XXIN spam bot."""
-    user = message.from_user
-    if not user:
-        return False
-    # Skip the bot itself and admins (don't delete our own messages)
-    username = (user.username or "").lower()
-    full_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
-    return bool(
-        SPAM_NAME_PATTERN.search(username) or SPAM_NAME_PATTERN.search(full_name)
-    )
-
-def _spam_group_allowed(message: types.Message) -> bool:
-    """Check if spam deletion is enabled for this chat."""
-    if not SPAM_DELETE_GROUPS:
-        return True  # watch all groups by default
-    chat = message.chat
-    return (
-        str(chat.id) in SPAM_DELETE_GROUPS
-        or (chat.username and f"@{chat.username}" in SPAM_DELETE_GROUPS)
-    )
-
-@dp.message(F.chat.type.in_(["group", "supergroup"]))
-async def xxin_spam_delete_handler(message: types.Message):
-    """Delete XXIN spam bot messages. Runs before the deal flow handler."""
-    # Skip if this is a deal command or the universal handler will catch it first
-    # (we only want to delete obvious spam, not interfere with deals)
-    if not _spam_group_allowed(message):
-        return
-    if _is_spam_sender(message):
-        try:
-            await message.delete()
-            logger.info(
-                f"Deleted XXIN spam from @{message.from_user.username or message.from_user.id} "
-                f"in chat {message.chat.id}"
-            )
-        except Exception as e:
-            logger.warning(f"Failed to delete XXIN spam: {e}")
-        return  # don't pass to other handlers
-
 @dp.message(F.text & (F.chat.type.in_(["group", "supergroup"])))
 async def universal_stage_handler(message: types.Message):
     chat_id = message.chat.id
