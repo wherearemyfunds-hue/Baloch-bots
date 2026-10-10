@@ -53,7 +53,7 @@ def _trongrid_headers() -> dict:
 def _get_with_retry(url: str, params: dict = None, max_retries: int = 5) -> requests.Response:
     """GET with exponential backoff on 429 rate limits."""
     for attempt in range(max_retries):
-        r = requests.get(url, params=params, headers=_trongrid_headers(), timeout=15)
+        r = requests.get(url, params=params, headers=_trongrid_headers())
         if r.status_code != 429:
             return r
         wait = (2 ** attempt) + 1  # 2, 3, 5, 9, 17 seconds
@@ -141,7 +141,6 @@ def get_usdt_balance(address: str) -> float:
         resp = _get_with_retry(
             f"{TRONGRID_API}/v1/accounts/{address}",
             params={"only_confirmed": "true"},
-            timeout=15,
         )
         if resp.status_code != 200:
             logger.warning(f"TronGrid balance check failed: {resp.status_code}")
@@ -222,7 +221,6 @@ def wait_for_deposit(address: str, expected_usdt: float, timeout_sec: int = 7200
             f"{TRONGRID_API}/v1/accounts/{address}/transactions/trc20",
             params={"limit": 20, "only_confirmed": "true",
                     "contract_address": USDT_CONTRACT},
-            timeout=15,
         )
         if resp.status_code == 200:
             for t in resp.json().get("data", []):
@@ -236,7 +234,6 @@ def wait_for_deposit(address: str, expected_usdt: float, timeout_sec: int = 7200
                 f"{TRONGRID_API}/v1/accounts/{address}/transactions/trc20",
                 params={"limit": 20, "only_confirmed": "true",
                         "contract_address": USDT_CONTRACT},
-                timeout=15,
             )
             if resp.status_code == 200:
                 for t in resp.json().get("data", []):
