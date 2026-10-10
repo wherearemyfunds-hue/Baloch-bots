@@ -506,11 +506,11 @@ async def invite_and_promote(invite_client, channel, username_or_id, rank, label
 
 
 # ==================== XXIN SPAM AUTO-DELETE ====================
-# Deletes messages from senders whose username or display name contains "xxin"
-# (case-insensitive). Requires the bot to be admin with delete rights in the group.
-# Set SPAM_DELETE_GROUPS env var (comma-separated) to limit which groups are watched;
-# empty = all groups the bot is in.
-SPAM_NAME_PATTERN = re.compile(os.environ.get("SPAM_NAME_PATTERN", r"xxin"), re.IGNORECASE)
+# Deletes messages from senders whose username or display name matches spam pattern
+# (case-insensitive). Catches: xxin, xxxin, xxin7, xinxin, etc.
+# Requires the bot to be admin with delete rights in the group.
+# Set SPAM_NAME_PATTERN env var (regex) to customize; empty = all groups watched.
+SPAM_NAME_PATTERN = re.compile(os.environ.get("SPAM_NAME_PATTERN", r"x{2,}i*n|xinxin|xxin\d*"), re.IGNORECASE)
 _env_spam_groups = os.environ.get("SPAM_DELETE_GROUPS", "").strip()
 SPAM_DELETE_GROUPS = [s.strip() for s in _env_spam_groups.split(",") if s.strip()]
 
