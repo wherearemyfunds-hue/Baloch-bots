@@ -149,11 +149,13 @@ async def cb_u_balance(callback: types.CallbackQuery):
         None, get_or_create_user, u.id, u.username, u.first_name)
     loop = asyncio.get_event_loop()
     bal = await loop.run_in_executor(None, tron_pay.get_usdt_balance, rec["address"])
+    trx_bal = await loop.run_in_executor(None, tron_pay.get_trx_balance, rec["address"])
     # Admin sees total across all funds
     if _is_admin(u.id):
         import json
         def _totals():
             total = bal
+            total_trx = trx_bal
             # Deal escrow funds
             try:
                 with open("/root/deal_states.json") as f:
@@ -162,6 +164,7 @@ async def cb_u_balance(callback: types.CallbackQuery):
                     addr = s.get("tron_deposit_address")
                     if addr and addr != rec["address"]:
                         total += tron_pay.get_usdt_balance(addr)
+                        total_trx += tron_pay.get_trx_balance(addr)
             except Exception:
                 pass
             # User deposits
@@ -171,20 +174,21 @@ async def cb_u_balance(callback: types.CallbackQuery):
                     a = urec.get("address", "")
                     if a and a != rec["address"]:
                         total += tron_pay.get_usdt_balance(a)
+                        total_trx += tron_pay.get_trx_balance(a)
             except Exception:
                 pass
-            return total
-        total = await loop.run_in_executor(None, _totals)
+            return total, total_trx
+        total, total_trx = await loop.run_in_executor(None, _totals)
         await callback.message.answer(
             f"💰 <b>Total Balance</b>\n\n"
-            f"My Wallet: <b>{bal:.2f}</b> USDT\n"
-            f"All Funds: <b>{total:.2f}</b> USDT\n\n"
+            f"My Wallet: <b>{bal:.2f}</b> USDT | <b>{trx_bal:.2f}</b> TRX\n"
+            f"All Funds: <b>{total:.2f}</b> USDT | <b>{total_trx:.2f}</b> TRX\n\n"
             f"<i>Includes deal escrow + user deposits</i>",
             parse_mode="HTML",
         )
         return
     await callback.message.answer(
-        f"💰 <b>Your Balance</b>\n\nUSDT: <b>{bal:.2f}</b>",
+        f"💰 <b>Your Balance</b>\n\nUSDT: <b>{bal:.2f}</b>\nTRX: <b>{trx_bal:.2f}</b>",
         parse_mode="HTML",
     )
 
@@ -231,8 +235,10 @@ async def cb_a_deals(callback: types.CallbackQuery):
     for cid, s in deals[-10:]:  # last 10
         addr = s["tron_deposit_address"]
         bal = await loop.run_in_executor(None, tron_pay.get_usdt_balance, addr)
+        trx = await loop.run_in_executor(None, tron_pay.get_trx_balance, addr)
         stage = s.get("stage", "?")
-        lines.append(f"• Chat {cid} — <b>{bal:.2f}</b> USDT ({stage})\n  <code>{addr}</code>")
+        gas_warn = " ⚠️" if trx < 5 else ""
+        lines.append(f"• Chat {cid} — <b>{bal:.2f}</b> USDT | <b>{trx:.1f}</b> TRX{gas_warn} ({stage})\n  <code>{addr}</code>")
         if bal > 0.01:
             kb_rows.append([InlineKeyboardButton(
                 text=f"💸 Withdraw {bal:.2f} from {cid}",
