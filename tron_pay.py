@@ -258,12 +258,33 @@ def ensure_gas(address: str, min_trx: float = 20.0) -> bool:
 def send_usdt_from_with_gas(priv_key: PrivateKey, to_address: str, amount_usdt: float) -> dict:
     """
     Send USDT from a derived address, auto-funding TRX for gas if needed.
+    After payout, sweeps leftover TRX back to hot wallet (no waste!).
     This is the 'just works' version — user never manually sends TRX.
     """
     from_addr = priv_key.public_key.to_base58check_address()
     if not ensure_gas(from_addr):
         return {"ok": False, "error": "Could not fund gas (TRX). Hot wallet may be empty."}
-    return send_usdt_from(priv_key, to_address, amount_usdt)
+    result = send_usdt_from(priv_key, to_address, amount_usdt)
+    # Sweep leftover TRX back to hot wallet (don't waste it!)
+    if result.get("ok"):
+        try:
+            time.sleep(5)  # let the USDT tx confirm
+            leftover = get_trx_balance(from_addr)
+            # Keep 1 TRX for account, sweep the rest
+            if leftover > 1.5:
+                sweep_amt = round(leftover - 1.0, 2)
+                hot_addr = _get_master_key().public_key.to_base58check_address()
+                client = _get_client()
+                txn = (
+                    client.trx.transfer(from_addr, hot_addr, int(sweep_amt * 1_000_000))
+                    .build()
+                    .sign(priv_key)
+                )
+                txn.broadcast()
+                logger.info(f"Swept {sweep_amt} TRX back from {from_addr}")
+        except Exception as e:
+            logger.warning(f"TRX sweep-back failed (non-critical): {e}")
+    return result
 
 
 def wait_for_deposit(address: str, expected_usdt: float, timeout_sec: int = 7200,
