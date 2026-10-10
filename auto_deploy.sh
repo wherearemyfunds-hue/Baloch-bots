@@ -40,6 +40,21 @@ if [ "$LOCAL" != "$REMOTE" ]; then
   export $(cat /root/.secrets/escrow_bot.env | xargs)
   nohup python3 /root/dealcreaterbot.py > /root/escrowbot.log 2>&1 &
 
+  # Wallet Bot (BTCPay)
+  if [ -f walletbot.py ]; then
+    cp walletbot.py /root/walletbot.py
+    python3 -m py_compile /root/walletbot.py || { echo "Wallet syntax failed!"; exit 1; }
+    pkill -f walletbot.py
+    sleep 2
+    if [ -f /root/.secrets/wallet_bot.env ]; then
+      export $(cat /root/.secrets/wallet_bot.env | xargs)
+      nohup python3 /root/walletbot.py > /root/walletbot.log 2>&1 &
+      echo "[$(date)] Wallet bot restarted."
+    else
+      echo "[$(date)] Wallet bot skipped: /root/.secrets/wallet_bot.env missing."
+    fi
+  fi
+
   echo "$REMOTE" > "$VERSION_FILE"
   echo "[$(date)] Deploy complete!"
 else
