@@ -148,6 +148,40 @@ async def cb_u_balance(callback: types.CallbackQuery):
         None, get_or_create_user, u.id, u.username, u.first_name)
     loop = asyncio.get_event_loop()
     bal = await loop.run_in_executor(None, tron_pay.get_usdt_balance, rec["address"])
+    # Admin sees total across all funds
+    if _is_admin(u.id):
+        import json
+        def _totals():
+            total = bal
+            # Deal escrow funds
+            try:
+                with open("/root/deal_states.json") as f:
+                    states = json.load(f)
+                for s in states.values():
+                    addr = s.get("tron_deposit_address")
+                    if addr and addr != rec["address"]:
+                        total += tron_pay.get_usdt_balance(addr)
+            except Exception:
+                pass
+            # User deposits
+            try:
+                users = load_users()
+                for uid, urec in users.items():
+                    a = urec.get("address", "")
+                    if a and a != rec["address"]:
+                        total += tron_pay.get_usdt_balance(a)
+            except Exception:
+                pass
+            return total
+        total = await loop.run_in_executor(None, _totals)
+        await callback.message.answer(
+            f"💰 <b>Total Balance</b>\n\n"
+            f"My Wallet: <b>{bal:.2f}</b> USDT\n"
+            f"All Funds: <b>{total:.2f}</b> USDT\n\n"
+            f"<i>Includes deal escrow + user deposits</i>",
+            parse_mode="HTML",
+        )
+        return
     await callback.message.answer(
         f"💰 <b>Your Balance</b>\n\nUSDT: <b>{bal:.2f}</b>",
         parse_mode="HTML",
