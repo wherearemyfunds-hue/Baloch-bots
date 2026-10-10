@@ -164,6 +164,32 @@ async def cb_history(callback: types.CallbackQuery):
     await callback.answer("Loading...")
     if not _is_admin(callback.from_user.id):
         return
+    if USE_TRON and TRON_AVAILABLE:
+        import asyncio as aio
+        import requests
+        loop = aio.get_event_loop()
+        def _fetch():
+            addr = tron_pay.get_hot_wallet_address()
+            r = requests.get(
+                f"https://api.trongrid.io/v1/accounts/{addr}/transactions/trc20",
+                params={"limit": 10, "only_confirmed": "true",
+                        "contract_address": tron_pay.USDT_CONTRACT},
+                timeout=15,
+            )
+            return r.json().get("data", []) if r.status_code == 200 else []
+        txs = await loop.run_in_executor(None, _fetch)
+        if not txs:
+            await callback.message.answer("📊 No USDT transactions yet.")
+            return
+        addr = tron_pay.get_hot_wallet_address()
+        lines = ["📊 <b>Recent USDT Transactions</b>\n"]
+        for t in txs[:10]:
+            txid = str(t.get("transaction_id", "?"))[:12]
+            amt = int(t.get("value", 0)) / 1_000_000
+            direction = "📥 In" if t.get("to") == addr else "📤 Out"
+            lines.append(f"{direction} <code>{txid}...</code> — {amt:.2f} USDT")
+        await callback.message.answer("\n".join(lines), parse_mode="HTML")
+        return
     resp = await _btcpay_get("/transactions?limit=10")
     if resp["ok"]:
         txs = resp["data"] if isinstance(resp["data"], list) else resp["data"].get("transactions", [])
