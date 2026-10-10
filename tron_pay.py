@@ -145,9 +145,16 @@ def send_usdt(to_address: str, amount_usdt: float) -> dict:
     Send USDT (TRC20) from hot wallet to address.
     Returns {"ok": True, "txid": ...} or {"ok": False, "error": ...}.
     """
+    return send_usdt_from(_get_master_key(), to_address, amount_usdt)
+
+
+def send_usdt_from(priv_key: PrivateKey, to_address: str, amount_usdt: float) -> dict:
+    """
+    Send USDT (TRC20) from a specific private key to address.
+    Returns {"ok": True, "txid": ...} or {"ok": False, "error": ...}.
+    """
     try:
         client = _get_client()
-        priv_key = _get_master_key()
         contract = client.get_contract(USDT_CONTRACT)
         # USDT uses 6 decimals
         amount_units = int(round(amount_usdt * (10 ** USDT_DECIMALS)))

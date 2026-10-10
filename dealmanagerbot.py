@@ -60,9 +60,11 @@ CRYPTOMUS_API_BASE = "https://api.cryptomus.com/v1"
 # --- Direct TRON (USDT TRC20) — zero platform fee, only TRX gas ---
 USE_TRON = os.environ.get("USE_TRON", "false").lower() == "true"
 TRON_PRIVATE_KEY = os.environ.get("TRON_PRIVATE_KEY", "").strip()
+# HD seed phrase needed for unique per-deal addresses (same as wallet bot)
+WALLET_SEED_PHRASE = os.environ.get("WALLET_SEED_PHRASE", "").strip()
 try:
     import tron_pay  # noqa: F401
-    TRON_AVAILABLE = True
+    TRON_AVAILABLE = bool(TRON_PRIVATE_KEY) and bool(WALLET_SEED_PHRASE)
 except ImportError:
     TRON_AVAILABLE = False
 
@@ -990,16 +992,27 @@ async def show_payment_info(chat_id: int):
     await show_payment_info_cryptomus(chat_id)
 
 
+def deal_hd_index(chat_id: int) -> int:
+    """
+    Deterministic HD index for a deal's unique deposit address.
+    Uses offset + chat_id hash to avoid colliding with wallet user indexes (0-999).
+    """
+    return 100000 + (abs(chat_id) % 8000000)
+
+
 async def show_payment_info_tron(chat_id: int):
-    """Show TRON USDT (TRC20) deposit address — zero platform fee."""
+    """Show TRON USDT (TRC20) deposit address — unique per deal, zero platform fee."""
     import tron_pay
     state = deal_states[chat_id]
     buyer_amount = state["buyer_amount"]
     seller_amount = state["seller_amount"]
     fee = state["fee"]
 
-    deposit_address = tron_pay.generate_deposit_address(str(chat_id))
+    # Unique HD address per deal
+    hd_index = deal_hd_index(chat_id)
+    deposit_address = tron_pay.get_user_deposit_address(hd_index)
     state["tron_deposit_address"] = deposit_address
+    state["tron_hd_index"] = hd_index
     state["payment_order_id"] = f"tron-{abs(chat_id)}-{int(time.time())}"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1015,7 +1028,8 @@ async def show_payment_info_tron(chat_id: int):
         f"<b>Baloch Escrow fee: 3% (minimum $3)</b>\n\n"
         f"Send <b>exactly {buyer_amount} USDT</b> (TRC20) to:\n"
         f"<code>{deposit_address}</code>\n\n"
-        f"⚡ <b>Zero platform fee</b> — only TRON network fee (~$0.30)!\n\n"
+        f"⚡ <b>Zero platform fee</b> — only TRON network fee!\n"
+        f"🔒 <b>Unique address</b> for this deal only!\n\n"
         f"Payment will be <b>automatically detected</b> once confirmed on TRON.\n\n"
         f"{'=' * 30}\n\n"
         f"<i>Admin: tap the button or reply <b>received</b> to confirm manually if needed.</i>"
@@ -1138,14 +1152,26 @@ async def payout_to_seller(address: str, address_type: str, network: str, amount
 
 
 async def payout_via_tron(address: str, amount: float, chat_id: int) -> tuple[bool, str]:
-    """Send USDT (TRC20) directly via TRON — only gas fee applies."""
+    """
+    Send USDT (TRC20) via TRON — ONLY TRC20, no other networks.
+    Pays directly from the deal's unique HD address (saves a sweep tx).
+    """
     import tron_pay
     try:
-        # Basic TRON address validation
+        # STRICT: only TRC20 TRON addresses
         if not (address.startswith("T") and len(address) == 34):
-            return False, "Invalid TRON address. Must start with T (TRC20)."
+            return False, "Only USDT TRC20 addresses supported (must start with T)."
+        state = deal_states.get(chat_id, {})
+        hd_index = state.get("tron_hd_index")
+        if hd_index is None:
+            # Fallback: hot wallet (should not happen for TRON deals)
+            logger.warning(f"No HD index for chat {chat_id}, using hot wallet")
+            send_fn = lambda: tron_pay.send_usdt(address, amount)
+        else:
+            priv_key = tron_pay.get_user_private_key(hd_index)
+            send_fn = lambda: tron_pay.send_usdt_from(priv_key, address, amount)
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, lambda: tron_pay.send_usdt(address, amount))
+        result = await loop.run_in_executor(None, send_fn)
         if result.get("ok"):
             txid = result.get("txid", "")
             logger.info(f"TRON payout: {amount} USDT -> {address}, txid={txid}")
