@@ -2884,6 +2884,16 @@ async def universal_stage_handler(message: types.Message):
         )
         return
 
+    # ---- Fallback: message didn't match any stage ----
+    # Don't stay silent — guide the user back to the flow.
+    logger.info(f"No stage matched for message in chat {chat_id}, stage={stage}")
+    await message.answer(
+        "I didn't quite catch that. 🤔\n"
+        "Please use the buttons above, or type <b>/start</b> to restart the deal setup.",
+        parse_mode="HTML",
+    )
+    return
+
 
 # ==============================================
 # DEAL CONFIRMATION HELPER
