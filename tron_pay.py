@@ -233,7 +233,7 @@ def send_trx(to_address: str, amount_trx: float) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-def ensure_gas(address: str, min_trx: float = 30.0) -> bool:
+def ensure_gas(address: str, min_trx: float = 20.0) -> bool:
     """
     Ensure an address has enough TRX for gas.
     If not, send TRX from hot wallet automatically.
