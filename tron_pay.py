@@ -145,7 +145,10 @@ def get_usdt_balance(address: str) -> float:
         if resp.status_code != 200:
             logger.warning(f"TronGrid balance check failed: {resp.status_code}")
             return 0.0
-        data = resp.json().get("data", [{}])[0]
+        data_list = resp.json().get("data", [])
+        if not data_list:
+            return 0.0  # Address has no activity yet
+        data = data_list[0]
         for token in data.get("trc20", []):
             # token is like {"TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t": "150000000"}
             if USDT_CONTRACT in token:
