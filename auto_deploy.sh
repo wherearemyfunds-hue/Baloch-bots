@@ -3,7 +3,7 @@
 # Setup: is file ko /root/auto_deploy.sh me rakho aur cron me lagao:
 #   */5 * * * * /root/auto_deploy.sh >> /root/auto_deploy.log 2>&1
 
-REPO_URL="https://github.com/SHWNPLACEHOLDER/baloch-bots.git"
+REPO_URL="https://github.com/wherearemyfunds-hue/Baloch-bots.git"
 REPO_DIR="/root/baloch-bots"
 VERSION_FILE="/root/.bot_version"
 
