@@ -1,0 +1,3398 @@
+# -*- coding: utf-8 -*-
+# =============================================================================
+# Baloch Escrow Bot - AI-Powered Automated Deal Management
+# =============================================================================
+# AI-POWERED FEATURES:
+# 1. AI auto-detects deal parameters from natural conversation
+# 2. AI extracts amount, deadline, documents, fee from free-form messages
+# 3. One-click deal confirmation (no rigid step-by-step prompts)
+# 4. Automatic Cryptomus invoice creation upon deal agreement
+# 5. Automatic payment detection via invoice status polling (5s intervals)
+# 6. Auto-confirm payments with tolerance
+# 7. Automatic payout to seller via Cryptomus
+# 8. Deadline countdown starts ONLY after payment confirmed
+# 9. Instant role permit when new person joins group
+# 10. Admin manual confirmation & override capabilities
+# 11. Full error handling and logging
+# =============================================================================
+
+import asyncio
+import hashlib
+import json
+import base64
+import logging
+import os
+import re
+import time
+import uuid as uuid_lib
+from datetime import datetime, timedelta
+
+import aiohttp
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.filters import Command
+from openai import AsyncOpenAI
+
+# ----------------------------------------------
+# LOGGING
+# ----------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# ----------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.path.join(BASE_DIR, "deal_states.json")
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "Balochbuyer").strip()
+ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "894719927") or 894719927)
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+
+# Cryptomus Configuration
+CRYPTOMUS_MERCHANT_ID = os.environ.get("CRYPTOMUS_MERCHANT_ID", "").strip()
+CRYPTOMUS_PAYMENT_API_KEY = os.environ.get("CRYPTOMUS_PAYMENT_API_KEY", "").strip()
+CRYPTOMUS_PAYOUT_API_KEY = os.environ.get("CRYPTOMUS_PAYOUT_API_KEY", "").strip()
+CRYPTOMUS_API_BASE = "https://api.cryptomus.com/v1"
+
+# Payment addresses (displayed as reference in messages)
+BEP20_ADDRESS = "0xf1a0fade24678e3331eaf915840cc6cf6a831d80"
+TRC20_ADDRESS = "TV1ddqZd6KeiMc1AKpDkqDf5hcAgSiWo6t"
+
+# At least one AI provider must be configured (Groq preferred — free; OpenAI fallback)
+_required = {
+    "BOT_TOKEN": BOT_TOKEN,
+    "CRYPTOMUS_MERCHANT_ID": CRYPTOMUS_MERCHANT_ID,
+    "CRYPTOMUS_PAYMENT_API_KEY": CRYPTOMUS_PAYMENT_API_KEY,
+    "CRYPTOMUS_PAYOUT_API_KEY": CRYPTOMUS_PAYOUT_API_KEY,
+}
+_missing = [k for k, v in _required.items() if not v]
+if not GROQ_API_KEY and not OPENAI_API_KEY:
+    _missing.append("GROQ_API_KEY or OPENAI_API_KEY")
+if _missing:
+    raise SystemExit(
+        f"Missing required environment variables: {', '.join(_missing)}. "
+        f"Set them before starting (see {os.path.join(BASE_DIR, '.secrets')} or export them)."
+    )
+
+# ----------------------------------------------
+# BOT INIT
+# ----------------------------------------------
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# ----------------------------------------------
+# AI PROVIDER (Groq preferred — free; OpenAI fallback)
+# Groq exposes an OpenAI-compatible API.
+# ----------------------------------------------
+if GROQ_API_KEY:
+    ai_client = AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+    AI_MODEL = "qwen/qwen3.8-27b"  # reliable JSON output
+    AI_PROVIDER = "groq"
+elif OPENAI_API_KEY:
+    ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    AI_MODEL = "gpt-3.5-turbo"
+    AI_PROVIDER = "openai"
+else:
+    ai_client = None
+    AI_MODEL = None
+    AI_PROVIDER = "none"
+# Legacy alias (do not use directly in new code)
+openai_client = ai_client
+
+# ----------------------------------------------
+# STATE STORAGE (persisted to disk so restarts don't lose deals)
+# ----------------------------------------------
+deal_states: dict[int, dict] = {}
+payment_monitoring_tasks: dict[int, asyncio.Task] = {}
+
+
+def save_deal_states():
+    """Atomically persist deal_states to disk."""
+    try:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(deal_states, f, default=str)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        logger.error(f"Failed to persist deal states: {e}")
+
+
+def load_deal_states() -> dict:
+    """Load persisted deal_states from disk (chat ids are ints)."""
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                data = json.load(f)
+                return {int(k): v for k, v in data.items()}
+    except Exception as e:
+        logger.error(f"Failed to load deal states: {e}")
+    return {}
+
+
+class PersistStateMiddleware(BaseMiddleware):
+    """Save deal state to disk after every handled update."""
+
+    async def __call__(self, handler, event, data):
+        try:
+            return await handler(event, data)
+        finally:
+            save_deal_states()
+
+
+# Register persistence middleware (after class definition)
+dp.message.middleware(PersistStateMiddleware())
+dp.callback_query.middleware(PersistStateMiddleware())
+dp.chat_member.middleware(PersistStateMiddleware())
+dp.my_chat_member.middleware(PersistStateMiddleware())
+
+
+# ==============================================
+# SAFE ADMIN NOTIFICATION
+# ==============================================
+
+async def safe_notify_admin(text: str):
+    """Send a message to admin, silently ignoring errors (e.g. chat not found)."""
+    try:
+        await bot.send_message(ADMIN_USER_ID, text)
+    except Exception as e:
+        logger.warning(f"Could not notify admin (ID={ADMIN_USER_ID}): {e}")
+
+
+# ==============================================
+# CRYPTOMUS API LAYER
+# ==============================================
+
+def _cryptomus_sign(body_json: str, api_key: str) -> str:
+    """Generate Cryptomus API signature: md5(base64(body) + api_key)"""
+    encoded = base64.b64encode(body_json.encode("utf-8")).decode("utf-8")
+    return hashlib.md5((encoded + api_key).encode("utf-8")).hexdigest()
+
+
+async def cryptomus_request(endpoint: str, data: dict, api_key: str) -> dict:
+    """Make authenticated request to Cryptomus API."""
+    if not CRYPTOMUS_MERCHANT_ID:
+        logger.error(f"Cryptomus API call skipped [{endpoint}]: CRYPTOMUS_MERCHANT_ID is not set!")
+        return {"ok": False, "error": "Merchant ID not configured. Please contact admin."}
+
+    url = f"{CRYPTOMUS_API_BASE}{endpoint}"
+    body_json = json.dumps(data) if data else ""
+    sign = _cryptomus_sign(body_json, api_key)
+
+    headers = {
+        "merchant": CRYPTOMUS_MERCHANT_ID,
+        "sign": sign,
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, data=body_json, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                result = await resp.json()
+                if resp.status == 200 and result.get("state") == 0:
+                    return {"ok": True, "result": result.get("result", {})}
+                else:
+                    error_msg = result.get("message") or result.get("errors") or str(result)
+                    logger.error(f"Cryptomus API error [{endpoint}]: {error_msg}")
+                    return {"ok": False, "error": str(error_msg)}
+    except Exception as e:
+        logger.error(f"Cryptomus API request failed [{endpoint}]: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+async def cryptomus_create_invoice(amount: float, order_id: str, lifetime: int = 7200) -> dict:
+    """Create a Cryptomus invoice for USDT payment."""
+    data = {
+        "amount": str(round(amount, 2)),
+        "currency": "USDT",
+        "order_id": order_id,
+        "lifetime": lifetime,
+        "is_payment_multiple": False,
+        "accuracy_payment_percent": 3,
+    }
+    return await cryptomus_request("/payment", data, CRYPTOMUS_PAYMENT_API_KEY)
+
+
+async def cryptomus_check_invoice(order_id: str) -> dict:
+    """Check the status of an existing Cryptomus invoice by order_id."""
+    data = {"order_id": order_id}
+    return await cryptomus_request("/payment/info", data, CRYPTOMUS_PAYMENT_API_KEY)
+
+
+async def cryptomus_create_payout(amount: float, address: str, network: str, order_id: str) -> dict:
+    """Create a Cryptomus payout (withdrawal) to seller's address."""
+    data = {
+        "amount": str(round(amount, 2)),
+        "currency": "USDT",
+        "network": network,
+        "order_id": order_id,
+        "address": address,
+        "is_subtract": True,
+    }
+    return await cryptomus_request("/payout", data, CRYPTOMUS_PAYOUT_API_KEY)
+
+
+async def cryptomus_check_payout(order_id: str) -> dict:
+    """Check status of a payout."""
+    data = {"order_id": order_id}
+    return await cryptomus_request("/payout/info", data, CRYPTOMUS_PAYOUT_API_KEY)
+
+
+# ==============================================
+# HELPERS
+# ==============================================
+
+def is_baloch_deal_group(group_name: str) -> bool:
+    return bool(group_name and re.match(r"Baloch Escrow Deal \d+", group_name))
+
+
+def generate_order_id(chat_id: int, prefix: str = "deal") -> str:
+    """Generate unique order_id for Cryptomus."""
+    short_uuid = uuid_lib.uuid4().hex[:8]
+    return f"{prefix}-{abs(chat_id)}-{short_uuid}"
+
+
+def calculate_fee(amount: float, fee_payer: str) -> tuple[float, float, float]:
+    fee = max(3.0, amount * 0.03)
+    if fee_payer == "buyer":
+        return round(amount + fee, 2), round(amount, 2), round(fee, 2)
+    elif fee_payer == "seller":
+        return round(amount, 2), round(amount - fee, 2), round(fee, 2)
+    else:  # half
+        half_fee = fee / 2
+        return round(amount + half_fee, 2), round(amount - half_fee, 2), round(fee, 2)
+
+
+def regex_parse_amount(text: str) -> float:
+    match = re.search(r"(\d+(\.\d+)?)", text.replace(",", ""))
+    return float(match.group(1)) if match else 0.0
+
+
+def detect_address_type(address: str) -> dict:
+    address = address.strip()
+    if re.fullmatch(r"T[A-Za-z0-9]{33}", address):
+        return {"valid": True, "type": "TRC20", "network": "tron"}
+    elif re.fullmatch(r"0x[a-fA-F0-9]{40}", address):
+        return {"valid": True, "type": "BEP20", "network": "bsc"}
+    return {"valid": False, "type": None, "network": None}
+
+
+def parse_deadline_to_seconds(deadline_text: str) -> int:
+    """Parse deadline text into total seconds. Handles misspellings."""
+    text = deadline_text.lower().strip()
+    total_seconds = 0
+
+    days_match = re.search(r"(\d+)\s*(?:days?|dys|dayz)", text)
+    if days_match:
+        total_seconds += int(days_match.group(1)) * 86400
+
+    hours_match = re.search(r"(\d+)\s*(?:hours?|hrs?|houers?|houres?|hurs?|ours?|hourz)", text)
+    if hours_match:
+        total_seconds += int(hours_match.group(1)) * 3600
+
+    minutes_match = re.search(r"(\d+)\s*(?:minutes?|mins?|minuts?|minites?|mints?|minutz|mnts?)", text)
+    if minutes_match:
+        total_seconds += int(minutes_match.group(1)) * 60
+
+    return total_seconds
+
+
+async def get_group_invite_link(chat: types.Chat) -> str:
+    if chat.username:
+        return f"https://t.me/{chat.username}"
+    try:
+        link = await bot.create_chat_invite_link(chat_id=chat.id)
+        if hasattr(link, "invite_link") and link.invite_link:
+            return link.invite_link
+        return await bot.export_chat_invite_link(chat.id)
+    except Exception as e:
+        logger.error(f"Could not create invite link: {e}")
+        return f"(Group ID: {chat.id})"
+
+
+async def get_username(user_id: int, fallback: str = "User") -> str:
+    try:
+        chat = await bot.get_chat(user_id)
+        return f"@{chat.username}" if chat.username else chat.first_name or fallback
+    except Exception:
+        return fallback
+
+
+# Service accounts that must NEVER be asked for a deal role
+# (group creator + support + bots are admins, not deal parties)
+SERVICE_USERNAMES = {"reall_baloch", "balochbuyer", "balochhelpbot"}
+SERVICE_USER_IDS = {8705882689, 6299697194}  # NEW (@Reall_Baloch), OLD (no username)
+
+
+def _is_service_account(user):
+    """True for bots and our own admin/service accounts — never deal parties."""
+    if getattr(user, "is_bot", False):
+        return True
+    if getattr(user, "id", None) in SERVICE_USER_IDS:
+        return True
+    uname = (getattr(user, "username", "") or "").lower()
+    if uname in SERVICE_USERNAMES:
+        return True
+    return False
+
+
+async def send_role_prompt(chat_id: int, user_display: str = ""):
+    """Send role selection prompt — ONLY to a newly joined real user.
+
+    Never spams: one prompt per user per group (tracked in state).
+    Service/admin accounts never get prompted (filtered by callers).
+    """
+    if chat_id not in deal_states:
+        deal_states[chat_id] = {"stage": "role_selection", "members": {}, "conversation_history": []}
+
+    state = deal_states[chat_id]
+
+    if "buyer" in state and "seller" in state:
+        return
+
+    locked = None
+    if "buyer" in state:
+        locked = "buyer"
+    elif "seller" in state:
+        locked = "seller"
+
+    welcome = f"Welcome {user_display}!\n\n" if user_display else ""
+
+    # HYBRID: buttons are primary, typed reply is the fallback.
+    if locked == "buyer":
+        role_text = "The buyer role is already taken."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Seller", callback_data="role_seller")],
+        ])
+        role_text += "\nTap <b>Seller</b>, or reply: <b>seller</b>"
+    elif locked == "seller":
+        role_text = "The seller role is already taken."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Buyer", callback_data="role_buyer")],
+        ])
+        role_text += "\nTap <b>Buyer</b>, or reply: <b>buyer</b>"
+    else:
+        role_text = "Are you the buyer or the seller?"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Buyer", callback_data="role_buyer"),
+                InlineKeyboardButton(text="Seller", callback_data="role_seller"),
+            ],
+        ])
+        role_text += "\nTap a button, or reply: <b>buyer</b> / <b>seller</b>"
+
+    await bot.send_message(
+        chat_id,
+        f"{welcome}"
+        f"<b>Role Permit Granted</b>\n"
+        f"{role_text}",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+# ==============================================
+# AI-POWERED DEAL ANALYSIS (CORE INTELLIGENCE)
+# ==============================================
+
+async def ai_analyze_deal_message(message_text: str, sender_role: str, conversation_context: str = "") -> dict:
+    """
+    AI analyzes a deal message. Fast, concise prompt for minimal latency.
+    """
+    ctx = conversation_context[:600] if conversation_context else "None"
+    prompt = f"""Escrow deal analysis. Extract deal info from {sender_role}'s message.
+Context: {ctx}
+Message: "{message_text}"
+Return JSON only:
+{{"is_deal_related":bool,"amount":number|null,"description":str|null,"deadline":str|null,"documents":list|null,"fee_preference":"buyer"|"seller"|"half"|null,"proof_of_completion":str|null,"account_age":str|null,"account_geo":str|null,"account_documents":list|null,"additional_info":str|null,"is_agreement":bool,"is_rejection":bool,"is_counter_offer":bool,"summary":"1 line"}}
+Rules: only extract EXPLICIT info, null if not mentioned. is_agreement=true if accepting/agreeing. is_rejection=true if declining/disagreeing."""
+
+    try:
+        response = await asyncio.wait_for(
+            ai_client.chat.completions.create(
+                model=AI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=400,
+                response_format={"type": "json_object"},
+            ),
+            timeout=20,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        # Robust JSON extraction: find the first {...} block
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+        if not raw.startswith("{"):
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            if m:
+                raw = m.group(0)
+        result = json.loads(raw)
+        logger.info(f"AI deal analysis: {result}")
+        return result
+    except asyncio.TimeoutError:
+        logger.warning("AI analysis timed out, using fallback")
+        return _fallback_deal_extraction(message_text)
+    except Exception as e:
+        logger.error(f"AI deal analysis error: {e}")
+        return _fallback_deal_extraction(message_text)
+
+
+async def ai_interpret_deal_question(answer_text: str, q_index: int) -> str | None:
+    """AI fallback to interpret a deal question answer in any phrasing.
+    Returns the canonical answer id or None."""
+    q = DEAL_QUESTIONS[q_index] if q_index < len(DEAL_QUESTIONS) else None
+    if not q:
+        return None
+    options_desc = "; ".join(
+        f"Option {i+1}: '{opt[0] if isinstance(opt, (list, tuple)) else opt}'"
+        for i, opt in enumerate(q.get("options", []))
+    )
+    prompt = f"""Escrow deal question. The user was asked:
+"{q.get('text', '')}"
+Options: {options_desc}
+User's answer: "{answer_text}"
+Which option did the user choose? Return JSON only: {{"option": 1|2|null}}
+Rules: match by meaning, not exact words. null if unclear or not an answer."""
+
+    try:
+        response = await asyncio.wait_for(
+            ai_client.chat.completions.create(
+                model=AI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=50,
+                response_format={"type": "json_object"},
+            ),
+            timeout=15,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        if not raw.startswith("{"):
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            if m:
+                raw = m.group(0)
+        result = json.loads(raw)
+        opt = result.get("option")
+        if opt in (1, 2):
+            # Map option number to canonical id via DQ_TEXT_MAP
+            canonical = DQ_TEXT_MAP.get(q_index, {}).get(str(opt))
+            logger.info(f"AI interpreted deal Q{q_index} answer '{answer_text}' as option {opt} -> {canonical}")
+            return canonical
+        return None
+    except Exception as e:
+        logger.warning(f"AI deal question interpretation failed: {e}")
+        return None
+
+
+def _fallback_deal_extraction(text: str) -> dict:
+    """Regex-based fallback when AI fails. Must be FULLY functional standalone,
+    because the bot cannot depend on OpenAI credits being available."""
+    result = {
+        "is_deal_related": False,
+        "amount": None,
+        "description": None,
+        "deadline": None,
+        "documents": None,
+        "fee_preference": None,
+        "is_agreement": False,
+        "is_counter_offer": False,
+        "is_rejection": False,
+        "summary": "Extracted via fallback"
+    }
+    t = text.lower()
+
+    # Amount: "150 usdt", "$200", "300 dollars"
+    amount_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:usdt|usd|\$|dollars?)", t)
+    if not amount_match:
+        amount_match = re.search(r"\$\s*(\d+(?:\.\d+)?)", text)
+    if amount_match:
+        result["amount"] = float(amount_match.group(1))
+
+    # Deadline: "2 hours", "3 days", "30 mins"
+    dl_match = re.search(r"(\d+)\s*(?:days?|dys|hours?|hrs?|houers?|houres?|hurs?|minutes?|mins?|minuts?|minites?|mints?)", t)
+    if dl_match:
+        result["deadline"] = dl_match.group(0).strip()
+
+    # Documents: "id+ssn+selfie", "documents: ..."
+    doc_match = re.search(r"id\s*\+\s*ssn[^,\n]*", t)
+    if doc_match:
+        docs_raw = doc_match.group(0).strip()
+        result["documents"] = [d.strip() for d in re.split(r"[+,]", docs_raw) if d.strip()]
+
+    # Description: strip amount/deadline/docs, remove filler verbs, keep product
+    desc = text
+    desc = re.sub(r"\d+(?:\.\d+)?\s*(?:usdt|usd|\$|dollars?)", " ", desc, flags=re.I)
+    desc = re.sub(r"\d+\s*(?:days?|dys|hours?|hrs?|minutes?|mins?)", " ", desc, flags=re.I)
+    desc = re.sub(r"id\s*\+\s*ssn[^,\n]*", " ", desc, flags=re.I)
+    desc = re.sub(r"\b(buying|selling|buy|sell|need|want|looking\s+for)\b", " ", desc, flags=re.I)
+    desc = re.sub(r"\s+", " ", desc).strip(" ,+-")
+    if desc and len(desc) >= 2:
+        result["description"] = desc[:80]
+
+    # Agreement words ("disagree" is NOT agreement — it's a rejection)
+    agree_words = ["agreed", "confirm", "accept", "sounds good", "perfect", "sure", "fine", "okay", "deal"]
+    if any(w in t for w in agree_words):
+        result["is_agreement"] = True
+    if re.search(r"\byes\b|\bok\b|\bagree\b", t) and "disagree" not in t:
+        result["is_agreement"] = True
+    if "disagree" in t or "reject" in t or "not agree" in t:
+        result["is_agreement"] = False
+        result["is_rejection"] = True
+
+    # Counter-offer indicators
+    counter_words = ["counter", "instead", "rather", "how about", "what about", "my price", "my offer"]
+    if any(w in t for w in counter_words):
+        result["is_counter_offer"] = True
+
+    # Fee preference
+    if "i pay fee" in t or "i will pay the fee" in t or "fee on me" in t:
+        result["fee_preference"] = "detected"
+    if "half" in t and "fee" in t:
+        result["fee_preference"] = "half"
+
+    # CRITICAL: mark deal-related only on real deal signals
+    # (bare description alone is not enough — "hello how are you" is not a deal)
+    deal_verbs = bool(re.search(r"\b(buying|selling|buy|sell)\b", t))
+    if (result["amount"] or result["is_agreement"] or result["is_counter_offer"]
+            or result["is_rejection"] or (deal_verbs and result["description"])):
+        result["is_deal_related"] = True
+
+    return result
+
+
+async def ai_infer_role(text: str) -> str | None:
+    """Infer buyer/seller intent from free-form text during role selection.
+
+    Returns "buyer", "seller", or None. Keyword heuristics first (fast),
+    then a tiny OpenAI call for anything ambiguous.
+    """
+    t = (text or "").lower()
+
+    buyer_hits = (
+        "i want to buy", "i wanna buy", "want to buy", "i need to buy",
+        "looking to buy", "i am buying", "i'm buying", "im buying",
+        "i'll buy", "i will buy", "buying", "i want it", "i need it",
+        "mera budget", "budget hai", "kharidna", "kharidna hai", "lena hai",
+        "i want the", "interested in buying", "i take", "i'll take",
+    )
+    seller_hits = (
+        "i want to sell", "i wanna sell", "want to sell",
+        "looking to sell", "i am selling", "i'm selling", "im selling",
+        "i'll sell", "i will sell", "selling", "i have for sale",
+        "for sale", "i offer", "bechna", "bechna hai", "dena hai",
+        "mere paas", "meray paas", "available hai",
+    )
+    if any(h in t for h in buyer_hits):
+        return "buyer"
+    if any(h in t for h in seller_hits):
+        return "seller"
+
+    # Ambiguous -> ask the AI (short, cheap call)
+    try:
+        response = await asyncio.wait_for(
+            ai_client.chat.completions.create(
+                model=AI_MODEL,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        "In an escrow deal group, a user wrote this while choosing "
+                        "their role. Is this person the BUYER or the SELLER? "
+                        "Reply with exactly one word: buyer, seller, or unknown.\n"
+                        f"Message: \"{text.strip()[:200]}\""
+                    ),
+                }],
+                temperature=0.0,
+                max_tokens=10,
+            ),
+            timeout=8,
+        )
+        guess = response.choices[0].message.content.strip().lower()
+        if guess in ("buyer", "seller"):
+            return guess
+    except Exception as e:
+        logger.warning(f"Role inference AI call failed: {e}")
+    return None
+
+
+async def ai_generate_deal_summary(state: dict) -> str:
+    """AI generates a clean deal summary from extracted parameters."""
+    amount = state.get("amount", "Not specified")
+    description = state.get("description", "Not specified")
+    deadline = state.get("deadline", "Not specified")
+    documents = state.get("documents", [])
+    docs_text = ", ".join(documents) if documents else "None"
+
+    return (
+        f"<b>Amount:</b> {amount} USDT\n"
+        f"<b>Description:</b> {description}\n"
+        f"<b>Deadline:</b> {deadline}\n"
+        f"<b>Documents:</b> {docs_text}"
+    )
+
+
+def build_conversation_context(history: list, max_messages: int = 10) -> str:
+    """Build conversation context string from recent messages."""
+    recent = history[-max_messages:] if len(history) > max_messages else history
+    lines = []
+    for entry in recent:
+        role = entry.get("role", "unknown")
+        text = entry.get("text", "")
+        lines.append(f"{role}: {text}")
+    return "\n".join(lines)
+
+
+# ==============================================
+# PAYMENT MONITORING (AUTOMATIC DETECTION)
+# ==============================================
+
+async def continuous_payment_monitoring(chat_id: int, order_id: str, duration_minutes: int = 60):
+    """Poll Cryptomus invoice status every 5 seconds. Auto-detects payment.
+    
+    Payment validation rules:
+    - Overpayment: accept silently (no issues)
+    - Underpayment $1-$3: accept as complete (tolerance)
+    - Underpayment > $3: alert buyer, request remaining amount
+    """
+    logger.info(f"[Monitor] Started for chat {chat_id}, order {order_id}")
+    end_time = time.time() + (duration_minutes * 60)
+    underpay_notified = False  # Track if we already notified about underpayment
+
+    try:
+        while time.time() < end_time:
+            if chat_id not in deal_states:
+                logger.info(f"[Monitor] Chat {chat_id} - deal removed, stopping")
+                break
+            stage = deal_states[chat_id].get("stage", "")
+            if stage not in ("payment", "payment_monitoring"):
+                logger.info(f"[Monitor] Chat {chat_id} - stage changed to '{stage}', stopping")
+                break
+
+            resp = await cryptomus_check_invoice(order_id)
+            if resp.get("ok"):
+                result = resp["result"]
+                status = result.get("payment_status") or result.get("status", "")
+                payment_amount = float(result.get("payment_amount") or 0)
+                expected = deal_states[chat_id].get("buyer_amount", 0)
+                shortfall = round(expected - payment_amount, 2)
+
+                logger.info(f"[Monitor] Chat {chat_id} - status: {status}, paid: {payment_amount}, expected: {expected}")
+
+                # PAID or OVERPAID -> accept immediately
+                if status in ("paid", "paid_over"):
+                    await handle_payment_detected(chat_id, payment_amount, max(shortfall, 0))
+                    return
+
+                # WRONG AMOUNT (partial payment received)
+                if status == "wrong_amount" and payment_amount > 0:
+                    if shortfall <= 0:
+                        # Overpaid but marked wrong_amount -> accept
+                        await handle_payment_detected(chat_id, payment_amount, 0)
+                        return
+                    elif shortfall <= 3.0:
+                        # Shortfall $1-$3 -> accept as complete (tolerance)
+                        await handle_payment_detected(chat_id, payment_amount, shortfall)
+                        return
+                    else:
+                        # Shortfall > $3 -> notify buyer once, keep monitoring
+                        if not underpay_notified:
+                            underpay_notified = True
+                            buyer_name = await get_username(deal_states[chat_id].get("buyer", 0), "Buyer")
+                            await bot.send_message(
+                                chat_id,
+                                f"<b>Partial Paymet Detected</b>\n\n"
+                                f"{buyer_name}, we received <b>{payment_amount} USDT</b> "
+                                f"but the required amount is <b>{expected} USDT</b>.\n\n"
+                                f"<b>Remaining: {shortfall} USDT</b>\n\n"
+                                f"Please send the remaining amount to complete the payment.\n"
+                                f"The system will automatically detect the additional payment.",
+                                parse_mode="HTML",
+                            )
+                            await safe_notify_admin(
+                                f"[Partial Payment]\n"
+                                f"Chat: {chat_id}\n"
+                                f"Expected: {expected} USDT\n"
+                                f"Received: {payment_amount} USDT\n"
+                                f"Shortfall: {shortfall} USDT"
+                            )
+
+                if status in ("cancel", "fail", "system_fail"):
+                    logger.warning(f"[Monitor] Chat {chat_id} - invoice {status}")
+                    break
+            else:
+                if "not configured" in resp.get("error", ""):
+                    logger.warning(f"[Monitor] Chat {chat_id} - Merchant ID not configured, stopping")
+                    break
+
+            await asyncio.sleep(5)
+
+        logger.info(f"[Monitor] Chat {chat_id} - monitoring ended")
+
+    except asyncio.CancelledError:
+        logger.info(f"[Monitor] Chat {chat_id} - monitoring cancelled")
+    except Exception as e:
+        logger.error(f"[Monitor] Chat {chat_id} - error: {e}")
+
+
+async def handle_payment_detected(chat_id: int, actual_amount: float, difference: float):
+    """Handle a detected payment: auto-notify buyer, confirm deal, pin details, start deadline timer.
+    
+    - Overpayment (difference <= 0): accept silently
+    - Shortfall $1-$3 (difference 0.01-3.0): accept with note
+    - Exact payment: confirm normally
+    """
+    try:
+        state = deal_states[chat_id]
+        # Idempotency: if payment was already confirmed, ignore duplicate detection.
+        # (Prevents duplicate messages/timers if monitor and admin confirm race.)
+        if state.get("payment_confirmed_at"):
+            logger.info(f"[Payment] Chat {chat_id} - duplicate detection ignored (already confirmed)")
+            return
+        state["stage"] = "work"
+        state["payment_confirmed_at"] = time.time()
+        state["actual_payment"] = actual_amount
+
+        buyer_name = await get_username(state["buyer"], "Buyer")
+        seller_name = await get_username(state["seller"], "Seller")
+
+        await pin_deal_details(chat_id)
+
+        if difference > 0.01 and difference <= 3.0:
+            # Small shortfall ($1-$3) - accepted with tolerance note
+            await bot.send_message(
+                chat_id,
+                f"<b>Payment Received!</b>\n\n"
+                f"{buyer_name}, your payment of <b>{actual_amount} USDT</b> has been received.\n"
+                f"(Expected: {state['buyer_amount']} USDT | Difference: -{round(difference, 2)} USDT - accepted)\n\n"
+                f"<b>Money Received Confirmed!</b>\n\n"
+                f"{seller_name}, you can start your work in private.\n"
+                f"If any issue, I am here.",
+                parse_mode="HTML",
+            )
+        elif actual_amount > state["buyer_amount"]:
+            # Overpayment - accept silently, no mention of overpayment
+            await bot.send_message(
+                chat_id,
+                f"<b>Payment Received!</b>\n\n"
+                f"{buyer_name}, your payment has been received.\n\n"
+                f"<b>Money Received Confirmed!</b>\n\n"
+                f"{seller_name}, you can start your work in private.\n"
+                f"If any issue, I am here.",
+                parse_mode="HTML",
+            )
+        else:
+            # Exact payment
+            await bot.send_message(
+                chat_id,
+                f"<b>Payment Received!</b>\n\n"
+                f"{buyer_name}, your payment of <b>{actual_amount} USDT</b> has been received.\n\n"
+                f"<b>Money Received Confirmed!</b>\n\n"
+                f"{seller_name}, you can start your work in private.\n"
+                f"If any issue, I am here.",
+                parse_mode="HTML",
+            )
+
+        # Send role-specific action buttons to each participant
+        await send_action_buttons_to_all(chat_id)
+
+        # Notify admin in group chat with @mention
+        group_title = ""
+        group_link = ""
+        try:
+            chat_info = await bot.get_chat(chat_id)
+            group_title = chat_info.title or str(chat_id)
+            group_link = await get_group_invite_link(chat_info)
+        except Exception:
+            group_title = str(chat_id)
+            group_link = ""
+
+        await bot.send_message(
+            chat_id,
+            f"@{ADMIN_USERNAME} - <b>Payment Received</b>\n"
+            f"Amount: <b>{actual_amount} USDT</b> (expected: {state['buyer_amount']} USDT)\n"
+            f"Buyer: {buyer_name} | Seller: {seller_name}",
+            parse_mode="HTML",
+        )
+
+        # Also notify admin via DM with full details
+        await safe_notify_admin(
+            f"[Payment Confirmed]\n"
+            f"Group: {group_title} ({group_link})\n"
+            f"Buyer: {buyer_name}\n"
+            f"Seller: {seller_name}\n"
+            f"Expected: {state['buyer_amount']} USDT\n"
+            f"Received: {actual_amount} USDT"
+        )
+
+        asyncio.create_task(schedule_deadline_reminder(chat_id))
+
+    except Exception as e:
+        logger.error(f"Error handling payment detection for chat {chat_id}: {e}")
+
+
+async def send_action_buttons_to_all(chat_id: int):
+    """Send role-specific quick actions: HYBRID — buttons for payment
+    actions (primary), typed commands as fallback. Dispute stays text-only.
+
+    Permission checks are enforced in the do_* handlers.
+    """
+    state = deal_states.get(chat_id, {})
+    buyer_name = await get_username(state.get("buyer", 0), "Buyer")
+    seller_name = await get_username(state.get("seller", 0), "Seller")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Release Payment", callback_data="release")],
+        [InlineKeyboardButton(text="Refund to Buyer", callback_data="refund")],
+    ])
+
+    await bot.send_message(
+        chat_id,
+        f"<b>Quick Actions:</b>\n\n"
+        f"<i>• {buyer_name} (Buyer) → tap <b>Release Payment</b> (or type <b>release</b>)\n"
+        f"• {seller_name} (Seller) → tap <b>Refund to Buyer</b> (or type <b>refund</b>)\n"
+        f"• Anyone → type <b>dispute</b> to raise a dispute\n"
+        f"• Admin → can use release or refund</i>",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+# ==============================================
+# DEAL DETAILS PINNING
+# ==============================================
+
+async def pin_deal_details(chat_id: int):
+    """Pin complete deal details to the group."""
+    try:
+        state = deal_states[chat_id]
+        buyer_name = await get_username(state["buyer"], "Buyer")
+        seller_name = await get_username(state["seller"], "Seller")
+
+        fee_payer_text = state.get("fee_payer", "buyer").capitalize()
+        documents = state.get("documents", [])
+        docs_text = ", ".join(documents) if documents else "None"
+
+        deal_info = (
+            f"<b>DEAL DETAILS</b>\n"
+            f"{'=' * 30}\n\n"
+            f"<b>Buyer:</b> {buyer_name}\n"
+            f"<b>Seller:</b> {seller_name}\n\n"
+            f"<b>Deal Amount:</b> {state['amount']} USDT\n"
+            f"<b>Buyer Pays:</b> {state['buyer_amount']} USDT\n"
+            f"<b>Seller Receives:</b> {state['seller_amount']} USDT\n"
+            f"<b>Escrow Fee:</b> {state['fee']} USDT\n"
+            f"<b>Fee Paid By:</b> {fee_payer_text}\n\n"
+            f"<b>Description:</b>\n{state.get('description', 'N/A')}\n\n"
+            f"<b>Deadline:</b> {state.get('deadline', 'Not specified')}\n"
+            f"<b>Documents:</b> {docs_text}\n\n"
+            f"{'=' * 30}\n"
+            f"<b>Status:</b> Payment Confirmed - Work in Progress"
+        )
+
+        msg = await bot.send_message(chat_id, deal_info, parse_mode="HTML")
+        try:
+            await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=False)
+        except Exception as e:
+            logger.warning(f"Could not pin message: {e}")
+    except Exception as e:
+        logger.error(f"Error pinning deal details: {e}")
+
+
+# ==============================================
+# DEADLINE REMINDER (starts AFTER payment confirmed)
+# ==============================================
+
+async def schedule_deadline_reminder(chat_id: int):
+    """Schedule reminder messages based on deadline."""
+    try:
+        if chat_id not in deal_states:
+            return
+        deadline_text = deal_states[chat_id].get("deadline", "")
+        if not deadline_text:
+            return
+
+        total_seconds = parse_deadline_to_seconds(deadline_text)
+
+        if total_seconds > 0:
+            half_remind = max(60, total_seconds // 2)
+            final_remind = max(60, int(total_seconds * 0.9))
+
+            await asyncio.sleep(half_remind)
+            if chat_id in deal_states and deal_states[chat_id].get("stage") == "work":
+                buyer_name = await get_username(deal_states[chat_id]["buyer"], "Buyer")
+                seller_name = await get_username(deal_states[chat_id]["seller"], "Seller")
+                await bot.send_message(
+                    chat_id,
+                    f"<b>Deadline Reminder (50%)</b>\n\n"
+                    f"{buyer_name} {seller_name}\n\n"
+                    f"Deadline: {deadline_text}\n\n"
+                    f"Half of the deadline time has passed. "
+                    f"Please ensure the work is progressing on time.",
+                    parse_mode="HTML",
+                )
+
+            remaining = final_remind - half_remind
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+                if chat_id in deal_states and deal_states[chat_id].get("stage") == "work":
+                    buyer_name = await get_username(deal_states[chat_id]["buyer"], "Buyer")
+                    seller_name = await get_username(deal_states[chat_id]["seller"], "Seller")
+                    await bot.send_message(
+                        chat_id,
+                        f"<b>URGENT Deadline Reminder (90%)</b>\n\n"
+                        f"{buyer_name} {seller_name}\n\n"
+                        f"Deadline: {deadline_text}\n\n"
+                        f"The deadline is almost up! Please finalize the work immediately.",
+                        parse_mode="HTML",
+                    )
+        else:
+            await asyncio.sleep(1800)
+            if chat_id in deal_states and deal_states[chat_id].get("stage") == "work":
+                buyer_name = await get_username(deal_states[chat_id]["buyer"], "Buyer")
+                seller_name = await get_username(deal_states[chat_id]["seller"], "Seller")
+                await bot.send_message(
+                    chat_id,
+                    f"<b>Deadline Reminder</b>\n\n"
+                    f"{buyer_name} {seller_name}\n\n"
+                    f"Deadline: {deadline_text}\n\n"
+                    f"Please ensure the work is completed on time.",
+                    parse_mode="HTML",
+                )
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.error(f"Error in deadline reminder: {e}")
+
+
+# ==============================================
+# PAYMENT INFO DISPLAY & INVOICE CREATION
+# ==============================================
+
+async def show_payment_info(chat_id: int):
+    """Create Cryptomus invoice and show payment information (text-based, no buttons)."""
+    state = deal_states[chat_id]
+    buyer_amount = state["buyer_amount"]
+    seller_amount = state["seller_amount"]
+    fee = state["fee"]
+
+    order_id = generate_order_id(chat_id, "pay")
+    state["payment_order_id"] = order_id
+
+    invoice_resp = await cryptomus_create_invoice(buyer_amount, order_id, lifetime=7200)
+
+    payment_url = ""
+    if invoice_resp.get("ok"):
+        result = invoice_resp["result"]
+        payment_url = result.get("url", "")
+        state["invoice_uuid"] = result.get("uuid", "")
+    else:
+        error = invoice_resp.get("error", "Unknown error")
+        logger.error(f"Failed to create invoice for chat {chat_id}: {error}")
+        await bot.send_message(
+            chat_id,
+            f"Failed to create payment invoice. "
+            f"Please contact admin @{ADMIN_USERNAME}.",
+            parse_mode="HTML",
+        )
+        # Do NOT continue into payment monitoring when no invoice exists.
+        # Leave the stage unchanged so the deal can be retried.
+        save_deal_states()
+        return
+
+    kb_rows = []
+    if payment_url:
+        kb_rows.append([InlineKeyboardButton(text="Pay with Cryptomus", url=payment_url)])
+    kb_rows.append([InlineKeyboardButton(text="Money Received (Admin Only)", callback_data="admin_confirm")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    payment_msg = (
+        f"<b>PAYMENT INFORMATION</b>\n"
+        f"{'=' * 30}\n\n"
+        f"Buyer needs to pay: <b>{buyer_amount} USDT</b>\n"
+        f"Seller will receive: <b>{seller_amount} USDT</b>\n"
+        f"Escrow Fee: <b>{fee} USDT</b>\n\n"
+        f"<b>Baloch Escrow fee: 3% (minimum $3)</b>\n\n"
+    )
+    if payment_url:
+        payment_msg += (
+            f"Tap the button below to pay securely through Cryptomus:\n{payment_url}\n\n"
+        )
+    payment_msg += (
+        f"Payment will be <b>automatically detected</b> once completed.\n\n"
+        f"{'=' * 30}\n\n"
+        f"<i>Admin: tap the button or reply <b>received</b> to confirm payment manually if needed.</i>"
+    )
+
+    await bot.send_message(chat_id, payment_msg, parse_mode="HTML", reply_markup=kb)
+
+    state["stage"] = "payment_monitoring"
+    state["payment_start_time"] = time.time()
+
+    if chat_id in payment_monitoring_tasks:
+        payment_monitoring_tasks[chat_id].cancel()
+
+    task = asyncio.create_task(continuous_payment_monitoring(chat_id, order_id, duration_minutes=120))
+    payment_monitoring_tasks[chat_id] = task
+
+
+# ==============================================
+# AUTOMATIC PAYOUT TO SELLER
+# ==============================================
+
+async def payout_to_seller(address: str, address_type: str, network: str, amount: float, chat_id: int) -> tuple[bool, str]:
+    """Process automatic payout to seller via Cryptomus Payout API."""
+    try:
+        if address_type not in ("TRC20", "BEP20"):
+            return False, "Only BEP20 and TRC20 withdrawals are supported."
+
+        payout_order_id = generate_order_id(chat_id, "payout")
+        resp = await cryptomus_create_payout(amount, address, network, payout_order_id)
+
+        if resp.get("ok"):
+            result = resp["result"]
+            payout_uuid = result.get("uuid", "-")
+            payout_status = result.get("status", "process")
+            logger.info(f"Payout created: uuid={payout_uuid}, status={payout_status}, amount={amount}")
+
+            # Poll for up to 120s. NEVER declare success on timeout:
+            # an unknown payout status must be verified manually.
+            for _ in range(24):  # 24 * 5s = 120s
+                await asyncio.sleep(5)
+                check_resp = await cryptomus_check_payout(payout_order_id)
+                if check_resp.get("ok"):
+                    check_status = check_resp["result"].get("status", "")
+                    txid = check_resp["result"].get("txid", "")
+                    if check_status == "paid":
+                        return True, f"Payout successful!\nTx ID: {txid or payout_uuid}"
+                    elif check_status in ("fail", "cancel", "system_fail"):
+                        return False, f"Payout failed with status: {check_status}"
+
+            return False, (
+                "Payout status unknown after 120s (still processing on Cryptomus).\n"
+                f"Payout ID: {payout_uuid}\n"
+                "DO NOT retry automatically - verify manually before re-attempting."
+            )
+        else:
+            error = resp.get("error", "Unknown error")
+            return False, f"Cryptomus payout error: {error}"
+
+    except Exception as e:
+        logger.error(f"Payout error: {e}")
+        return False, f"Withdrawal error: {str(e)}"
+
+
+# ==============================================
+# ==============================================
+# TEXT COMMAND ROUTER (replaces all inline buttons)
+# ==============================================
+# Users TYPE commands instead of tapping buttons.
+# route_text_command() runs FIRST in universal_stage_handler and consumes
+# command messages for the current stage. Anything else falls through to
+# the existing stage/AI handling.
+# All interaction logic lives in the do_* functions below; the legacy
+# @dp.callback_query handlers further down are thin wrappers over the
+# same functions (so any old button messages still work).
+
+YES_WORDS = {
+    "yes", "y", "yeah", "yep", "confirm", "confirmed", "agree", "agreed",
+    "ok", "okay", "sure", "haan", "han", "jee", "ji",
+}
+NO_WORDS = {
+    "no", "n", "nope", "cancel", "reject", "rejected", "renegotiate",
+    "disagree", "disagreed", "nahi", "na",
+}
+
+# Deal-question typed answers: question index -> {typed text: canonical answer id}
+DQ_TEXT_MAP = {
+    1: {  # "If an account gets blocked..." -> Refund to Buyer / Release to Seller
+        "1": "dq_blocked_refund", "one": "dq_blocked_refund",
+        "refund": "dq_blocked_refund", "refund to buyer": "dq_blocked_refund",
+        "buyer": "dq_blocked_refund",
+        "2": "dq_blocked_release", "two": "dq_blocked_release",
+        "release": "dq_blocked_release", "release to seller": "dq_blocked_release",
+        "seller": "dq_blocked_release",
+    },
+}
+
+
+def _normalize_cmd(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _is_admin_user(user: types.User) -> bool:
+    return user.id == ADMIN_USER_ID or (user.username or "").lower() == ADMIN_USERNAME.lower()
+
+
+# ----------------------------------------------
+# ROLE SELECTION (text version)
+# ----------------------------------------------
+
+# ----------------------------------------------
+# DEAL SETUP — BATCH Q&A (Shawn's manual flow, 2026-10-10)
+# Bot sends 2 batched messages. Either party answers (one or many messages).
+# AI extracts everything. Then the OTHER party confirms (agree/disagree).
+# If disagree -> ask what changes, apply, re-confirm with the other party. Loop.
+# ----------------------------------------------
+QA_BATCH_MSG_1 = (
+    "<b>Deal Details</b> — please reply with the following "
+    "(one message or multiple, either of you can answer):\n\n"
+    "1. Price in USDT? (excluding escrow fees)\n"
+    "2. Who pays the escrow fee? (Buyer / Seller / Split 50-50)\n"
+    "3. Description of product/service + requirements?\n"
+    "4. What will be the proof of successful completion?\n"
+    "5. Deadline?"
+)
+
+QA_BATCH_MSG_2 = (
+    "<b>Account Details:</b>\n\n"
+    "6. Account new or with transactions?\n"
+    "7. Account geo + owner country?\n"
+    "8. Documents in the account kit? (or 'none')\n"
+    "9. Any other important info? (or 'none')"
+)
+
+
+async def send_batch_questions(chat_id: int):
+    """Send the 2 batched question messages, mentioning BOTH parties."""
+    state = deal_states.get(chat_id)
+    if not state:
+        return
+    # Guard against duplicate sends
+    if state.get("_batch_sent"):
+        return
+    state["_batch_sent"] = True
+    state["stage"] = "deal_batch_qa"
+    state["qa_provider"] = None
+    buyer_name = await get_username(state.get("buyer"), "Buyer")
+    seller_name = await get_username(state.get("seller"), "Seller")
+    await bot.send_message(
+        chat_id,
+        f"{buyer_name} {seller_name},\n\n{QA_BATCH_MSG_1}",
+        parse_mode="HTML",
+    )
+    await bot.send_message(
+        chat_id,
+        QA_BATCH_MSG_2,
+        parse_mode="HTML",
+    )
+
+
+def _qa_summary_text(state: dict) -> str:
+    """Build the deal summary from Q&A answers."""
+    amount = state.get("amount", "Not specified")
+    fee_pref = state.get("fee_preference", "Not specified")
+    fee_display = {"buyer": "Buyer pays", "seller": "Seller pays", "half": "Split 50-50"}.get(fee_pref, fee_pref)
+    description = state.get("description", "Not specified")
+    proof = state.get("proof_of_completion", "Not specified")
+    deadline = state.get("deadline", "Not specified")
+    account_age = state.get("account_age", "Not specified")
+    account_geo = state.get("account_geo", "Not specified")
+    account_docs = state.get("account_documents", [])
+    docs_text = ", ".join(account_docs) if account_docs else "None"
+    additional = state.get("additional_info", "")
+    additional_line = f"<b>Additional Info:</b> {additional}\n" if additional else ""
+    return (
+        f"<b>DEAL SUMMARY</b>\n"
+        f"{'=' * 30}\n\n"
+        f"<b>Price:</b> {amount} USDT (excl. escrow fees)\n"
+        f"<b>Escrow Fee Paid By:</b> {fee_display}\n"
+        f"<b>Description:</b> {description}\n"
+        f"<b>Proof of Completion:</b> {proof}\n"
+        f"<b>Deadline:</b> {deadline}\n"
+        f"<b>Account:</b> {account_age}\n"
+        f"<b>Account Geo / Owner:</b> {account_geo}\n"
+        f"<b>Documents in Kit:</b> {docs_text}\n"
+        f"{additional_line}"
+        f"\n{'=' * 30}"
+    )
+
+
+async def present_qa_for_confirmation(chat_id: int):
+    """Present Q&A summary to the OTHER party (not the provider) for agree/disagree."""
+    state = deal_states.get(chat_id)
+    if not state:
+        return
+    provider = state.get("qa_provider")
+    buyer = state.get("buyer")
+    seller = state.get("seller")
+    # Confirmer = the party who did NOT provide the details (or the other one)
+    if provider == buyer:
+        confirmer = seller
+    elif provider == seller:
+        confirmer = buyer
+    else:
+        confirmer = seller  # default
+    state["qa_confirmer"] = confirmer
+    state["stage"] = "deal_qa_confirm"
+    confirmer_name = await get_username(confirmer, "Party")
+    provider_name = await get_username(provider, "The other party")
+    await bot.send_message(
+        chat_id,
+        f"{_qa_summary_text(state)}\n\n"
+        f"{confirmer_name}, {provider_name} provided these deal terms.\n"
+        f"<b>Do you agree? Reply: agree / disagree</b>",
+        parse_mode="HTML",
+    )
+
+
+def _apply_qa_analysis(state: dict, analysis: dict) -> bool:
+    """Apply AI-extracted fields to state. Returns True if anything was updated."""
+    _junk = ("agree", "disagree", "yes", "no", "none", "ok", "skip")
+    updated = False
+    if analysis.get("amount") is not None:
+        try:
+            state["amount"] = float(analysis["amount"])
+            updated = True
+        except (TypeError, ValueError):
+            pass
+    for _k in ("description", "proof_of_completion", "deadline", "account_geo",
+               "additional_info", "account_age"):
+        _v = analysis.get(_k)
+        if _v and isinstance(_v, str) and _v.strip().lower() not in _junk:
+            state[_k] = _v.strip()
+            updated = True
+    if analysis.get("fee_preference") in ("buyer", "seller", "half"):
+        state["fee_preference"] = analysis["fee_preference"]
+        updated = True
+    if isinstance(analysis.get("account_documents"), list):
+        state["account_documents"] = analysis["account_documents"]
+        updated = True
+    # Legacy "documents" key -> account_documents
+    if isinstance(analysis.get("documents"), list) and not state.get("account_documents"):
+        state["account_documents"] = analysis["documents"]
+        updated = True
+    return updated
+
+
+async def do_role_select(chat_id: int, user: types.User, role: str):
+    """Handle 'buyer' / 'seller' typed reply."""
+    # Service/admin accounts can never take a deal role
+    if _is_service_account(user):
+        return
+    username = user.username or "User"
+    if chat_id not in deal_states:
+        deal_states[chat_id] = {"stage": "role_selection", "members": {}, "conversation_history": []}
+    state = deal_states[chat_id]
+
+    if state.get("members", {}).get(user.id):
+        await bot.send_message(chat_id, f"@{username}, you have already selected a role.")
+        return
+    if role in state:
+        await bot.send_message(chat_id, f"The {role} role is already taken.")
+        return
+
+    state.setdefault("members", {})[user.id] = role
+    state[role] = user.id
+    await bot.send_message(chat_id, f"@{username}, you are the <b>{role.capitalize()}</b>.", parse_mode="HTML")
+
+    if "buyer" not in state or "seller" not in state:
+        try:
+            chat = await bot.get_chat(chat_id)
+            group_link = await get_group_invite_link(chat)
+        except Exception:
+            group_link = ""
+        await bot.send_message(
+            chat_id,
+            f"<b>Share this group link with your deal partner:</b>\n{group_link}",
+            parse_mode="HTML",
+        )
+    else:
+        # BOTH ROLES ASSIGNED -> SEND BATCHED DEAL QUESTIONS
+        buyer_name = await get_username(state["buyer"], "Buyer")
+        seller_name = await get_username(state["seller"], "Seller")
+        state.setdefault("conversation_history", [])
+        await bot.send_message(
+            chat_id,
+            f"<b>Both parties are here! Let's set up your deal.</b> ✅",
+            parse_mode="HTML",
+        )
+        await send_batch_questions(chat_id)
+
+
+# ----------------------------------------------
+# DEAL CONFIRMATION (text version)
+# ----------------------------------------------
+
+async def do_deal_confirm(chat_id: int, user: types.User, action: str):
+    """Handle 'confirm' / 'reject' typed reply. action = 'yes' | 'no'."""
+    state = deal_states.get(chat_id)
+    if not state or state.get("stage") != "deal_confirmation":
+        return
+    user_id = user.id
+    if user_id != state.get("buyer") and user_id != state.get("seller"):
+        await bot.send_message(chat_id, "Only the buyer or seller can confirm.")
+        return
+
+    if action == "no":
+        state["stage"] = "deal_negotiation"
+        state.pop("buyer_confirmed", None)
+        state.pop("seller_confirmed", None)
+        buyer_name = await get_username(state["buyer"], "Buyer")
+        seller_name = await get_username(state["seller"], "Seller")
+        await bot.send_message(
+            chat_id,
+            f"Deal terms rejected. {buyer_name} and {seller_name}, "
+            f"please continue your negotiation.\n\n"
+            f"<i>Discuss the terms and our AI will detect when you reach an agreement.</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    buyer_name = await get_username(state["buyer"], "Buyer")
+    seller_name = await get_username(state["seller"], "Seller")
+
+    if user_id == state.get("buyer"):
+        state["buyer_confirmed"] = True
+        confirmer, other = buyer_name, seller_name
+    elif user_id == state.get("seller"):
+        state["seller_confirmed"] = True
+        confirmer, other = seller_name, buyer_name
+    else:
+        return
+
+    # Ask the OTHER party in clear English (text, not buttons)
+    if not (state.get("buyer_confirmed") and state.get("seller_confirmed")):
+        await bot.send_message(
+            chat_id,
+            f"{other}, {confirmer} has confirmed the deal terms.\n"
+            f"<b>Do you agree? Reply: agree / disagree</b>",
+            parse_mode="HTML",
+        )
+        return
+
+    if state.get("buyer_confirmed") and state.get("seller_confirmed"):
+        await bot.send_message(
+            chat_id,
+            f"<b>Deal Confirmed by both parties!</b>\n\n"
+            f"Before we proceed, both parties need to answer a few important questions:",
+            parse_mode="HTML",
+        )
+        await ask_deal_question(chat_id, 0)
+
+
+# ----------------------------------------------
+# DEAL QUESTIONS (text version)
+# ----------------------------------------------
+
+async def do_deal_question_answer(chat_id: int, user: types.User, answer_data: str):
+    """Record a typed answer to the current deal question.
+    answer_data is the canonical id (e.g. 'dq_dispute_yes', 'dq_deadline_ask')."""
+    state = deal_states.get(chat_id, {})
+    if state.get("stage") != "deal_questions":
+        return
+    user_id = user.id
+    if user_id != state.get("buyer") and user_id != state.get("seller"):
+        await bot.send_message(chat_id, "Only deal participants can answer.")
+        return
+
+    question_index = state.get("current_question_index", 0)
+    q = DEAL_QUESTIONS[question_index]
+
+    answers_key = f"dq_answers_{question_index}"
+    if answers_key not in state:
+        state[answers_key] = {}
+    state[answers_key][user_id] = answer_data
+
+    buyer_answered = state.get("buyer") in state[answers_key]
+    seller_answered = state.get("seller") in state[answers_key]
+
+    if buyer_answered and seller_answered:
+        state[f"deal_question_{q['key']}"] = {
+            "buyer_answer": state[answers_key].get(state["buyer"]),
+            "seller_answer": state[answers_key].get(state["seller"]),
+        }
+        username = await get_username(user_id, "User")
+        await bot.send_message(chat_id, f"{username} answered. Both parties responded!", parse_mode="HTML")
+        await ask_deal_question(chat_id, question_index + 1)
+    else:
+        username = await get_username(user_id, "User")
+        other_role = "seller" if user_id == state.get("buyer") else "buyer"
+        other_name = await get_username(state.get(other_role, 0), other_role.capitalize())
+        await bot.send_message(
+            chat_id,
+            f"{username} answered. Waiting for {other_name} to respond.",
+            parse_mode="HTML",
+        )
+
+
+# ----------------------------------------------
+# FEE SELECTION & OPTIONS (text version)
+# ----------------------------------------------
+
+async def do_fee_select(chat_id: int, user: types.User, fee_payer: str):
+    """Buyer types 'buyer' / 'seller' / 'half'."""
+    state = deal_states.get(chat_id)
+    if not state or state.get("stage") != "fee_selection":
+        return
+    if user.id != state["buyer"]:
+        await bot.send_message(chat_id, "Only the buyer can select who pays the fee.")
+        return
+
+    amount = state["amount"]
+    buyer_amount, seller_amount, fee = calculate_fee(amount, fee_payer)
+
+    if fee_payer == "buyer":
+        state["fee_payer"] = fee_payer
+        state["buyer_amount"] = buyer_amount
+        state["seller_amount"] = seller_amount
+        state["fee"] = fee
+        state["stage"] = "payment"
+        await show_payment_info(chat_id)
+    else:
+        state["temp_fee_payer"] = fee_payer
+        state["temp_buyer_amount"] = buyer_amount
+        state["temp_seller_amount"] = seller_amount
+        state["temp_fee"] = fee
+        state["stage"] = "fee_confirmation"
+        seller_name = await get_username(state["seller"], "Seller")
+        label = "half " if fee_payer == "half" else ""
+        await bot.send_message(
+            chat_id,
+            f"{seller_name}, the buyer selected that you pay the {label}fee. Do you agree?\n"
+            f"Reply: <b>yes</b> / <b>no</b>",
+            parse_mode="HTML",
+        )
+
+
+async def do_fee_confirm(chat_id: int, user: types.User, action: str):
+    """Seller types 'yes' / 'no' to the fee proposal."""
+    state = deal_states.get(chat_id, {})
+    if state.get("stage") != "fee_confirmation":
+        return
+    if user.id != state["seller"]:
+        await bot.send_message(chat_id, "Only seller can confirm.")
+        return
+
+    if action == "no":
+        state["stage"] = "fee_selection"
+        await bot.send_message(
+            chat_id,
+            "Who will pay the escrow fee?\nReply: <b>buyer</b> / <b>seller</b> / <b>half</b>",
+            parse_mode="HTML",
+        )
+    else:
+        state["fee_payer"] = state.pop("temp_fee_payer")
+        state["buyer_amount"] = state.pop("temp_buyer_amount")
+        state["seller_amount"] = state.pop("temp_seller_amount")
+        state["fee"] = state.pop("temp_fee")
+        state["stage"] = "fee_option"
+        seller_name = await get_username(state["seller"], "Seller")
+        await bot.send_message(
+            chat_id,
+            f"{seller_name}, how would you like to pay the fee?\n"
+            f"Reply: <b>include</b> (fee included in deal amount) / <b>separate</b> (pay fee upfront separately)",
+            parse_mode="HTML",
+        )
+
+
+async def do_fee_include(chat_id: int, user: types.User):
+    """Seller types 'include'."""
+    state = deal_states.get(chat_id, {})
+    if state.get("stage") != "fee_option" or user.id != state.get("seller"):
+        await bot.send_message(chat_id, "Only seller can choose.")
+        return
+
+    buyer_name = await get_username(state["buyer"], "Buyer")
+    state["pending_fee_option"] = "include"
+    state["stage"] = "fee_option_buyer_confirm"
+    await bot.send_message(
+        chat_id,
+        f"Seller chose: Include fee in the deal amount.\n"
+        f"Buyer will pay: <b>{state['buyer_amount']}</b> USDT\n"
+        f"Seller will receive: <b>{state['seller_amount']}</b> USDT\n"
+        f"Escrow Fee: <b>{state['fee']}</b> USDT\n\n"
+        f"{buyer_name}, do you agree?\nReply: <b>yes</b> / <b>no</b>",
+        parse_mode="HTML",
+    )
+
+
+async def do_fee_separate(chat_id: int, user: types.User):
+    """Seller types 'separate'."""
+    state = deal_states.get(chat_id, {})
+    if state.get("stage") != "fee_option" or user.id != state.get("seller"):
+        await bot.send_message(chat_id, "Only seller can choose.")
+        return
+
+    fee_payer = state["fee_payer"]
+    fee = state["fee"]
+    amount = state["amount"]
+    seller_fee = fee if fee_payer == "seller" else fee / 2
+    buyer_amount = amount + (fee / 2 if fee_payer == "half" else 0)
+    buyer_name = await get_username(state["buyer"], "Buyer")
+
+    state["pending_fee_option"] = "separate"
+    state["stage"] = "fee_option_buyer_confirm"
+    await bot.send_message(
+        chat_id,
+        f"Seller chose: Pay fee separately upfront.\n"
+        f"Seller pays fee upfront: <b>{round(seller_fee, 2)}</b> USDT\n"
+        f"Buyer will pay: <b>{round(buyer_amount, 2)}</b> USDT\n"
+        f"Seller will receive: <b>{round(amount, 2)}</b> USDT\n"
+        f"Escrow Fee: <b>{round(fee, 2)}</b> USDT\n\n"
+        f"{buyer_name}, do you agree?\nReply: <b>yes</b> / <b>no</b>",
+        parse_mode="HTML",
+    )
+
+
+async def do_fee_option_buyer_confirm(chat_id: int, user: types.User, action: str):
+    """Buyer types 'yes' / 'no' to the seller's fee-payment option."""
+    state = deal_states.get(chat_id, {})
+    if state.get("stage") != "fee_option_buyer_confirm" or user.id != state.get("buyer"):
+        await bot.send_message(chat_id, "Only the buyer can confirm.")
+        return
+
+    seller_name = await get_username(state["seller"], "Seller")
+
+    if action == "no":
+        state["stage"] = "fee_option"
+        await bot.send_message(
+            chat_id,
+            f"{seller_name}, buyer rejected the option. Please choose again:\n"
+            f"Reply: <b>include</b> / <b>separate</b>",
+            parse_mode="HTML",
+        )
+        return
+
+    pending = state.pop("pending_fee_option", None)
+    fee = state["fee"]
+    amount = state["amount"]
+    fee_payer = state["fee_payer"]
+
+    if pending == "include":
+        state["fee_separate"] = False
+        state["stage"] = "payment"
+        await show_payment_info(chat_id)
+    else:
+        seller_fee = fee if fee_payer == "seller" else fee / 2
+        buyer_amount = amount + (fee / 2 if fee_payer == "half" else 0)
+
+        state["buyer_amount"] = round(buyer_amount, 2)
+        state["seller_amount"] = round(amount, 2)
+        state["seller_fee"] = round(seller_fee, 2)
+        state["fee_separate"] = True
+
+        fee_order_id = generate_order_id(chat_id, "fee")
+        state["fee_order_id"] = fee_order_id
+
+        fee_invoice = await cryptomus_create_invoice(seller_fee, fee_order_id, lifetime=3600)
+
+        fee_url = ""
+        if fee_invoice.get("ok"):
+            fee_url = fee_invoice["result"].get("url", "")
+            state["fee_invoice_uuid"] = fee_invoice["result"].get("uuid", "")
+
+        kb_rows = []
+        if fee_url:
+            kb_rows.append([InlineKeyboardButton(text="Pay Fee with Cryptomus", url=fee_url)])
+        kb_rows.append([InlineKeyboardButton(text="Fee Received (Admin Only)", callback_data="admin_fee_confirm")])
+        fee_kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+        fee_msg = (
+            f"<b>SELLER FEE PAYMENT</b>\n"
+            f"{'=' * 30}\n\n"
+            f"Seller needs to pay: <b>{state['seller_fee']}</b> USDT\n\n"
+            f"<b>Baloch Escrow fees: 3% (minimum $3)</b>\n\n"
+        )
+        if fee_url:
+            fee_msg += f"Tap the button below to pay securely through Cryptomus:\n{fee_url}\n\n"
+        fee_msg += (
+            f"Payment will be <b>automatically detected</b> once completed.\n"
+            f"Seller: reply <b>paid</b> after paying.\n\n"
+            f"{'=' * 30}\n\n"
+            f"<i>Admin: tap the button or reply <b>received</b> to confirm manually.</i>"
+        )
+        await bot.send_message(chat_id, fee_msg, parse_mode="HTML", reply_markup=fee_kb)
+        state["stage"] = "seller_fee_payment"
+
+        if chat_id in payment_monitoring_tasks:
+            payment_monitoring_tasks[chat_id].cancel()
+
+        async def monitor_seller_fee():
+            try:
+                for _ in range(360):  # 30 min
+                    if chat_id not in deal_states or deal_states[chat_id].get("stage") != "seller_fee_payment":
+                        return
+                    resp = await cryptomus_check_invoice(fee_order_id)
+                    if resp.get("ok"):
+                        status = resp["result"].get("payment_status") or resp["result"].get("status", "")
+                        if status in ("paid", "paid_over"):
+                            deal_states[chat_id]["stage"] = "payment"
+                            await bot.send_message(chat_id, "<b>Fee Payment Confirmed!</b>\nNow waiting for buyer payment.", parse_mode="HTML")
+                            await show_payment_info(chat_id)
+                            return
+                    elif "not configured" in resp.get("error", ""):
+                        return
+                    await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"Fee monitoring error: {e}")
+
+        task = asyncio.create_task(monitor_seller_fee())
+        payment_monitoring_tasks[chat_id] = task
+
+
+# ----------------------------------------------
+# FEE PAID CHECK / ADMIN FEE CONFIRM (text version)
+# ----------------------------------------------
+
+async def do_fee_paid_check(chat_id: int, user: types.User):
+    """Seller types 'paid' - check whether the seller fee invoice was paid."""
+    state = deal_states.get(chat_id, {})
+    if state.get("stage") != "seller_fee_payment" or user.id != state.get("seller"):
+        await bot.send_message(chat_id, "Only the seller can confirm fee payment.")
+        return
+
+    await bot.send_message(chat_id, "Checking fee payment. Please wait...")
+
+    fee_order_id = state.get("fee_order_id", "")
+    if not fee_order_id:
+        await bot.send_message(chat_id, "Error: No fee invoice found. Please contact admin.")
+        return
+
+    for _ in range(36):  # 3 min
+        resp = await cryptomus_check_invoice(fee_order_id)
+        if resp.get("ok"):
+            status = resp["result"].get("payment_status") or resp["result"].get("status", "")
+            if status in ("paid", "paid_over"):
+                state["stage"] = "payment"
+                await bot.send_message(chat_id, "<b>Fee Payment Confirmed!</b>\nNow waiting for buyer payment.", parse_mode="HTML")
+                await show_payment_info(chat_id)
+                return
+            if status in ("cancel", "fail"):
+                break
+        elif "not configured" in resp.get("error", ""):
+            break
+        await asyncio.sleep(5)
+
+    await bot.send_message(
+        chat_id,
+        "<b>Fee payment not detected.</b>\n\nPlease contact admin or wait for manual confirmation.\n"
+        f"<i>Admin: reply <b>received</b> to confirm manually.</i>",
+        parse_mode="HTML",
+    )
+
+
+async def do_admin_fee_confirm(chat_id: int, user: types.User):
+    """Admin types 'received' during seller fee payment."""
+    if not _is_admin_user(user):
+        await bot.send_message(chat_id, "Only admin can confirm.")
+        return
+    state = deal_states.get(chat_id, {})
+    state["stage"] = "payment"
+    await bot.send_message(chat_id, "<b>Fee Payment Confirmed by Admin!</b>\nNow waiting for buyer payment.", parse_mode="HTML")
+    await show_payment_info(chat_id)
+
+
+# ----------------------------------------------
+# BUYER "PAID" INFO / ADMIN PAYMENT CONFIRM (text version)
+# ----------------------------------------------
+
+async def do_payment_paid_info(chat_id: int, user: types.User):
+    """Buyer types 'paid' - payment is auto-detected; reassure them."""
+    state = deal_states.get(chat_id, {})
+    if state.get("stage") not in ("payment", "payment_monitoring"):
+        return
+    if user.id != state.get("buyer"):
+        return
+    await bot.send_message(
+        chat_id,
+        "<i>Payment is being automatically monitored. "
+        "You will be notified as soon as your payment is detected.</i>",
+        parse_mode="HTML",
+    )
+
+
+async def do_admin_confirm(chat_id: int, user: types.User):
+    """Admin types 'received' - manually confirm buyer payment."""
+    if not _is_admin_user(user):
+        await bot.send_message(chat_id, "Only admin can confirm.")
+        return
+    state = deal_states.get(chat_id, {})
+    state["stage"] = "work"
+    state["payment_confirmed_at"] = time.time()
+    seller_name = await get_username(state["seller"], "Seller")
+    await pin_deal_details(chat_id)
+    await bot.send_message(
+        chat_id,
+        f"<b>Money Received Confirmed by Admin!</b>\n\n"
+        f"{seller_name}, you can start your work in private.\n"
+        f"If any issue, I am here.",
+        parse_mode="HTML",
+    )
+    await send_action_buttons_to_all(chat_id)
+    asyncio.create_task(schedule_deadline_reminder(chat_id))
+
+
+# ----------------------------------------------
+# DISPUTE (text version)
+# ----------------------------------------------
+
+def _is_frozen_for_user(state: dict, user: types.User) -> bool:
+    """True if the deal is disputed AND the user is not an admin.
+    Frozen deals block release/refund for buyer/seller; admin can still act."""
+    if not state.get("disputed"):
+        return False
+    return not _is_admin_user(user)
+
+
+async def do_dispute_resolve(chat_id: int, user: types.User):
+    """Admin types 'resolve dispute' — unfreezes the deal."""
+    if chat_id not in deal_states:
+        return
+    state = deal_states[chat_id]
+    if not _is_admin_user(user):
+        await bot.send_message(chat_id, "Only admin can resolve a dispute.")
+        return
+    if not state.get("disputed"):
+        await bot.send_message(chat_id, "No open dispute on this deal.")
+        return
+    state["disputed"] = False
+    state.pop("dispute_by", None)
+    state.pop("dispute_at", None)
+    save_deal_states()
+    await bot.send_message(
+        chat_id,
+        "✅ <b>Dispute resolved by admin.</b> Deal is unfrozen — release/refund are available again.",
+        parse_mode="HTML",
+    )
+    await safe_notify_admin(f"[DISPUTE RESOLVED]\nChat: {chat_id}")
+
+
+async def do_dispute(chat_id: int, user: types.User):
+    """Anyone types 'dispute'. FREEZES the deal: release/refund blocked until admin resolves."""
+    if chat_id not in deal_states:
+        return
+    state = deal_states[chat_id]
+    # Freeze the deal — no money moves until admin resolves.
+    state["disputed"] = True
+    state["dispute_by"] = user.id
+    state["dispute_at"] = time.time()
+    save_deal_states()
+    disputer_name = f"@{user.username}" if user.username else (user.first_name or "User")
+    await bot.send_message(
+        chat_id,
+        f"🚨 <b>Dispute raised by {disputer_name}!</b>\n\n"
+        f"🔒 <b>Deal is now FROZEN.</b> Release and refund are blocked until admin resolves.\n"
+        f"Admin @{ADMIN_USERNAME} will review the deal.",
+        parse_mode="HTML",
+    )
+    try:
+        chat = await bot.get_chat(chat_id)
+        group_title = chat.title or str(chat_id)
+        group_link = await get_group_invite_link(chat)
+    except Exception:
+        group_title = str(chat_id)
+        group_link = ""
+    disputer = user.username or user.first_name
+    await safe_notify_admin(
+        f"[DISPUTE RAISED]\n"
+        f"Group: {group_title} ({group_link})\n"
+        f"Raised by: @{disputer}\n"
+        f"Amount: {deal_states[chat_id].get('buyer_amount', 'Unknown')} USDT"
+    )
+
+
+# ----------------------------------------------
+# RELEASE PAYMENT (text version)
+# ----------------------------------------------
+
+async def do_release(chat_id: int, user: types.User):
+    """Buyer/admin types 'release' - ask for typed confirmation."""
+    state = deal_states.get(chat_id, {})
+    if state.get("stage") != "work":
+        return
+    # Frozen deal: blocked for non-admins.
+    if _is_frozen_for_user(state, user):
+        await bot.send_message(chat_id, "🔒 <b>Deal is frozen due to an open dispute.</b> Release is blocked until admin resolves.", parse_mode="HTML")
+        return
+    if state.get("payout_done"):
+        await bot.send_message(chat_id, "<b>⚠️ Payout has already been sent for this deal. No duplicate payouts allowed.</b>", parse_mode="HTML")
+        return
+    user_id = user.id
+    if not (user_id == state.get("buyer") or _is_admin_user(user)):
+        await bot.send_message(chat_id, "Only buyer or admin can release payment.")
+        return
+    state["awaiting"] = "release_confirm"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Yes", callback_data="release_confirm"),
+        InlineKeyboardButton(text="No", callback_data="release_cancel"),
+    ]])
+    await bot.send_message(
+        chat_id,
+        "Are you ready to release payment to seller?\n"
+        "Tap <b>Yes</b> / <b>No</b>, or reply: <b>confirm</b> / <b>cancel</b>",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+async def do_release_confirm(chat_id: int, user: types.User):
+    """Buyer/admin types 'confirm' - proceed to payout address."""
+    if chat_id not in deal_states:
+        return
+    state = deal_states[chat_id]
+    if _is_frozen_for_user(state, user):
+        await bot.send_message(chat_id, "🔒 <b>Deal is frozen due to an open dispute.</b> Release is blocked until admin resolves.", parse_mode="HTML")
+        return
+    if state.get("payout_done"):
+        await bot.send_message(chat_id, "Payout has already been processed for this deal.")
+        return
+    user_id = user.id
+    if not (user_id == state.get("buyer") or _is_admin_user(user)):
+        await bot.send_message(chat_id, "Only the buyer or admin can confirm payment release.")
+        return
+    state.pop("awaiting", None)
+    seller_name = await get_username(state["seller"], "Seller")
+    state["stage"] = "payout_address"
+    await bot.send_message(chat_id, f"{seller_name}, please send your payout address (USDT TRC20 or USDT BEP20 only).")
+
+
+async def do_release_cancel(chat_id: int, user: types.User):
+    """Buyer/admin types 'cancel' - abort the release."""
+    if chat_id not in deal_states:
+        return
+    state = deal_states[chat_id]
+    user_id = user.id
+    if not (user_id == state.get("buyer") or _is_admin_user(user)):
+        await bot.send_message(chat_id, "Only the buyer or admin can cancel payment release.")
+        return
+    state.pop("awaiting", None)
+    state["stage"] = "work"
+    await send_action_buttons_to_all(chat_id)
+
+
+# ----------------------------------------------
+# ADDRESS CONFIRMATION & AUTOMATIC PAYOUT (text version)
+# *** MONEY LOGIC - payout_in_progress flag set BEFORE any await ***
+# ----------------------------------------------
+
+async def do_address_confirm(chat_id: int, user: types.User):
+    """Seller types 'yes' - confirm payout address and execute payout."""
+    state = deal_states.get(chat_id, {})
+    if state.get("stage") != "address_confirmation":
+        return
+    if user.id != state.get("seller"):
+        await bot.send_message(chat_id, "Only the seller can confirm the address.")
+        return
+
+    # Check duplicate payout. The in-progress flag is set BEFORE the payout
+    # await below, which closes the double-payout race (concurrent messages).
+    if state.get("payout_done") or state.get("payout_in_progress"):
+        await bot.send_message(chat_id, "Payout is already being processed for this deal.")
+        return
+
+    # Claim the payout slot BEFORE any await -> no two messages can pass this point.
+    state["payout_in_progress"] = True
+    save_deal_states()
+
+    amount = state["seller_amount"]
+    address = state["payout_address"]
+    address_type = state["address_type"]
+    network = state["address_network"]
+
+    await bot.send_message(chat_id, "Processing withdrawal. Please wait...")
+
+    ok, payout_msg = await payout_to_seller(address, address_type, network, amount, chat_id)
+
+    if ok:
+        # Mark payout as done to prevent duplicates
+        state["payout_done"] = True
+        state.pop("payout_in_progress", None)
+        save_deal_states()
+        await bot.send_message(
+            chat_id,
+            f"<b>Deal Completed and payout sent!</b>\n\n"
+            f"{payout_msg}\n\n"
+            f"<b>Thanks for choosing and trusting Baloch OTC</b>\n"
+            f"<b>You can use Baloch OTC any time 24/7.</b>\n"
+            f"<b>Website: https://balochotc.com/</b>",
+            parse_mode="HTML",
+        )
+        # Wipe deal state ONLY on confirmed success
+        if chat_id in payment_monitoring_tasks:
+            payment_monitoring_tasks[chat_id].cancel()
+            del payment_monitoring_tasks[chat_id]
+        del deal_states[chat_id]
+        save_deal_states()
+    else:
+        # Keep the deal state on failure so admin can retry manually.
+        state.pop("payout_in_progress", None)
+        state["stage"] = "payout_failed"
+        state["payout_error"] = payout_msg
+        save_deal_states()
+        await bot.send_message(
+            chat_id,
+            f"Deal completed, but payout failed: {payout_msg}\n"
+            f"Please contact admin @{ADMIN_USERNAME} for manual payout.",
+            parse_mode="HTML",
+        )
+        await safe_notify_admin(
+            f"⚠️ PAYOUT FAILED (chat {chat_id})\n"
+            f"Amount: {amount}\nAddress: {address}\n"
+            f"Error: {payout_msg}\n"
+            f"Deal state preserved for manual retry."
+        )
+
+
+async def do_address_reject(chat_id: int, user: types.User):
+    """Seller types 'no' - re-enter payout address."""
+    state = deal_states.get(chat_id)
+    if not state or state.get("stage") != "address_confirmation":
+        return
+    seller_name = await get_username(state["seller"], "Seller")
+    state["stage"] = "payout_address"
+    await bot.send_message(chat_id, f"{seller_name}, please send your payout address again (USDT TRC20 or USDT BEP20 only).")
+
+
+# ----------------------------------------------
+# REFUND (text version)
+# ----------------------------------------------
+
+async def do_refund(chat_id: int, user: types.User):
+    """Seller/admin types 'refund' - ask for typed confirmation."""
+    state = deal_states.get(chat_id, {})
+    if state.get("stage") != "work":
+        return
+    if _is_frozen_for_user(state, user):
+        await bot.send_message(chat_id, "🔒 <b>Deal is frozen due to an open dispute.</b> Refund is blocked until admin resolves.", parse_mode="HTML")
+        return
+    if state.get("refund_done"):
+        await bot.send_message(chat_id, "<b>⚠️ Refund has already been sent for this deal. No duplicate refunds allowed.</b>", parse_mode="HTML")
+        return
+    user_id = user.id
+    if not (user_id == state.get("seller") or _is_admin_user(user)):
+        await bot.send_message(chat_id, "Only seller or admin can initiate refund.")
+        return
+    state["awaiting"] = "refund_confirm"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Yes", callback_data="refund_confirm"),
+        InlineKeyboardButton(text="No", callback_data="refund_cancel"),
+    ]])
+    await bot.send_message(
+        chat_id,
+        "Are you sure you want to refund to the buyer?\n"
+        "Tap <b>Yes</b> / <b>No</b>, or reply: <b>confirm</b> / <b>cancel</b>",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+async def do_refund_confirm(chat_id: int, user: types.User):
+    """Seller/admin types 'confirm' - proceed to refund address."""
+    if chat_id not in deal_states:
+        return
+    state = deal_states[chat_id]
+    if _is_frozen_for_user(state, user):
+        await bot.send_message(chat_id, "🔒 <b>Deal is frozen due to an open dispute.</b> Refund is blocked until admin resolves.", parse_mode="HTML")
+        return
+    if state.get("refund_done"):
+        await bot.send_message(chat_id, "Refund has already been processed for this deal.")
+        return
+    user_id = user.id
+    if not (user_id == state.get("seller") or _is_admin_user(user)):
+        await bot.send_message(chat_id, "Only the seller or admin can confirm the refund.")
+        return
+    state.pop("awaiting", None)
+    buyer_name = await get_username(state["buyer"], "Buyer")
+    state["stage"] = "refund_address"
+    await bot.send_message(chat_id, f"{buyer_name}, please send your refund address (USDT TRC20 or USDT BEP20 only).")
+
+
+async def do_refund_cancel(chat_id: int, user: types.User):
+    """Seller/admin types 'cancel' - abort the refund."""
+    if chat_id not in deal_states:
+        return
+    state = deal_states[chat_id]
+    user_id = user.id
+    if not (user_id == state.get("seller") or _is_admin_user(user)):
+        await bot.send_message(chat_id, "Only the seller or admin can cancel the refund.")
+        return
+    state.pop("awaiting", None)
+    state["stage"] = "work"
+    await send_action_buttons_to_all(chat_id)
+
+
+# ----------------------------------------------
+# REFUND ADDRESS CONFIRMATION (text version)
+# *** MONEY LOGIC - refund_in_progress flag set BEFORE any await ***
+# ----------------------------------------------
+
+async def do_refund_address_confirm(chat_id: int, user: types.User):
+    """Buyer types 'yes' - confirm refund address and execute refund."""
+    state = deal_states.get(chat_id, {})
+    if state.get("stage") != "refund_confirmation":
+        return
+    if user.id != state.get("buyer"):
+        await bot.send_message(chat_id, "Only the buyer can confirm the refund address.")
+        return
+
+    # Check duplicate refund. The in-progress flag is set BEFORE the payout
+    # await below, which closes the double-refund race (concurrent messages).
+    if state.get("refund_done") or state.get("refund_in_progress"):
+        await bot.send_message(chat_id, "Refund is already being processed for this deal.")
+        return
+
+    # Claim the refund slot BEFORE any await -> no two messages can pass this point.
+    state["refund_in_progress"] = True
+    save_deal_states()
+
+    fee_separate = state.get("fee_separate", False)
+    deduct = state["fee"] if not fee_separate else (0 if state["fee_payer"] == "seller" else state["fee"] / 2)
+    amount = round(state["buyer_amount"] - deduct, 2)
+    address = state["refund_address"]
+    address_type = state["refund_address_type"]
+    network = state["refund_address_network"]
+
+    await bot.send_message(chat_id, "Processing refund. Please wait...")
+
+    ok, payout_msg = await payout_to_seller(address, address_type, network, amount, chat_id)
+
+    if ok:
+        # Mark refund as done to prevent duplicates
+        state["refund_done"] = True
+        state.pop("refund_in_progress", None)
+        save_deal_states()
+        await bot.send_message(
+            chat_id,
+            f"<b>Refund sent!</b>\n\n"
+            f"{payout_msg}\n\n"
+            f"Unfortunately, the deal has been cancelled.\n"
+            f"We understand things don't always go as planned.\n"
+            f"If you ever wish to try again, Baloch OTC Escrow will always be here.\n\n"
+            f"<b>Thanks for choosing and trusting Baloch OTC</b>\n"
+            f"<b>You can use Baloch OTC any time 24/7.</b>\n"
+            f"<b>Website: https://balochotc.com/</b>",
+            parse_mode="HTML",
+        )
+        # Wipe deal state ONLY on confirmed success
+        if chat_id in payment_monitoring_tasks:
+            payment_monitoring_tasks[chat_id].cancel()
+            del payment_monitoring_tasks[chat_id]
+        del deal_states[chat_id]
+        save_deal_states()
+    else:
+        # Keep the deal state on failure so admin can retry manually.
+        state.pop("refund_in_progress", None)
+        state["stage"] = "refund_failed"
+        state["refund_error"] = payout_msg
+        save_deal_states()
+        await bot.send_message(
+            chat_id,
+            f"Refund failed: {payout_msg}\nPlease contact admin @{ADMIN_USERNAME}.",
+            parse_mode="HTML",
+        )
+        await safe_notify_admin(
+            f"⚠️ REFUND FAILED (chat {chat_id})\n"
+            f"Amount: {amount}\nAddress: {address}\n"
+            f"Error: {payout_msg}\n"
+            f"Deal state preserved for manual retry."
+        )
+
+
+async def do_refund_address_reject(chat_id: int, user: types.User):
+    """Buyer types 'no' - re-enter refund address."""
+    state = deal_states.get(chat_id)
+    if not state or state.get("stage") != "refund_confirmation":
+        return
+    buyer_name = await get_username(state["buyer"], "Buyer")
+    state["stage"] = "refund_address"
+    await bot.send_message(chat_id, f"{buyer_name}, please send your refund address again (USDT TRC20 or USDT BEP20 only).")
+
+
+# ----------------------------------------------
+# THE ROUTER - checked FIRST for every group text message
+# ----------------------------------------------
+
+async def route_text_command(message: types.Message) -> bool:
+    """Route typed commands to the do_* handlers. Returns True if consumed."""
+    chat_id = message.chat.id
+    user = message.from_user
+    state = deal_states.get(chat_id)
+    if not state or user is None:
+        return False
+    stage = state.get("stage")
+    cmd = _normalize_cmd(message.text)
+
+    # --- role_selection: 'buyer' / 'seller' (+ AI guess confirm) ---
+    if stage == "role_selection":
+        if cmd in ("buyer", "i am buyer", "i'm buyer", "im buyer", "me buyer"):
+            await do_role_select(chat_id, user, "buyer")
+            return True
+        if cmd in ("seller", "i am seller", "i'm seller", "im seller", "me seller"):
+            await do_role_select(chat_id, user, "seller")
+            return True
+        # Pending AI role guess: yes -> accept, no -> re-prompt
+        guess = state.get("role_guess", {}).get(user.id)
+        if guess:
+            if cmd in YES_WORDS:
+                state.get("role_guess", {}).pop(user.id, None)
+                await do_role_select(chat_id, user, guess)
+                return True
+            if cmd in NO_WORDS:
+                state.get("role_guess", {}).pop(user.id, None)
+                await send_role_prompt(chat_id)
+                return True
+        return False
+
+    # --- deal_confirmation: 'confirm' / 'reject' ---
+    if stage == "deal_confirmation":
+        if cmd in YES_WORDS:
+            await do_deal_confirm(chat_id, user, "yes")
+            return True
+        if cmd in NO_WORDS:
+            await do_deal_confirm(chat_id, user, "no")
+            return True
+        return False
+
+    # --- deal_questions: yes/no or numbered options ---
+    if stage == "deal_questions":
+        q_index = state.get("current_question_index", 0)
+        if q_index >= len(DEAL_QUESTIONS):
+            return False
+        answer_data = None
+        if q_index == 0:
+            if cmd in YES_WORDS:
+                answer_data = "dq_dispute_yes"
+            elif cmd in NO_WORDS:
+                answer_data = "dq_dispute_no"
+        else:
+            answer_data = DQ_TEXT_MAP.get(q_index, {}).get(cmd)
+            # AI fallback: if the fixed map doesn't match, let AI interpret
+            # the answer (handles any phrasing, e.g. "refund to the buyer please")
+            if not answer_data:
+                answer_data = await ai_interpret_deal_question(message.text, q_index)
+        if answer_data:
+            await do_deal_question_answer(chat_id, user, answer_data)
+            return True
+        return False
+
+    # --- fee_selection (buyer): 'buyer' / 'seller' / 'half' ---
+    if stage == "fee_selection":
+        if cmd == "buyer":
+            await do_fee_select(chat_id, user, "buyer")
+            return True
+        if cmd == "seller":
+            await do_fee_select(chat_id, user, "seller")
+            return True
+        if cmd in ("half", "half-half", "half half", "50-50", "5050", "fifty fifty", "fifty-fifty"):
+            await do_fee_select(chat_id, user, "half")
+            return True
+        return False
+
+    # --- fee_confirmation (seller): yes / no ---
+    if stage == "fee_confirmation":
+        if cmd in YES_WORDS:
+            await do_fee_confirm(chat_id, user, "yes")
+            return True
+        if cmd in NO_WORDS:
+            await do_fee_confirm(chat_id, user, "no")
+            return True
+        return False
+
+    # --- fee_option (seller): 'include' / 'separate' ---
+    if stage == "fee_option":
+        if cmd in ("include", "include fee", "include in deal", "in deal", "included"):
+            await do_fee_include(chat_id, user)
+            return True
+        if cmd in ("separate", "separately", "pay separately", "separate fee", "upfront", "pay upfront"):
+            await do_fee_separate(chat_id, user)
+            return True
+        return False
+
+    # --- fee_option_buyer_confirm (buyer): yes / no ---
+    if stage == "fee_option_buyer_confirm":
+        if cmd in YES_WORDS:
+            await do_fee_option_buyer_confirm(chat_id, user, "yes")
+            return True
+        if cmd in NO_WORDS:
+            await do_fee_option_buyer_confirm(chat_id, user, "no")
+            return True
+        return False
+
+    # --- seller_fee_payment: seller 'paid', admin 'received' ---
+    if stage == "seller_fee_payment":
+        if cmd in ("paid", "i paid", "i have paid", "fee paid", "done"):
+            await do_fee_paid_check(chat_id, user)
+            return True
+        if cmd == "received" and _is_admin_user(user):
+            await do_admin_fee_confirm(chat_id, user)
+            return True
+        return False
+
+    # --- payment / payment_monitoring: buyer 'paid', admin 'received' ---
+    if stage in ("payment", "payment_monitoring"):
+        if cmd in ("paid", "i paid", "i have paid", "done"):
+            await do_payment_paid_info(chat_id, user)
+            return True
+        if cmd == "received" and _is_admin_user(user):
+            await do_admin_confirm(chat_id, user)
+            return True
+        return False
+
+    # --- payout_address / refund_address: address text, NOT commands ---
+    # (handled by the existing stage code in universal_stage_handler)
+
+    # --- address_confirmation (seller): yes / no ---
+    if stage == "address_confirmation":
+        if cmd in YES_WORDS:
+            await do_address_confirm(chat_id, user)
+            return True
+        if cmd in NO_WORDS:
+            await do_address_reject(chat_id, user)
+            return True
+        return False
+
+    # --- refund_confirmation (buyer): yes / no ---
+    if stage == "refund_confirmation":
+        if cmd in YES_WORDS:
+            await do_refund_address_confirm(chat_id, user)
+            return True
+        if cmd in NO_WORDS:
+            await do_refund_address_reject(chat_id, user)
+            return True
+        return False
+
+    # --- work: release / refund / dispute (+ pending confirm/cancel) ---
+    if stage == "work":
+        awaiting = state.get("awaiting")
+        if awaiting == "release_confirm":
+            if cmd in YES_WORDS:
+                await do_release_confirm(chat_id, user)
+                return True
+            if cmd in NO_WORDS:
+                await do_release_cancel(chat_id, user)
+                return True
+            return False
+        if awaiting == "refund_confirm":
+            if cmd in YES_WORDS:
+                await do_refund_confirm(chat_id, user)
+                return True
+            if cmd in NO_WORDS:
+                await do_refund_cancel(chat_id, user)
+                return True
+            return False
+        if cmd in ("release", "release payment", "release the payment"):
+            await do_release(chat_id, user)
+            return True
+        if cmd in ("refund", "refund to buyer", "refund buyer"):
+            await do_refund(chat_id, user)
+            return True
+        if cmd in ("dispute", "raise dispute", "open dispute"):
+            await do_dispute(chat_id, user)
+            return True
+        if cmd in ("resolve dispute", "close dispute", "unfreeze deal"):
+            await do_dispute_resolve(chat_id, user)
+            return True
+        return False
+
+    return False
+
+
+
+
+# BOT EVENT HANDLERS
+# ==============================================
+
+# -- Bot added to group --
+@dp.my_chat_member()
+async def on_bot_added(event: types.ChatMemberUpdated):
+    if event.new_chat_member.status in ("member", "administrator") and event.old_chat_member.status in ("left", "kicked"):
+        chat_id = event.chat.id
+        group_title = event.chat.title
+        if is_baloch_deal_group(group_title):
+            if chat_id not in deal_states:
+                deal_states[chat_id] = {"stage": "role_selection", "members": {}, "conversation_history": []}
+            await send_role_prompt(chat_id)
+
+
+# -- New member joins group via chat_member update --
+@dp.chat_member()
+async def on_any_member(event: types.ChatMemberUpdated):
+    chat_id = event.chat.id
+    group_title = event.chat.title
+    if not is_baloch_deal_group(group_title):
+        return
+    if event.new_chat_member.status not in ("member", "administrator") or event.old_chat_member.status not in ("left", "kicked"):
+        return
+
+    user = event.new_chat_member.user
+
+    try:
+        me = await bot.get_me()
+        if user.id == me.id:
+            return
+        if _is_service_account(user):
+            return
+        # Skip group creator/admins — they are service accounts, not deal parties
+        if event.new_chat_member.status in ("creator", "administrator"):
+            return
+        me_cm = await bot.get_chat_member(chat_id, me.id)
+        if me_cm.status not in ("administrator", "creator"):
+            return
+    except Exception:
+        return
+
+    user_display = f"@{user.username}" if user.username else user.first_name or "User"
+
+    # One prompt per user per group — never repeat
+    state = deal_states.setdefault(chat_id, {"stage": "role_selection", "members": {}, "conversation_history": []})
+    prompted = state.setdefault("prompted_users", [])
+    if user.id in prompted:
+        return
+    prompted.append(user.id)
+
+    await send_role_prompt(chat_id, user_display)
+
+
+# -- FALLBACK: New member joins via message event --
+@dp.message(F.new_chat_members)
+async def on_new_chat_members_message(message: types.Message):
+    chat_id = message.chat.id
+    group_title = message.chat.title
+    if not is_baloch_deal_group(group_title):
+        return
+
+    try:
+        me = await bot.get_me()
+    except Exception:
+        return
+
+    for new_user in message.new_chat_members:
+        if new_user.id == me.id:
+            # Bot itself joined: initialize state silently, NO role prompt.
+            # The prompt goes ONLY to real users when THEY join.
+            if chat_id not in deal_states:
+                deal_states[chat_id] = {"stage": "role_selection", "members": {}, "conversation_history": []}
+            continue
+
+        # Never ask service/admin accounts for a deal role
+        if _is_service_account(new_user):
+            continue
+
+        try:
+            member = await bot.get_chat_member(chat_id, new_user.id)
+            if member.status in ("creator", "administrator"):
+                continue
+            me_cm = await bot.get_chat_member(chat_id, me.id)
+            if me_cm.status not in ("administrator", "creator"):
+                continue
+        except Exception:
+            continue
+
+        # One prompt per user per group — never repeat
+        state = deal_states.setdefault(chat_id, {"stage": "role_selection", "members": {}, "conversation_history": []})
+        prompted = state.setdefault("prompted_users", [])
+        if new_user.id in prompted:
+            continue
+        prompted.append(new_user.id)
+
+        user_display = f"@{new_user.username}" if new_user.username else new_user.first_name or "User"
+        await send_role_prompt(chat_id, user_display)
+
+
+# -- /start command: manually trigger role prompt (for group creators/admins
+# who were skipped by the auto-prompt, or to restart role selection) --
+@dp.message(Command("start", "deal"))
+async def on_start_command(message: types.Message):
+    await _do_start_command(message)
+
+
+async def _do_start_command(message: types.Message):
+    """Shared logic for /start — called by Command filter and text fallback."""
+    chat_id = message.chat.id
+    if message.chat.type == "private":
+        return
+    group_title = message.chat.title
+    if not is_baloch_deal_group(group_title):
+        return
+    user = message.from_user
+    # Skip service accounts
+    if _is_service_account(user):
+        return
+    # Don't send a confusing role prompt mid-deal — only in role_selection stage
+    # or if no deal has started yet (no stage = fresh group).
+    existing = deal_states.get(chat_id)
+    if existing and existing.get("stage") not in ("role_selection", None):
+        # Allow /start to RESET a stuck/broken deal back to role selection.
+        # (Shawn: "aisa ho k insan easily escrow use kr skay" — no dead-ends.)
+        pass
+    # Initialize/reset state
+    state = deal_states.setdefault(chat_id, {"stage": "role_selection", "members": {}, "conversation_history": []})
+    # /start always resets to role selection (user explicitly asked).
+    state["stage"] = "role_selection"
+    state["members"] = {}
+    prompted = state.setdefault("prompted_users", [])
+    # Allow re-prompt via /start even if already prompted
+    if user.id in prompted:
+        prompted.remove(user.id)
+    prompted.append(user.id)
+    user_display = f"@{user.username}" if user.username else user.first_name or "User"
+    await send_role_prompt(chat_id, user_display)
+
+
+# -- Role selection callback (legacy: old button messages still work) --
+@dp.callback_query(F.data.in_(["role_buyer", "role_seller"]))
+async def handle_role_selection(callback: CallbackQuery):
+    await callback.answer()
+    if not is_baloch_deal_group(callback.message.chat.title):
+        return
+    role = callback.data.split("_")[1]
+    if role not in ("buyer", "seller"):
+        return
+    chat_id = callback.message.chat.id
+    # Clear any pending AI role guess for this user
+    deal_states.get(chat_id, {}).get("role_guess", {}).pop(callback.from_user.id, None)
+    await do_role_select(chat_id, callback.from_user, role)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data == "role_guess_no")
+async def handle_role_guess_no(callback: CallbackQuery):
+    """User rejected the AI-inferred role -> clear guess, re-prompt."""
+    await callback.answer()
+    chat_id = callback.message.chat.id
+    deal_states.get(chat_id, {}).get("role_guess", {}).pop(callback.from_user.id, None)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await send_role_prompt(chat_id)
+
+
+# ==============================================
+# AI-POWERED DEAL NEGOTIATION HANDLER
+# ==============================================
+
+@dp.message(F.text & (F.chat.type.in_(["group", "supergroup"])))
+async def universal_stage_handler(message: types.Message):
+    chat_id = message.chat.id
+    # Fallback: catch /start and /deal as plain text (in case Command filter
+    # doesn't match due to privacy mode or client quirks). This runs even
+    # when there's no deal state yet (fresh group).
+    _text = (message.text or "").strip().lower()
+    # Strip @botname suffix if present (e.g. /start@Balochhelpbot)
+    _cmd = _text.split("@")[0]
+    if _cmd in ("/start", "/deal") and message.chat.type in ("group", "supergroup"):
+        await _do_start_command(message)
+        return
+    if chat_id not in deal_states:
+        return
+    # Service/admin accounts never participate in deal flow — ignore completely.
+    if _is_service_account(message.from_user):
+        return
+    # Text commands (typed replies replacing buttons) are checked FIRST.
+    # If the message was a command for the current stage, it is consumed here.
+    if await route_text_command(message):
+        return
+    state = deal_states[chat_id]
+    stage = state.get("stage")
+    user_id = message.from_user.id
+
+    # ======================================================
+    # STAGE: role_selection (SMART: free text -> AI infers role)
+    # ======================================================
+    if stage == "role_selection":
+        # Skip users who already picked a role or have a pending guess
+        if state.get("members", {}).get(user_id) or state.get("role_guess", {}).get(user_id):
+            return
+        text = (message.text or "").strip()
+        if len(text) < 2:
+            return
+        role = await ai_infer_role(text)
+        username = message.from_user.username
+        display = f"@{username}" if username else (message.from_user.first_name or "User")
+        if role:
+            # Don't guess a role that's already taken
+            if role in state:
+                other = "seller" if role == "buyer" else "buyer"
+                if other in state:
+                    return
+                role = other if other not in state else None
+            if role:
+                state.setdefault("role_guess", {})[user_id] = role
+                kb = InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="Yes", callback_data=f"role_{role}"),
+                    InlineKeyboardButton(text="No", callback_data="role_guess_no"),
+                ]])
+                await bot.send_message(
+                    chat_id,
+                    f"{display}, you seem to be the <b>{role}</b>. Is that correct?\n"
+                    f"Tap <b>Yes</b> / <b>No</b>, or reply: <b>yes</b> / <b>no</b>",
+                    parse_mode="HTML",
+                    reply_markup=kb,
+                )
+                return
+        # Could not infer -> gentle nudge back to the buttons
+        await bot.send_message(
+            chat_id,
+            f"{display}, please tap <b>Buyer</b> or <b>Seller</b> above to choose your role.",
+            parse_mode="HTML",
+        )
+        return
+
+    # ======================================================
+    # STAGE: deal_batch_qa (BATCHED QUESTIONS — either party answers)
+    # ======================================================
+    if stage == "deal_batch_qa":
+        # Either buyer or seller can answer
+        if user_id != state.get("buyer") and user_id != state.get("seller"):
+            return
+        sender_role = "buyer" if user_id == state.get("buyer") else "seller"
+        text = (message.text or "").strip()
+        if len(text) < 1:
+            return
+
+        # AI extracts everything from the reply
+        history = state.setdefault("conversation_history", [])
+        history.append({"role": sender_role, "text": text, "user_id": user_id})
+        context = build_conversation_context(history)
+        analysis = await ai_analyze_deal_message(text, sender_role, context)
+
+        # "none" for optional fields
+        if text.lower().strip() in ("none", "no", "nope", "n/a", "-"):
+            # Only meaningful if we already have core fields; otherwise ignore
+            pass
+        else:
+            if _apply_qa_analysis(state, analysis):
+                # Track who first provided substantive details
+                if not state.get("qa_provider"):
+                    state["qa_provider"] = user_id
+
+        # Core fields present? -> ask the OTHER party to confirm
+        if state.get("amount") and state.get("description"):
+            await present_qa_for_confirmation(chat_id)
+        # Otherwise stay in deal_batch_qa and keep collecting
+        return
+
+    # ======================================================
+    # STAGE: deal_qa_confirm (OTHER party: agree / disagree)
+    # ======================================================
+    if stage == "deal_qa_confirm":
+        confirmer = state.get("qa_confirmer")
+        if user_id != confirmer:
+            return  # Only the confirmer's reply counts here
+        sender_role = "buyer" if user_id == state.get("buyer") else "seller"
+        text = (message.text or "").strip()
+        if len(text) < 1:
+            return
+
+        history = state.setdefault("conversation_history", [])
+        history.append({"role": sender_role, "text": text, "user_id": user_id})
+        context = build_conversation_context(history)
+        analysis = await ai_analyze_deal_message(text, sender_role, context)
+
+        # AGREE -> proceed to deal questions (dispute etc.)
+        if analysis.get("is_agreement"):
+            confirmer_name = await get_username(confirmer, "Party")
+            await bot.send_message(
+                chat_id,
+                f"<b>{confirmer_name} agreed to the deal terms!</b> ✅",
+                parse_mode="HTML",
+            )
+            await ask_deal_question(chat_id, 0)
+            return
+
+        # DISAGREE with specific changes -> apply, swap confirmer, re-present
+        changed = _apply_qa_analysis(state, analysis)
+        if analysis.get("is_rejection") or analysis.get("is_counter_offer") or changed:
+            if changed:
+                # Swap: the other party now confirms the revised terms
+                other = state.get("buyer") if confirmer == state.get("seller") else state.get("seller")
+                state["qa_provider"] = confirmer  # they provided the revision
+                await present_qa_for_confirmation(chat_id)
+                # present_qa_for_confirmation sets confirmer to the other party
+                return
+            # Plain "disagree" with no details -> ask what changes they want
+            confirmer_name = await get_username(confirmer, "Party")
+            state["stage"] = "deal_qa_revise"
+            await bot.send_message(
+                chat_id,
+                f"{confirmer_name}, what changes do you want to make to the deal terms?",
+                parse_mode="HTML",
+            )
+            return
+
+        # Unclear reply -> nudge
+        confirmer_name = await get_username(confirmer, "Party")
+        await message.answer(
+            f"{confirmer_name}, please reply <b>agree</b> or <b>disagree</b>.",
+            parse_mode="HTML",
+        )
+        return
+
+    # ======================================================
+    # STAGE: deal_qa_revise (confirmer states what changes they want)
+    # ======================================================
+    if stage == "deal_qa_revise":
+        confirmer = state.get("qa_confirmer")
+        if user_id != confirmer:
+            return
+        sender_role = "buyer" if user_id == state.get("buyer") else "seller"
+        text = (message.text or "").strip()
+        if len(text) < 2:
+            return
+
+        history = state.setdefault("conversation_history", [])
+        history.append({"role": sender_role, "text": text, "user_id": user_id})
+        context = build_conversation_context(history)
+        analysis = await ai_analyze_deal_message(text, sender_role, context)
+
+        if _apply_qa_analysis(state, analysis):
+            # Changes applied -> the OTHER party now confirms
+            state["qa_provider"] = confirmer
+            await present_qa_for_confirmation(chat_id)
+            return
+
+        # Could not understand the changes -> ask again
+        confirmer_name = await get_username(confirmer, "Party")
+        await message.answer(
+            f"{confirmer_name}, I didn't catch the changes. Please describe what you want changed.",
+            parse_mode="HTML",
+        )
+        return
+
+    # ======================================================
+    # STAGE: deal_negotiation (AI-POWERED)
+    # ======================================================
+    if stage == "deal_negotiation":
+        # Determine sender role
+        sender_role = None
+        if user_id == state.get("buyer"):
+            sender_role = "buyer"
+        elif user_id == state.get("seller"):
+            sender_role = "seller"
+        else:
+            return  # Not a participant
+
+        # Add to conversation history
+        history = state.setdefault("conversation_history", [])
+        history.append({"role": sender_role, "text": message.text, "user_id": user_id})
+
+        # Show typing while AI processes (speed feedback)
+        try:
+            await bot.send_chat_action(chat_id, "typing")
+        except Exception:
+            pass
+
+        # Build context and analyze with AI
+        context = build_conversation_context(history)
+        analysis = await ai_analyze_deal_message(message.text, sender_role, context)
+
+        if not analysis.get("is_deal_related", False):
+            return  # Just casual chat, don't interfere
+
+        # Update extracted deal parameters (merge with existing)
+        if analysis.get("amount") is not None:
+            state["amount"] = float(analysis["amount"])
+        if analysis.get("description") is not None:
+            state["description"] = analysis["description"]
+        if analysis.get("deadline") is not None:
+            state["deadline"] = analysis["deadline"]
+        if analysis.get("documents") is not None:
+            state["documents"] = analysis["documents"]
+        if analysis.get("fee_preference") is not None:
+            state["fee_preference_hint"] = analysis["fee_preference"]
+
+        # Check if we have enough info for a deal summary
+        has_amount = "amount" in state and state["amount"] and state["amount"] > 0
+        has_description = "description" in state and state["description"]
+
+        # If seller REJECTS the proposal — notify buyer, ask seller for counter terms
+        if analysis.get("is_rejection") and sender_role == "seller":
+            buyer_name = await get_username(state["buyer"], "Buyer")
+            seller_name = await get_username(state["seller"], "Seller")
+            await message.answer(
+                f"{seller_name} has <b>disagreed</b> with the proposed terms.\n\n"
+                f"{buyer_name}, please revise your offer, or {seller_name}, "
+                f"send your counter-offer (amount and terms).",
+                parse_mode="HTML",
+            )
+            return
+
+        # If buyer REJECTS seller's counter — ask buyer to revise
+        if analysis.get("is_rejection") and sender_role == "buyer":
+            buyer_name = await get_username(state["buyer"], "Buyer")
+            seller_name = await get_username(state["seller"], "Seller")
+            await message.answer(
+                f"{buyer_name} has <b>disagreed</b> with the counter-offer.\n\n"
+                f"{seller_name}, please send revised terms, or {buyer_name}, "
+                f"send your updated offer.",
+                parse_mode="HTML",
+            )
+            return
+
+        # If seller agrees and we have enough info, present deal summary
+        if analysis.get("is_agreement") and sender_role == "seller" and has_amount:
+            # Seller agreed - present deal for confirmation
+            await _present_deal_for_confirmation(chat_id, message)
+            return
+
+        # If buyer provides info and seller hasn't responded yet, check completeness
+        if sender_role == "buyer" and has_amount and has_description:
+            buyer_name = await get_username(state["buyer"], "Buyer")
+            seller_name = await get_username(state["seller"], "Seller")
+            deadline_text = state.get("deadline", "Not specified")
+            docs = state.get("documents", [])
+            docs_text = ", ".join(docs) if docs else "None"
+
+            await message.answer(
+                f"{seller_name}, {buyer_name} has proposed:\n"
+                f"<b>Amount:</b> {state['amount']} USDT\n"
+                f"<b>Description:</b> {state['description']}\n"
+                f"<b>Deadline:</b> {deadline_text}\n"
+                f"<b>Documents:</b> {docs_text}\n\n"
+                f"<b>Do you agree? Reply: agree / disagree</b>",
+                parse_mode="HTML",
+            )
+            return
+
+        # If seller provides counter-offer or additional details
+        if sender_role == "seller" and (analysis.get("is_counter_offer") or has_amount):
+            buyer_name = await get_username(state["buyer"], "Buyer")
+
+            if analysis.get("is_counter_offer"):
+                deadline_text = state.get("deadline", "Not specified")
+                docs = state.get("documents", [])
+                docs_text = ", ".join(docs) if docs else "None"
+
+                await message.answer(
+                    f"{buyer_name}, {seller_name} has proposed updated terms:\n"
+                    f"<b>Amount:</b> {state.get('amount', 'Not specified')} USDT\n"
+                    f"<b>Description:</b> {state.get('description', 'Not specified')}\n"
+                    f"<b>Deadline:</b> {deadline_text}\n"
+                    f"<b>Documents:</b> {docs_text}\n\n"
+                    f"<b>Do you agree? Reply: agree / disagree</b>",
+                    parse_mode="HTML",
+                )
+                return
+
+        # If buyer agrees to seller's terms
+        if analysis.get("is_agreement") and sender_role == "buyer" and has_amount:
+            await _present_deal_for_confirmation(chat_id, message)
+            return
+
+        # Not enough info yet - provide gentle guidance
+        if not has_amount and len(history) >= 2:
+            await message.answer(
+                "<i>I'm following your conversation. Please make sure to mention "
+                "the deal amount so I can set up the escrow.</i>",
+                parse_mode="HTML",
+            )
+
+        return
+
+    # ======================================================
+    # STAGE: deal_missing_info (waiting for specific info)
+    # ======================================================
+    if stage == "deal_missing_info":
+        sender_role = None
+        if user_id == state.get("buyer"):
+            sender_role = "buyer"
+        elif user_id == state.get("seller"):
+            sender_role = "seller"
+        else:
+            return
+
+        history = state.setdefault("conversation_history", [])
+        history.append({"role": sender_role, "text": message.text, "user_id": user_id})
+
+        try:
+            await bot.send_chat_action(chat_id, "typing")
+        except Exception:
+            pass
+
+        context = build_conversation_context(history)
+        analysis = await ai_analyze_deal_message(message.text, sender_role, context)
+
+        # Update any newly provided info
+        if analysis.get("amount") is not None:
+            state["amount"] = float(analysis["amount"])
+        if analysis.get("description") is not None:
+            state["description"] = analysis["description"]
+        if analysis.get("deadline") is not None:
+            state["deadline"] = analysis["deadline"]
+        if analysis.get("documents") is not None:
+            state["documents"] = analysis["documents"]
+
+        # Check if we now have enough
+        has_amount = "amount" in state and state["amount"] and state["amount"] > 0
+
+        if has_amount:
+            await _present_deal_for_confirmation(chat_id, message)
+        else:
+            await message.answer(
+                "<i>Please specify the deal amount to proceed.</i>",
+                parse_mode="HTML",
+            )
+        return
+
+    # ======================================================
+    # STAGE: payout_address (seller sends payout address)
+    # ======================================================
+    if stage == "payout_address" and user_id == state.get("seller"):
+        address = message.text.strip()
+        verification = detect_address_type(address)
+        if not verification["valid"]:
+            await message.answer("Invalid address. Please send a valid USDT TRC20 or USDT BEP20 address.")
+            return
+
+        state["payout_address"] = address
+        state["address_type"] = verification["type"]
+        state["address_network"] = verification["network"]
+        state["stage"] = "address_confirmation"
+
+        await message.answer(
+            f"Buyer paid: <b>{state['buyer_amount']}</b> USDT\n"
+            f"Seller will receive: <b>{state['seller_amount']}</b> USDT\n"
+            f"Escrow Fee: <b>{state['fee']}</b> USDT\n\n"
+            f"Is this the correct address?\n<code>{address}</code>\n"
+            f"Network: <b>{verification['type']}</b>\n\n"
+            f"Reply: <b>yes</b> / <b>no</b>",
+            parse_mode="HTML",
+        )
+        return
+
+    # ======================================================
+    # STAGE: refund_address (buyer sends refund address)
+    # ======================================================
+    if stage == "refund_address" and user_id == state.get("buyer"):
+        address = message.text.strip()
+        verification = detect_address_type(address)
+        if not verification["valid"]:
+            await message.answer("Invalid address. Please send a valid USDT TRC20 or USDT BEP20 address.")
+            return
+
+        state["refund_address"] = address
+        state["refund_address_type"] = verification["type"]
+        state["refund_address_network"] = verification["network"]
+        state["stage"] = "refund_confirmation"
+
+        fee_separate = state.get("fee_separate", False)
+        deduct = state["fee"] if not fee_separate else (0 if state["fee_payer"] == "seller" else state["fee"] / 2)
+        refund_amount = round(state["buyer_amount"] - deduct, 2)
+
+        await message.answer(
+            f"Refund amount: <b>{refund_amount} USDT</b>\n"
+            f"Is this the correct address?\n<code>{address}</code>\n\n"
+            f"Reply: <b>yes</b> / <b>no</b>",
+            parse_mode="HTML",
+        )
+        return
+
+
+# ==============================================
+# DEAL CONFIRMATION HELPER
+# ==============================================
+
+async def _present_deal_for_confirmation(chat_id: int, message: types.Message):
+    """Present the AI-extracted deal summary for both parties to confirm."""
+    state = deal_states[chat_id]
+
+    amount = state.get("amount", 0)
+    fee_pref = state.get("fee_preference", "Not specified")
+    fee_display = {"buyer": "Buyer pays", "seller": "Seller pays", "half": "Split 50-50"}.get(fee_pref, fee_pref)
+    description = state.get("description", "Not specified")
+    proof = state.get("proof_of_completion", "Not specified")
+    deadline = state.get("deadline", "Not specified")
+    account_age = state.get("account_age", "Not specified")
+    account_geo = state.get("account_geo", "Not specified")
+    account_docs = state.get("account_documents", [])
+    docs_text = ", ".join(account_docs) if account_docs else "None"
+    additional = state.get("additional_info", "")
+    additional_line = f"<b>Additional Info:</b> {additional}\n" if additional else ""
+
+    buyer_name = await get_username(state["buyer"], "Buyer")
+    seller_name = await get_username(state["seller"], "Seller")
+
+    state["stage"] = "deal_confirmation"
+
+    await bot.send_message(
+        chat_id,
+        f"<b>DEAL SUMMARY</b>\n"
+        f"{'=' * 30}\n\n"
+        f"<b>Price:</b> {amount} USDT (excl. escrow fees)\n"
+        f"<b>Escrow Fee Paid By:</b> {fee_display}\n"
+        f"<b>Description:</b> {description}\n"
+        f"<b>Proof of Completion:</b> {proof}\n"
+        f"<b>Deadline:</b> {deadline}\n"
+        f"<b>Account:</b> {account_age}\n"
+        f"<b>Account Geo / Owner:</b> {account_geo}\n"
+        f"<b>Documents in Kit:</b> {docs_text}\n"
+        f"{additional_line}\n"
+        f"{'=' * 30}\n\n"
+        f"{buyer_name} and {seller_name}, please confirm these deal terms.\n"
+        f"<b>Both parties need to reply 'confirm' to proceed</b> (or 'reject' to renegotiate).",
+        parse_mode="HTML",
+    )
+
+
+# ==============================================
+# DEAL QUESTIONS - ASKED AFTER BOTH CONFIRM
+# ==============================================
+
+DEAL_QUESTIONS = [
+    {
+        "key": "dispute_resolution",
+        "text": (
+            "<b>Deal Question 1 of 2:</b>\n\n"
+            "If a dispute arises and cannot be resolved between buyer and seller, "
+            "do both parties agree that the admin's decision will be final?"
+        ),
+        "prefix": "dq_dispute",
+    },
+    {
+        "key": "account_blocked",
+        "text": (
+            "<b>Deal Question 2 of 2:</b>\n\n"
+            "If an account gets blocked during an active deal, "
+            "what action should be taken?"
+        ),
+        "options": [
+            ("Refund to Buyer", "dq_blocked_refund"),
+            ("Release to Seller", "dq_blocked_release"),
+        ],
+        "prefix": "dq_blocked",
+    },
+]
+
+
+async def ask_deal_question(chat_id: int, question_index: int):
+    """Ask the next deal question to both parties (text-based, no buttons)."""
+    state = deal_states[chat_id]
+
+    if question_index >= len(DEAL_QUESTIONS):
+        # All questions answered.
+        # If fee_preference was already captured in batch Q&A and confirmed by
+        # both parties, skip the redundant fee question and proceed directly.
+        # (Shawn: "aisa ho k insan easily escrow use kr skay" — no repeated questions.)
+        fee_pref = state.get("fee_preference")
+        if fee_pref in ("buyer", "seller", "half"):
+            # Auto-apply the already-confirmed fee preference.
+            state["stage"] = "fee_selection"
+            buyer_user = types.User(id=state["buyer"], is_bot=False, first_name="Buyer")
+            await do_fee_select(chat_id, buyer_user, fee_pref)
+            return
+        # Fallback: fee preference not set (old flow) -> ask
+        state["stage"] = "fee_selection"
+        buyer_name = await get_username(state["buyer"], "Buyer")
+        await bot.send_message(
+            chat_id,
+            f"<b>All deal questions answered! Proceeding...</b>\n\n"
+            f"{buyer_name}, who will pay the escrow fee?\n"
+            f"Reply: <b>buyer</b> / <b>seller</b> / <b>half</b>",
+            parse_mode="HTML",
+        )
+        return
+
+    state["current_question_index"] = question_index
+    state["stage"] = "deal_questions"
+    q = DEAL_QUESTIONS[question_index]
+
+    if "options" in q:
+        # Multi-choice question -> numbered list, accept number or option text
+        numbered = "\n".join(f"{i + 1}. {opt[0]}" for i, opt in enumerate(q["options"]))
+        await bot.send_message(
+            chat_id,
+            f"{q['text']}\n\n{numbered}\n\n"
+            f"<i>Both parties: reply with the <b>number</b> (1/{len(q['options'])}) or the option text.</i>",
+            parse_mode="HTML",
+        )
+    else:
+        # Yes/No question
+        await bot.send_message(
+            chat_id,
+            f"{q['text']}\n\n<i>Both parties: reply <b>yes</b> / <b>no</b>.</i>",
+            parse_mode="HTML",
+        )
+
+
+# -- Deal questions callback handler (legacy: old button messages still work) --
+@dp.callback_query(F.data.startswith("dq_"))
+async def handle_deal_question_response(callback: CallbackQuery):
+    await callback.answer()
+    await do_deal_question_answer(callback.message.chat.id, callback.from_user, callback.data)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# ==============================================
+# DEAL CONFIRMATION CALLBACKS
+# ==============================================
+
+# -- Deal confirmation callback (legacy: old button messages still work) --
+@dp.callback_query(F.data.startswith("deal_confirm_"))
+async def handle_deal_confirmation(callback: CallbackQuery):
+    await callback.answer()
+    action = callback.data.split("_")[2]
+    if action not in ("yes", "no"):
+        return
+    await do_deal_confirm(callback.message.chat.id, callback.from_user, action)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# ==============================================
+# FEE SELECTION & OPTIONS
+# ==============================================
+
+# -- Fee selection callback (legacy: old button messages still work) --
+@dp.callback_query(F.data.in_(["fee_buyer", "fee_seller", "fee_half"]))
+async def handle_fee_selection(callback: CallbackQuery):
+    await callback.answer()
+    await do_fee_select(callback.message.chat.id, callback.from_user, callback.data.split("_")[1])
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# -- Fee confirm callback (legacy: old button messages still work) --
+@dp.callback_query(F.data.startswith("fee_confirm_"))
+async def handle_fee_confirm(callback: CallbackQuery):
+    await callback.answer()
+    action = callback.data.split("_")[2]
+    if action not in ("yes", "no"):
+        return
+    await do_fee_confirm(callback.message.chat.id, callback.from_user, action)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# -- Fee include callback (legacy: old button messages still work) --
+@dp.callback_query(F.data == "fee_include")
+async def handle_fee_include(callback: CallbackQuery):
+    await callback.answer()
+    await do_fee_include(callback.message.chat.id, callback.from_user)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# -- Fee separate callback (legacy: old button messages still work) --
+@dp.callback_query(F.data == "fee_separate")
+async def handle_fee_separate(callback: CallbackQuery):
+    await callback.answer()
+    await do_fee_separate(callback.message.chat.id, callback.from_user)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# -- Fee option buyer confirm callback (legacy: old button messages still work) --
+@dp.callback_query(F.data.startswith("fee_opt_buyer_"))
+async def handle_fee_option_buyer_confirm(callback: CallbackQuery):
+    await callback.answer()
+    action = callback.data.split("_")[3]
+    if action not in ("yes", "no"):
+        return
+    await do_fee_option_buyer_confirm(callback.message.chat.id, callback.from_user, action)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# ==============================================
+# FEE PAID / ADMIN FEE CONFIRM
+# ==============================================
+
+# -- Fee paid callback (legacy: old button messages still work) --
+@dp.callback_query(F.data == "fee_paid")
+async def handle_fee_paid(callback: CallbackQuery):
+    await callback.answer()
+    await do_fee_paid_check(callback.message.chat.id, callback.from_user)
+
+
+# -- Admin fee confirm callback (legacy: old button messages still work) --
+@dp.callback_query(F.data == "admin_fee_confirm")
+async def handle_admin_fee_confirm(callback: CallbackQuery):
+    await callback.answer()
+    # Only delete the button message if the clicker is actually an admin.
+    # Non-admin clicks get rejected inside do_admin_fee_confirm; the message
+    # (with the payment button) must stay visible for everyone else.
+    if not _is_admin_user(callback.from_user):
+        await do_admin_fee_confirm(callback.message.chat.id, callback.from_user)
+        return
+    await do_admin_fee_confirm(callback.message.chat.id, callback.from_user)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# ==============================================
+# "I HAVE PAID" BUTTON
+# ==============================================
+
+# -- "I have paid" callback (legacy: old button messages still work) --
+@dp.callback_query(F.data == "paid")
+async def handle_payment(callback: CallbackQuery):
+    """Legacy fallback - payment is auto-detected, but handle old button clicks gracefully."""
+    await callback.answer()
+    await do_payment_paid_info(callback.message.chat.id, callback.from_user)
+
+
+# -- Admin manual confirmation callback (legacy: old button messages still work) --
+@dp.callback_query(F.data == "admin_confirm")
+async def handle_admin_confirm(callback: CallbackQuery):
+    await callback.answer()
+    # Only delete the button message if the clicker is actually an admin.
+    if not _is_admin_user(callback.from_user):
+        await do_admin_confirm(callback.message.chat.id, callback.from_user)
+        return
+    await do_admin_confirm(callback.message.chat.id, callback.from_user)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# -- Dispute callback (legacy: old button messages still work) --
+@dp.callback_query(F.data == "dispute")
+async def handle_dispute(callback: CallbackQuery):
+    await callback.answer()
+    # Only delete the button message if the clicker is a party or admin.
+    state = deal_states.get(callback.message.chat.id, {})
+    allowed = (
+        _is_admin_user(callback.from_user)
+        or callback.from_user.id == state.get("buyer")
+        or callback.from_user.id == state.get("seller")
+    )
+    if not allowed:
+        await do_dispute(callback.message.chat.id, callback.from_user)
+        return
+    await do_dispute(callback.message.chat.id, callback.from_user)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# ==============================================
+# RELEASE PAYMENT
+# ==============================================
+
+# -- Release callback (legacy: old button messages still work) --
+@dp.callback_query(F.data == "release")
+async def handle_release(callback: CallbackQuery):
+    await callback.answer()
+    # Only delete if the clicker is authorized (buyer or admin).
+    state = deal_states.get(callback.message.chat.id, {})
+    authorized = (callback.from_user.id == state.get("buyer") or _is_admin_user(callback.from_user))
+    await do_release(callback.message.chat.id, callback.from_user)
+    if not authorized:
+        return
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# -- Release confirm callback (legacy: old button messages still work) --
+@dp.callback_query(F.data == "release_confirm")
+async def handle_release_confirm(callback: CallbackQuery):
+    await callback.answer()
+    state = deal_states.get(callback.message.chat.id, {})
+    authorized = (callback.from_user.id == state.get("buyer") or _is_admin_user(callback.from_user))
+    await do_release_confirm(callback.message.chat.id, callback.from_user)
+    if not authorized:
+        return
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# -- Release cancel callback (legacy: old button messages still work) --
+@dp.callback_query(F.data == "release_cancel")
+async def handle_release_cancel(callback: CallbackQuery):
+    await callback.answer()
+    state = deal_states.get(callback.message.chat.id, {})
+    authorized = (callback.from_user.id == state.get("buyer") or _is_admin_user(callback.from_user))
+    await do_release_cancel(callback.message.chat.id, callback.from_user)
+    if not authorized:
+        return
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# ==============================================
+# ADDRESS CONFIRMATION & AUTOMATIC PAYOUT
+# ==============================================
+
+# -- Address confirmation callback (legacy: old button messages still work) --
+# *** MONEY LOGIC lives in do_address_confirm - payout_in_progress set BEFORE any await ***
+@dp.callback_query(F.data == "address_confirm")
+async def handle_address_confirmation(callback: CallbackQuery):
+    await callback.answer()
+    await do_address_confirm(callback.message.chat.id, callback.from_user)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+# -- Address reject callback (legacy: old button messages still work) --
+@dp.callback_query(F.data == "address_reject")
+async def handle_address_reject(callback: CallbackQuery):
+    await callback.answer()
+    await do_address_reject(callback.message.chat.id, callback.from_user)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+# ==============================================
+# REFUND (text-based; legacy callbacks below are thin wrappers)
+# ==============================================
+
+# -- Refund callback (legacy: old button messages still work) --
+@dp.callback_query(F.data == "refund")
+async def handle_refund(callback: CallbackQuery):
+    await callback.answer()
+    # Only delete if the clicker is authorized (seller or admin).
+    state = deal_states.get(callback.message.chat.id, {})
+    authorized = (callback.from_user.id == state.get("seller") or _is_admin_user(callback.from_user))
+    await do_refund(callback.message.chat.id, callback.from_user)
+    if not authorized:
+        return
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# -- Refund confirm callback (legacy: old button messages still work) --
+@dp.callback_query(F.data == "refund_confirm")
+async def handle_refund_confirm(callback: CallbackQuery):
+    await callback.answer()
+    state = deal_states.get(callback.message.chat.id, {})
+    authorized = (callback.from_user.id == state.get("seller") or _is_admin_user(callback.from_user))
+    await do_refund_confirm(callback.message.chat.id, callback.from_user)
+    if not authorized:
+        return
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# -- Refund cancel callback (legacy: old button messages still work) --
+@dp.callback_query(F.data == "refund_cancel")
+async def handle_refund_cancel(callback: CallbackQuery):
+    await callback.answer()
+    state = deal_states.get(callback.message.chat.id, {})
+    authorized = (callback.from_user.id == state.get("seller") or _is_admin_user(callback.from_user))
+    await do_refund_cancel(callback.message.chat.id, callback.from_user)
+    if not authorized:
+        return
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# -- Refund address confirmation callback (legacy: old button messages still work) --
+# *** MONEY LOGIC lives in do_refund_address_confirm - refund_in_progress set BEFORE any await ***
+@dp.callback_query(F.data == "refund_address_confirm")
+async def handle_refund_address_confirmation(callback: CallbackQuery):
+    await callback.answer()
+    await do_refund_address_confirm(callback.message.chat.id, callback.from_user)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+# -- Refund address reject callback (legacy: old button messages still work) --
+@dp.callback_query(F.data == "refund_address_reject")
+async def handle_refund_address_reject(callback: CallbackQuery):
+    await callback.answer()
+    await do_refund_address_reject(callback.message.chat.id, callback.from_user)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+# ==============================================
+# MAIN ENTRY POINT
+# ==============================================
+
+async def main():
+    logger.info("Baloch Escrow Bot Starting...")
+    logger.info("AI-Powered Automated Deal Management Active")
+    logger.info("Cryptomus Payment Gateway Active")
+    logger.info("Automatic Payment Detection (5s polling)")
+    logger.info("Automatic Payout via Cryptomus")
+    logger.info("Deadline Timer starts AFTER payment confirmed")
+    logger.info("Instant Role Permit on join")
+
+    if not CRYPTOMUS_MERCHANT_ID:
+        logger.error("=" * 60)
+        logger.error("CRITICAL: CRYPTOMUS_MERCHANT_ID is NOT set!")
+        logger.error("Payment invoices and monitoring will NOT work.")
+        logger.error("Please set your Cryptomus Merchant UUID in the config.")
+        logger.error("You can find it at: https://app.cryptomus.com/settings/api")
+        logger.error('Example: CRYPTOMUS_MERCHANT_ID = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"')
+        logger.error("=" * 60)
+
+    # ---- Startup recovery: reload persisted deals, resume monitoring ----
+    restored = load_deal_states()
+    if restored:
+        deal_states.update(restored)
+        logger.info(f"Restored {len(restored)} deal(s) from disk")
+    for r_chat_id, r_state in list(deal_states.items()):
+        try:
+            if r_state.get("payout_in_progress") or r_state.get("refund_in_progress"):
+                # A payout/refund was in-flight during restart: status unknown.
+                r_state["stage"] = "payout_failed"
+                r_state["payout_error"] = "Bot restarted during payout - status unknown, verify manually."
+                r_state.pop("payout_in_progress", None)
+                r_state.pop("refund_in_progress", None)
+                await safe_notify_admin(
+                    f"⚠️ Bot restarted during a payout/refund (chat {r_chat_id}). "
+                    f"Status unknown - verify on Cryptomus before re-attempting."
+                )
+            elif r_state.get("stage") == "payment_monitoring" and r_state.get("payment_order_id"):
+                task = asyncio.create_task(
+                    continuous_payment_monitoring(
+                        r_chat_id, r_state["payment_order_id"], duration_minutes=120
+                    )
+                )
+                payment_monitoring_tasks[r_chat_id] = task
+                logger.info(f"Resumed payment monitoring for chat {r_chat_id}")
+        except Exception as e:
+            logger.error(f"Recovery failed for chat {r_chat_id}: {e}")
+    save_deal_states()
+
+    # C10 FIX: loop instead of recursing (recursion -> RecursionError crash)
+    while True:
+        try:
+            await dp.start_polling(bot)
+            break  # clean shutdown
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            logger.error(f"Bot polling error: {e}; restarting in 5s")
+            await asyncio.sleep(5)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
