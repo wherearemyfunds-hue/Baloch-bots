@@ -1045,32 +1045,106 @@ async def show_payment_info_tron(chat_id: int):
 
 
 async def tron_payment_monitoring(chat_id: int, address: str, expected: float, duration_minutes: int = 120):
-    """Monitor TRON blockchain for USDT deposit."""
+    """
+    Monitor TRON blockchain for USDT deposits.
+    Handles partial payments like Cryptomus:
+    - Cumulative >= expected - $3: accept
+    - Partial < expected - $3: notify buyer once, keep monitoring
+    """
     import tron_pay
-    import asyncio as aio
+    import requests
     state = deal_states.get(chat_id)
     if not state:
         return
-    # Run blocking wait in thread to avoid blocking event loop
-    loop = aio.get_event_loop()
-    result = await loop.run_in_executor(
-        None,
-        lambda: tron_pay.wait_for_deposit(address, expected, timeout_sec=duration_minutes * 60, poll_interval=15),
-    )
-    state = deal_states.get(chat_id)
-    if not state or state.get("stage") != "payment_monitoring":
-        return
-    if result.get("ok"):
-        logger.info(f"TRON deposit detected for chat {chat_id}: {result['amount']} USDT")
-        expected = state.get("buyer_amount", 0)
-        shortfall = round(expected - result["amount"], 2)
-        await handle_payment_detected(chat_id, result["amount"], max(shortfall, 0))
-    else:
-        await bot.send_message(
-            chat_id,
-            "⏰ Payment timeout (120 min). If you already sent USDT, contact admin.",
-            parse_mode="HTML",
+    logger.info(f"[TRON Monitor] Started for chat {chat_id}, address {address}")
+    end_time = time.time() + (duration_minutes * 60)
+    seen_txids: set = set()
+    total_received = 0.0
+    underpay_notified = False
+
+    # Baseline: ignore txs that existed before monitoring started
+    try:
+        r = requests.get(
+            f"https://api.trongrid.io/v1/accounts/{address}/transactions/trc20",
+            params={"limit": 20, "only_confirmed": "true",
+                    "contract_address": tron_pay.USDT_CONTRACT},
+            timeout=15,
         )
+        if r.status_code == 200:
+            for t in r.json().get("data", []):
+                seen_txids.add(t.get("transaction_id", ""))
+    except Exception as e:
+        logger.warning(f"[TRON Monitor] Baseline fetch failed: {e}")
+
+    try:
+        while time.time() < end_time:
+            if chat_id not in deal_states:
+                break
+            stage = deal_states[chat_id].get("stage", "")
+            if stage not in ("payment", "payment_monitoring"):
+                break
+            try:
+                r = requests.get(
+                    f"https://api.trongrid.io/v1/accounts/{address}/transactions/trc20",
+                    params={"limit": 20, "only_confirmed": "true",
+                            "contract_address": tron_pay.USDT_CONTRACT},
+                    timeout=15,
+                )
+                if r.status_code == 200:
+                    for t in r.json().get("data", []):
+                        txid = t.get("transaction_id", "")
+                        if txid in seen_txids or t.get("to", "") != address:
+                            continue
+                        seen_txids.add(txid)
+                        amt = int(t.get("value", 0)) / 1_000_000
+                        total_received = round(total_received + amt, 2)
+                        logger.info(f"[TRON Monitor] Chat {chat_id}: +{amt} USDT (total {total_received}/{expected})")
+                        shortfall = round(expected - total_received, 2)
+                        if shortfall <= 3.0:
+                            # Accept: exact, overpaid, or within $3 tolerance
+                            await handle_payment_detected(chat_id, total_received, max(shortfall, 0))
+                            return
+                        elif not underpay_notified:
+                            underpay_notified = True
+                            buyer_name = await get_username(deal_states[chat_id].get("buyer", 0), "Buyer")
+                            await bot.send_message(
+                                chat_id,
+                                f"<b>Partial Payment Detected</b>\n\n"
+                                f"{buyer_name}, we received <b>{total_received} USDT</b> "
+                                f"but the required amount is <b>{expected} USDT</b>.\n\n"
+                                f"<b>Remaining: {shortfall} USDT</b>\n\n"
+                                f"Please send the remaining amount to the same address.\n"
+                                f"The system will automatically detect the additional payment.",
+                                parse_mode="HTML",
+                            )
+                            await safe_notify_admin(
+                                f"[Partial Payment - TRON]\nChat: {chat_id}\n"
+                                f"Expected: {expected} USDT\nReceived: {total_received} USDT\n"
+                                f"Shortfall: {shortfall} USDT"
+                            )
+            except Exception as e:
+                logger.warning(f"[TRON Monitor] Poll error: {e}")
+            await asyncio.sleep(15)
+        # Timeout
+        state = deal_states.get(chat_id)
+        if state and state.get("stage") in ("payment", "payment_monitoring"):
+            if total_received > 0:
+                await bot.send_message(
+                    chat_id,
+                    f"⏰ Payment timeout. Received <b>{total_received} USDT</b> of <b>{expected} USDT</b>.\n"
+                    f"Contact admin @{ADMIN_USERNAME}.",
+                    parse_mode="HTML",
+                )
+            else:
+                await bot.send_message(
+                    chat_id,
+                    "⏰ Payment timeout (120 min). If you already sent USDT, contact admin.",
+                    parse_mode="HTML",
+                )
+    except asyncio.CancelledError:
+        logger.info(f"[TRON Monitor] Chat {chat_id} - cancelled")
+    except Exception as e:
+        logger.error(f"[TRON Monitor] Chat {chat_id} - error: {e}")
 
 
 async def show_payment_info_cryptomus(chat_id: int):
