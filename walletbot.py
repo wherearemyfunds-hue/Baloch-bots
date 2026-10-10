@@ -103,6 +103,7 @@ def admin_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="💸 Send (Admin)", callback_data="w_send")],
         [InlineKeyboardButton(text="👥 Users", callback_data="a_users")],
         [InlineKeyboardButton(text="🤝 Deal Funds", callback_data="a_deals")],
+        [InlineKeyboardButton(text="📦 Backup Deals", callback_data="a_backup")],
     ])
 
 
@@ -282,6 +283,28 @@ async def cb_deal_wd_confirm(callback: types.CallbackQuery):
             f"❌ Failed: {result.get('error', '?')}\n\n"
             f"Tip: deal address needs TRX for gas!",
             parse_mode="HTML", reply_markup=admin_menu())
+
+
+@dp.callback_query(F.data == "a_backup")
+async def cb_a_backup(callback: types.CallbackQuery):
+    """Send deal_states.json backup to admin via Telegram."""
+    await callback.answer("Preparing...")
+    if not _is_admin(callback.from_user.id):
+        return
+    import os
+    from aiogram.types import FSInputFile
+    path = "/root/deal_states.json"
+    if not os.path.exists(path):
+        await callback.message.answer("❌ No deal data yet.")
+        return
+    try:
+        await callback.message.answer_document(
+            FSInputFile(path, filename=f"deal_backup_{callback.message.date.strftime('%Y%m%d')}.json"),
+            caption="📦 <b>Deal Backup</b>\n\nIs file ko <b>save</b> kar lo!\nVPS kharab ho jaye to isi se paisa wapas milega.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await callback.message.answer(f"❌ Backup failed: {e}")
 
 
 @dp.callback_query(F.data == "w_send")
