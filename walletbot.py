@@ -25,6 +25,16 @@ BTCPAY_STORE_ID = os.environ.get("BTCPAY_STORE_ID", "")
 CRYPTO_CODE = os.environ.get("BTCPAY_CRYPTO", "BTC")  # BTC, USDT, etc.
 ADMIN_IDS = {int(x) for x in os.environ.get("WALLET_ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
+# --- Direct TRON (USDT TRC20) — personal wallet mode ---
+USE_TRON = os.environ.get("WALLET_USE_TRON", "false").lower() == "true"
+TRON_PRIVATE_KEY = os.environ.get("TRON_PRIVATE_KEY", "").strip()
+try:
+    import tron_pay
+    TRON_AVAILABLE = bool(TRON_PRIVATE_KEY)
+except ImportError:
+    TRON_AVAILABLE = False
+    tron_pay = None
+
 if not BOT_TOKEN:
     logger.error("WALLET_BOT_TOKEN not set!")
     sys.exit(1)
@@ -93,6 +103,20 @@ async def cb_balance(callback: types.CallbackQuery):
     await callback.answer("Checking...")
     if not _is_admin(callback.from_user.id):
         return
+    if USE_TRON and TRON_AVAILABLE:
+        import asyncio as aio
+        loop = aio.get_event_loop()
+        addr = await loop.run_in_executor(None, tron_pay.get_hot_wallet_address)
+        usdt = await loop.run_in_executor(None, tron_pay.get_usdt_balance, addr)
+        trx = await loop.run_in_executor(None, tron_pay.get_trx_balance, addr)
+        await callback.message.answer(
+            f"💰 <b>Wallet Balance</b>\n\n"
+            f"USDT (TRC20): <b>{usdt:.2f}</b>\n"
+            f"TRX (gas): <b>{trx:.2f}</b>\n\n"
+            f"<code>{addr}</code>",
+            parse_mode="HTML",
+        )
+        return
     resp = await _btcpay_get("")
     if resp["ok"]:
         data = resp["data"]
@@ -112,6 +136,16 @@ async def cb_balance(callback: types.CallbackQuery):
 async def cb_receive(callback: types.CallbackQuery):
     await callback.answer("Generating...")
     if not _is_admin(callback.from_user.id):
+        return
+    if USE_TRON and TRON_AVAILABLE:
+        import asyncio as aio
+        loop = aio.get_event_loop()
+        addr = await loop.run_in_executor(None, tron_pay.get_hot_wallet_address)
+        await callback.message.answer(
+            f"📥 <b>Your USDT (TRC20) Address</b>\n\n<code>{addr}</code>\n\n"
+            f"Send USDT (TRC20) here. Deposits are detected automatically!",
+            parse_mode="HTML",
+        )
         return
     resp = await _btcpay_post("/addresses", {})
     if resp["ok"]:
@@ -172,6 +206,27 @@ async def cb_send_confirm(callback: types.CallbackQuery):
         return
     # Yes — broadcast the transaction
     await callback.message.answer("⏳ Broadcasting transaction...")
+    if USE_TRON and TRON_AVAILABLE:
+        import asyncio as aio
+        loop = aio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, lambda: tron_pay.send_usdt(st["address"], st["amount"]))
+        user_state.pop(uid, None)
+        if result.get("ok"):
+            txid = result.get("txid", "")
+            await callback.message.answer(
+                f"✅ <b>USDT Sent!</b>\n\nTxID: <code>{txid}</code>\n"
+                f"https://tronscan.org/#/transaction/{txid}",
+                parse_mode="HTML",
+                reply_markup=main_menu(),
+            )
+        else:
+            await callback.message.answer(
+                f"❌ Send failed: {result.get('error', 'unknown')}",
+                parse_mode="HTML",
+                reply_markup=main_menu(),
+            )
+        return
     payload = {
         "destinations": [{"destination": st["address"], "amount": st["amount"]}],
         "proceedWithBroadcast": True,
