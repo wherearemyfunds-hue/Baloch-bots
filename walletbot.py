@@ -104,6 +104,7 @@ def admin_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="👥 Users", callback_data="a_users")],
         [InlineKeyboardButton(text="🤝 Deal Funds", callback_data="a_deals")],
         [InlineKeyboardButton(text="📦 Backup Deals", callback_data="a_backup")],
+        [InlineKeyboardButton(text="🧹 Recover TRX", callback_data="a_sweep")],
     ])
 
 
@@ -289,6 +290,55 @@ async def cb_deal_wd_confirm(callback: types.CallbackQuery):
             f"❌ Failed: {result.get('error', '?')}\n\n"
             f"Tip: deal address needs TRX for gas!",
             parse_mode="HTML", reply_markup=admin_menu())
+
+
+@dp.callback_query(F.data == "a_sweep")
+async def cb_a_sweep(callback: types.CallbackQuery):
+    """Sweep leftover TRX from all deal addresses back to hot wallet."""
+    await callback.answer("Sweeping...")
+    if not _is_admin(callback.from_user.id):
+        return
+    import json
+    await callback.message.answer("🧹 <b>Sweeping leftover TRX...</b>", parse_mode="HTML")
+    loop = asyncio.get_event_loop()
+    def _sweep_all():
+        results = []
+        try:
+            with open("/root/deal_states.json") as f:
+                states = json.load(f)
+        except Exception:
+            return [("error", "No deal data")]
+        hot_addr = tron_pay._get_master_key().public_key.to_base58check_address()
+        for cid, s in states.items():
+            addr = s.get("tron_deposit_address")
+            idx = s.get("tron_hd_index")
+            if not addr or not idx:
+                continue
+            try:
+                bal = tron_pay.get_trx_balance(addr)
+                if bal > 1.5:
+                    sweep_amt = round(bal - 1.0, 2)
+                    pk = tron_pay.get_user_private_key(idx)
+                    client = tron_pay._get_client()
+                    txn = (
+                        client.trx.transfer(addr, hot_addr, int(sweep_amt * 1_000_000))
+                        .build()
+                        .sign(pk)
+                    )
+                    r = txn.broadcast()
+                    results.append((addr, sweep_amt, "ok"))
+                else:
+                    results.append((addr, bal, "skip"))
+            except Exception as e:
+                results.append((addr, 0, f"fail: {e}"))
+        return results
+    results = await loop.run_in_executor(None, _sweep_all)
+    total = sum(r[1] for r in results if r[2] == "ok")
+    lines = [f"🧹 <b>Sweep Complete!</b>\n", f"Recovered: <b>{total:.2f} TRX</b>\n"]
+    for addr, amt, st in results:
+        if st == "ok":
+            lines.append(f"✅ {addr[:10]}...: {amt:.2f} TRX")
+    await callback.message.answer("\n".join(lines), parse_mode="HTML", reply_markup=admin_menu())
 
 
 @dp.callback_query(F.data == "a_backup")
