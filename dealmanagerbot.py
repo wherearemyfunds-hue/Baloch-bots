@@ -294,6 +294,36 @@ def detect_address_type(address: str) -> dict:
     return {"valid": False, "type": None, "network": None}
 
 
+def validate_payout_address(address: str) -> tuple[bool, str]:
+    """
+    Validate payout/refund address.
+    In TRON mode: ONLY TRC20 accepted. Otherwise both TRC20/BEP20.
+    Returns (valid, error_message).
+    """
+    v = detect_address_type(address)
+    if not v["valid"]:
+        if USE_TRON and TRON_AVAILABLE:
+            return False, "❌ Invalid address. Please send your <b>USDT TRC20</b> address (starts with T)."
+        return False, "Invalid address. Please send a valid USDT TRC20 or USDT BEP20 address."
+    if USE_TRON and TRON_AVAILABLE and v["type"] != "TRC20":
+        return False, "❌ Only <b>USDT TRC20</b> is supported. Please send a TRON address (starts with T)."
+    return True, ""
+
+
+def payout_prompt_text() -> str:
+    """Payout address prompt — TRC20 only in TRON mode."""
+    if USE_TRON and TRON_AVAILABLE:
+        return "please send your payout address (USDT <b>TRC20</b> only — starts with T)."
+    return "please send your payout address (USDT TRC20 or USDT BEP20 only)."
+
+
+def refund_prompt_text() -> str:
+    """Refund address prompt — TRC20 only in TRON mode."""
+    if USE_TRON and TRON_AVAILABLE:
+        return "please send your refund address (USDT <b>TRC20</b> only — starts with T)."
+    return "please send your refund address (USDT TRC20 or USDT BEP20 only)."
+
+
 def parse_deadline_to_seconds(deadline_text: str) -> int:
     """Parse deadline text into total seconds. Handles misspellings."""
     text = deadline_text.lower().strip()
@@ -2115,7 +2145,7 @@ async def do_release_confirm(chat_id: int, user: types.User):
     state.pop("awaiting", None)
     seller_name = await get_username(state["seller"], "Seller")
     state["stage"] = "payout_address"
-    await bot.send_message(chat_id, f"{seller_name}, please send your payout address (USDT TRC20 or USDT BEP20 only).")
+    await bot.send_message(chat_id, f"{seller_name}, {payout_prompt_text()}")
 
 
 async def do_release_cancel(chat_id: int, user: types.User):
@@ -2212,7 +2242,7 @@ async def do_address_reject(chat_id: int, user: types.User):
         return
     seller_name = await get_username(state["seller"], "Seller")
     state["stage"] = "payout_address"
-    await bot.send_message(chat_id, f"{seller_name}, please send your payout address again (USDT TRC20 or USDT BEP20 only).")
+    await bot.send_message(chat_id, f"{seller_name}, please send your payout address again. {payout_prompt_text()}")
 
 
 # ----------------------------------------------
@@ -2266,7 +2296,7 @@ async def do_refund_confirm(chat_id: int, user: types.User):
     state.pop("awaiting", None)
     buyer_name = await get_username(state["buyer"], "Buyer")
     state["stage"] = "refund_address"
-    await bot.send_message(chat_id, f"{buyer_name}, please send your refund address (USDT TRC20 or USDT BEP20 only).")
+    await bot.send_message(chat_id, f"{buyer_name}, {refund_prompt_text()}")
 
 
 async def do_refund_cancel(chat_id: int, user: types.User):
@@ -2367,7 +2397,7 @@ async def do_refund_address_reject(chat_id: int, user: types.User):
         return
     buyer_name = await get_username(state["buyer"], "Buyer")
     state["stage"] = "refund_address"
-    await bot.send_message(chat_id, f"{buyer_name}, please send your refund address again (USDT TRC20 or USDT BEP20 only).")
+    await bot.send_message(chat_id, f"{buyer_name}, please send your refund address again. {refund_prompt_text()}")
 
 
 # ----------------------------------------------
@@ -3144,10 +3174,11 @@ async def universal_stage_handler(message: types.Message):
     # ======================================================
     if stage == "payout_address" and user_id == state.get("seller"):
         address = message.text.strip()
-        verification = detect_address_type(address)
-        if not verification["valid"]:
-            await message.answer("Invalid address. Please send a valid USDT TRC20 or USDT BEP20 address.")
+        ok, err = validate_payout_address(address)
+        if not ok:
+            await message.answer(err, parse_mode="HTML")
             return
+        verification = detect_address_type(address)
 
         state["payout_address"] = address
         state["address_type"] = verification["type"]
@@ -3170,10 +3201,11 @@ async def universal_stage_handler(message: types.Message):
     # ======================================================
     if stage == "refund_address" and user_id == state.get("buyer"):
         address = message.text.strip()
-        verification = detect_address_type(address)
-        if not verification["valid"]:
-            await message.answer("Invalid address. Please send a valid USDT TRC20 or USDT BEP20 address.")
+        ok, err = validate_payout_address(address)
+        if not ok:
+            await message.answer(err, parse_mode="HTML")
             return
+        verification = detect_address_type(address)
 
         state["refund_address"] = address
         state["refund_address_type"] = verification["type"]
