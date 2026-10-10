@@ -101,6 +101,7 @@ def admin_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📥 My Deposit Address", callback_data="u_address")],
         [InlineKeyboardButton(text="💰 My Balance", callback_data="u_balance")],
         [InlineKeyboardButton(text="💸 Send (Admin)", callback_data="w_send")],
+        [InlineKeyboardButton(text="🔄 Swap USDT→TRX", callback_data="a_swap")],
         [InlineKeyboardButton(text="👥 Users", callback_data="a_users")],
         [InlineKeyboardButton(text="🤝 Deal Funds", callback_data="a_deals")],
         [InlineKeyboardButton(text="📦 Backup Deals", callback_data="a_backup")],
@@ -341,6 +342,46 @@ async def cb_a_sweep(callback: types.CallbackQuery):
     await callback.message.answer("\n".join(lines), parse_mode="HTML", reply_markup=admin_menu())
 
 
+@dp.callback_query(F.data == "a_swap")
+async def cb_a_swap(callback: types.CallbackQuery):
+    """Start USDT->TRX swap (admin only)."""
+    await callback.answer()
+    if not _is_admin(callback.from_user.id):
+        return
+    user_state[callback.from_user.id] = {"step": "swap_amount"}
+    await callback.message.answer(
+        "🔄 <b>Swap USDT → TRX</b>\n\n"
+        "How much USDT to swap? (e.g., 10)\n"
+        "<i>Uses SunSwap. ~5 TRX fee for the swap itself.</i>",
+        parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("swap_confirm_"))
+async def cb_swap_confirm(callback: types.CallbackQuery):
+    await callback.answer()
+    if not _is_admin(callback.from_user.id):
+        return
+    uid = callback.from_user.id
+    st = user_state.get(uid, {})
+    if callback.data == "swap_confirm_no":
+        user_state.pop(uid, None)
+        await callback.message.answer("❌ Cancelled.", reply_markup=admin_menu())
+        return
+    await callback.message.answer("⏳ Swapping via SunSwap...")
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, tron_pay.swap_usdt_to_trx, st.get("swap_amt", 0))
+    user_state.pop(uid, None)
+    if result.get("ok"):
+        await callback.message.answer(
+            f"✅ <b>Swapped!</b>\n\nReceived: <b>{result.get('trx_received', 0):.2f} TRX</b>\n"
+            f"TxID: <code>{result.get('txid', '')}</code>",
+            parse_mode="HTML", reply_markup=admin_menu())
+    else:
+        await callback.message.answer(
+            f"❌ Swap failed: {result.get('error', '?')}",
+            parse_mode="HTML", reply_markup=admin_menu())
+
+
 @dp.callback_query(F.data == "a_backup")
 async def cb_a_backup(callback: types.CallbackQuery):
     """Send deal_states.json backup to admin via Telegram."""
@@ -414,6 +455,23 @@ async def handle_text(message: types.Message):
         user_state.pop(uid, None)
         return
     text = message.text.strip()
+    if st["step"] == "swap_amount":
+        try:
+            amt = float(text)
+            if amt <= 0:
+                raise ValueError
+        except ValueError:
+            await message.answer("❌ Invalid amount. Try again:")
+            return
+        st["swap_amt"] = amt
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Confirm Swap", callback_data="swap_confirm_yes")],
+            [InlineKeyboardButton(text="❌ Cancel", callback_data="swap_confirm_no")],
+        ])
+        await message.answer(
+            f"Confirm swap:\n\n<b>{amt} USDT</b> → TRX\n<i>Via SunSwap V2</i>",
+            parse_mode="HTML", reply_markup=kb)
+        return
     if st["step"] == "deal_withdraw":
         # Step 1: get destination address for deal withdraw
         if not (text.startswith("T") and len(text) == 34):

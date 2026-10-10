@@ -16,6 +16,10 @@ logger = logging.getLogger("tron_pay")
 
 # USDT TRC20 contract (mainnet)
 USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+# SunSwap V2 Router (mainnet) - for USDT<->TRX swaps
+SUNSWAP_V2_ROUTER = "TKzxdSv2FZKQrEqkKVgp5DcwEXBEKMg2Ax"
+# Wrapped TRX (for swap paths)
+WTRX_CONTRACT = "TNUC9Qb1rRpS5CbWLmNMxXBjyFoydXjWFR"
 TRONGRID_API = "https://api.trongrid.io"
 # USDT has 6 decimals
 USDT_DECIMALS = 6
@@ -237,12 +241,17 @@ def ensure_gas(address: str, min_trx: float = 20.0) -> bool:
     """
     Ensure an address has enough TRX for gas.
     If not, send TRX from hot wallet automatically.
+    If hot wallet is low, auto-swap USDT->TRX to refill.
     Returns True if gas is available (or was funded).
     """
     try:
         bal = get_trx_balance(address)
         if bal >= min_trx:
             return True
+        # Check hot wallet, auto-refill if needed
+        refill = auto_refill_gas(min_trx=30.0)
+        if not refill.get("ok") and refill.get("action") not in ("sufficient", "swapped"):
+            logger.warning(f"Auto-refill failed: {refill.get('error')}")
         logger.info(f"Funding gas: {address} has {bal} TRX, sending {min_trx}")
         result = send_trx(address, min_trx)
         if result.get("ok"):
@@ -285,6 +294,82 @@ def send_usdt_from_with_gas(priv_key: PrivateKey, to_address: str, amount_usdt: 
         except Exception as e:
             logger.warning(f"TRX sweep-back failed (non-critical): {e}")
     return result
+
+
+def swap_usdt_to_trx(amount_usdt: float, slippage_pct: float = 1.0) -> dict:
+    """
+    Swap USDT -> TRX via SunSwap V2 (for gas funding).
+    Uses hot wallet. Returns {"ok": True, "trx_received": ..., "txid": ...}.
+    """
+    try:
+        client = _get_client()
+        priv_key = _get_master_key()
+        from_addr = priv_key.public_key.to_base58check_address()
+
+        # Get quote first (how much TRX we'll get)
+        router = client.get_contract(SUNSWAP_V2_ROUTER)
+        amount_in = int(amount_usdt * (10 ** USDT_DECIMALS))
+        path = [USDT_CONTRACT, WTRX_CONTRACT]
+
+        # Get amounts out
+        amounts = router.functions.getAmountsOut(amount_in, path)
+        expected_trx = int(amounts[-1]) / 1_000_000
+        min_out = int(amounts[-1] * (1 - slippage_pct / 100))
+
+        logger.info(f"Swapping {amount_usdt} USDT -> ~{expected_trx:.2f} TRX")
+
+        # Step 1: Approve router to spend USDT
+        usdt = client.get_contract(USDT_CONTRACT)
+        approve_txn = (
+            usdt.functions.approve(SUNSWAP_V2_ROUTER, amount_in)
+            .with_owner(from_addr)
+            .build()
+            .sign(priv_key)
+        )
+        approve_txn.broadcast()
+        time.sleep(5)  # wait for approval
+
+        # Step 2: Swap
+        deadline = int(time.time()) + 600  # 10 min
+        swap_txn = (
+            router.functions.swapExactTokensForTRX(
+                amount_in, min_out, path, from_addr, deadline
+            )
+            .with_owner(from_addr)
+            .build()
+            .sign(priv_key)
+        )
+        result = swap_txn.broadcast()
+        txid = result.get("txid", "")
+
+        # Wait and check TRX received
+        time.sleep(10)
+        return {"ok": True, "trx_received": expected_trx, "txid": txid}
+    except Exception as e:
+        logger.error(f"Swap failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+def auto_refill_gas(min_trx: float = 20.0, swap_usdt_amount: float = 10.0) -> dict:
+    """
+    If hot wallet TRX is below min_trx, auto-swap USDT->TRX to refill.
+    Returns {"ok": True, "action": "swapped"/"sufficient"/"no_usdt"}.
+    """
+    hot_addr = _get_master_key().public_key.to_base58check_address()
+    trx_bal = get_trx_balance(hot_addr)
+    if trx_bal >= min_trx:
+        return {"ok": True, "action": "sufficient", "trx": trx_bal}
+
+    usdt_bal = get_usdt_balance(hot_addr)
+    if usdt_bal < swap_usdt_amount:
+        return {"ok": False, "action": "no_usdt",
+                "error": f"Hot wallet low on TRX ({trx_bal:.1f}) and USDT ({usdt_bal:.1f})"}
+
+    logger.info(f"Auto-refill: swapping {swap_usdt_amount} USDT -> TRX (hot wallet low: {trx_bal:.1f} TRX)")
+    result = swap_usdt_to_trx(swap_usdt_amount)
+    if result.get("ok"):
+        return {"ok": True, "action": "swapped", "trx_received": result.get("trx_received")}
+    return {"ok": False, "action": "swap_failed", "error": result.get("error")}
 
 
 def wait_for_deposit(address: str, expected_usdt: float, timeout_sec: int = 7200,
