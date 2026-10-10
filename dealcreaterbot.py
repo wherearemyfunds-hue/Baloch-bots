@@ -24,6 +24,7 @@ import html
 import logging
 import json
 import os
+import re
 import sys
 import tempfile
 import traceback
