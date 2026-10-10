@@ -222,14 +222,18 @@ async def cryptomus_check_invoice(order_id: str) -> dict:
 
 
 async def cryptomus_create_payout(amount: float, address: str, network: str, order_id: str) -> dict:
-    """Create a Cryptomus payout (withdrawal) to seller's address."""
+    """Create a Cryptomus payout (withdrawal) to seller's address.
+    
+    is_subtract=True: Cryptomus deducts its network fee from the payout amount.
+    The recipient gets (amount - cryptomus_fee). The escrow fee is NOT touched.
+    """
     data = {
         "amount": str(round(amount, 2)),
         "currency": "USDT",
         "network": network,
         "order_id": order_id,
         "address": address,
-        "is_subtract": True,
+        "is_subtract": True,  # Fee deducted from payout amount, NOT from escrow fee
     }
     return await cryptomus_request("/payout", data, CRYPTOMUS_PAYOUT_API_KEY)
 
@@ -1069,9 +1073,10 @@ async def payout_to_seller(address: str, address_type: str, network: str, amount
                         return False, f"Payout failed with status: {check_status}"
 
             return False, (
-                "Payout status unknown after 120s (still processing on Cryptomus).\n"
+                "⏳ Payout is still processing on Cryptomus after 120s.\n"
                 f"Payout ID: {payout_uuid}\n"
-                "DO NOT retry automatically - verify manually before re-attempting."
+                "It may complete successfully. Please check the Cryptomus dashboard "
+                "to verify the status before retrying. DO NOT retry blindly."
             )
         else:
             error = resp.get("error", "Unknown error")
@@ -1398,9 +1403,63 @@ async def do_deal_question_answer(chat_id: int, user: types.User, answer_data: s
     seller_answered = state.get("seller") in state[answers_key]
 
     if buyer_answered and seller_answered:
+        buyer_ans = state[answers_key].get(state["buyer"])
+        seller_ans = state[answers_key].get(state["seller"])
+        # Normalize answers for comparison (handle 1/2 vs text)
+        def _norm(a):
+            s = str(a).strip().lower()
+            # Map common variants to canonical form
+            if s in ("1", "refund to buyer", "refund"):
+                return "refund"
+            if s in ("2", "release to seller", "release"):
+                return "release"
+            return s
+        # ---- NEW: check agreement before proceeding ----
+        if _norm(buyer_ans) != _norm(seller_ans):
+            buyer_name = await get_username(state.get("buyer", 0), "Buyer")
+            seller_name = await get_username(state.get("seller", 0), "Seller")
+            await bot.send_message(
+                chat_id,
+                f"⚠️ <b>You disagree!</b>\n\n"
+                f"{buyer_name} (Buyer) said: <b>{buyer_ans}</b>\n"
+                f"{seller_name} (Seller) said: <b>{seller_ans}</b>\n\n"
+                f"Please decide among yourselves what to do:\n"
+                f"<b>Refund</b> or <b>Release to Seller</b>?\n\n"
+                f"Once you agree, <b>one of you reply</b> with the agreed option, "
+                f"and I'll ask the other to confirm.",
+                parse_mode="HTML",
+            )
+            # Mark as needing agreement: next reply proposes, other confirms
+            state[f"disagreement_{question_index}"] = True
+            state[answers_key] = {}
+            return
+        # ---- Handle agreement confirmation after disagreement ----
+        disagree_key = f"disagreement_{question_index}"
+        if state.get(disagree_key):
+            # One party proposed an answer, ask the other to confirm
+            proposer_id = user_id
+            proposer_role = "buyer" if user_id == state.get("buyer") else "seller"
+            other_role = "seller" if proposer_role == "buyer" else "buyer"
+            other_id = state.get(other_role)
+            other_name = await get_username(other_id, other_role.capitalize())
+            # Store the proposal
+            state[f"proposal_{question_index}"] = answer_data
+            state[f"proposer_{question_index}"] = proposer_id
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Yes, I agree", callback_data=f"agree_{question_index}"),
+                InlineKeyboardButton(text="❌ No", callback_data=f"disagree_{question_index}"),
+            ]])
+            await bot.send_message(
+                chat_id,
+                f"{other_name}, do you agree with <b>{answer_data}</b>?\n"
+                f"Tap <b>Yes</b> / <b>No</b>, or reply: <b>yes</b> / <b>no</b>",
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+            return
         state[f"deal_question_{q['key']}"] = {
-            "buyer_answer": state[answers_key].get(state["buyer"]),
-            "seller_answer": state[answers_key].get(state["seller"]),
+            "buyer_answer": buyer_ans,
+            "seller_answer": seller_ans,
         }
         username = await get_username(user_id, "User")
         await bot.send_message(chat_id, f"{username} answered. Both parties responded!", parse_mode="HTML")
@@ -2114,6 +2173,45 @@ async def route_text_command(message: types.Message) -> bool:
         return False
     stage = state.get("stage")
     cmd = _normalize_cmd(message.text)
+
+    # --- Pending agreement proposal: 'yes' / 'no' ---
+    # Check if there's a pending proposal for any question
+    for key in list(state.keys()):
+        if key.startswith("disagreement_") and state.get(key):
+            try:
+                q_idx = int(key.split("_")[1])
+            except (IndexError, ValueError):
+                continue
+            proposer_id = state.get(f"proposer_{q_idx}")
+            # Only the non-proposer can confirm, and only if there's a proposal
+            if proposer_id and user.id != proposer_id and state.get(f"proposal_{q_idx}"):
+                if cmd in YES_WORDS:
+                    # Accepted!
+                    proposal = state.get(f"proposal_{q_idx}")
+                    q = DEAL_QUESTIONS[q_idx]
+                    state[f"deal_question_{q['key']}"] = {
+                        "buyer_answer": proposal,
+                        "seller_answer": proposal,
+                        "agreed": True,
+                    }
+                    for k in (f"disagreement_{q_idx}", f"proposal_{q_idx}", f"proposer_{q_idx}"):
+                        state.pop(k, None)
+                    username = await get_username(user.id, "User")
+                    await bot.send_message(chat_id, f"{username} agreed! ✅ Moving on...", parse_mode="HTML")
+                    await ask_deal_question(chat_id, q_idx + 1)
+                    return True
+                if cmd in NO_WORDS:
+                    for k in (f"disagreement_{q_idx}", f"proposal_{q_idx}", f"proposer_{q_idx}"):
+                        state.pop(k, None)
+                    await bot.send_message(
+                        chat_id,
+                        "❌ Not agreed. Please discuss and <b>one of you reply</b> with the agreed option:\n"
+                        "<b>Refund</b> or <b>Release to Seller</b>?",
+                        parse_mode="HTML",
+                    )
+                    state[f"disagreement_{q_idx}"] = True
+                    return True
+            break  # only handle the first pending disagreement
 
     # --- role_selection: 'buyer' / 'seller' (+ AI guess confirm) ---
     if stage == "role_selection":
@@ -3026,6 +3124,59 @@ async def ask_deal_question(chat_id: int, question_index: int):
 async def handle_deal_question_response(callback: CallbackQuery):
     await callback.answer()
     await do_deal_question_answer(callback.message.chat.id, callback.from_user, callback.data)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# -- Agreement confirmation after disagreement --
+@dp.callback_query(F.data.startswith("agree_") | F.data.startswith("disagree_"))
+async def handle_agreement_response(callback: CallbackQuery):
+    """Handle Yes/No response to a proposed answer after disagreement."""
+    await callback.answer()
+    chat_id = callback.message.chat.id
+    data = callback.data
+    is_agree = data.startswith("agree_")
+    try:
+        question_index = int(data.split("_")[1])
+    except (IndexError, ValueError):
+        return
+    state = deal_states.get(chat_id)
+    if not state:
+        return
+    # Only the non-proposer can confirm
+    proposer_id = state.get(f"proposer_{question_index}")
+    if callback.from_user.id == proposer_id:
+        await callback.answer("Wait for the other party to respond.", show_alert=True)
+        return
+    if is_agree:
+        # Accepted! Store the agreed answer and move on
+        proposal = state.get(f"proposal_{question_index}")
+        q = DEAL_QUESTIONS[question_index]
+        state[f"deal_question_{q['key']}"] = {
+            "buyer_answer": proposal,
+            "seller_answer": proposal,
+            "agreed": True,
+        }
+        # Cleanup
+        for key in (f"disagreement_{question_index}", f"proposal_{question_index}", f"proposer_{question_index}"):
+            state.pop(key, None)
+        username = await get_username(callback.from_user.id, "User")
+        await bot.send_message(chat_id, f"{username} agreed! ✅ Moving on...", parse_mode="HTML")
+        await ask_deal_question(chat_id, question_index + 1)
+    else:
+        # Rejected — back to negotiation
+        for key in (f"disagreement_{question_index}", f"proposal_{question_index}", f"proposer_{question_index}"):
+            state.pop(key, None)
+        await bot.send_message(
+            chat_id,
+            "❌ Not agreed. Please discuss and <b>one of you reply</b> with the agreed option:\n"
+            "<b>Refund</b> or <b>Release to Seller</b>?",
+            parse_mode="HTML",
+        )
+        # Re-mark as needing agreement
+        state[f"disagreement_{question_index}"] = True
     try:
         await callback.message.delete()
     except Exception:
