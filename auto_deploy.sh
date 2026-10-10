@@ -24,8 +24,9 @@ if [ "$LOCAL" != "$REMOTE" ]; then
   echo "[$(date)] New code found! Deploying..."
   git reset --hard origin/main || { echo "Reset failed!"; exit 1; }
 
-  # Ensure tronpy is installed (for Direct TRON USDT)
+  # Ensure tronpy and bip-utils are installed (for Direct TRON USDT)
   pip3 show tronpy >/dev/null 2>&1 || pip3 install --break-system-packages tronpy 2>&1 | tail -1
+  pip3 show bip-utils >/dev/null 2>&1 || pip3 install --break-system-packages bip-utils 2>&1 | tail -1
 
   # Deal Manager Bot
   cp dealmanagerbot.py /root/dealmanagerbot.py

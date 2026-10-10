@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Baloch Wallet Bot — Full wallet via BTCPay Server API.
-Features: Balance, Receive (new address), Send (manual payout), History.
-1000% perfect. Uses env vars for secrets (never hardcoded).
+Personal Wallet Bot — Multi-user TRON USDT (TRC20).
+- Each user gets a unique deposit address (BIP44 HD).
+- Admin notified on every deposit (username + name + amount).
+- Withdraw/payout: admin only.
 """
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -17,20 +19,15 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("walletbot")
 
-# --- Config from environment ---
 BOT_TOKEN = os.environ.get("WALLET_BOT_TOKEN", "")
-BTCPAY_URL = os.environ.get("BTCPAY_URL", "").rstrip("/")
-BTCPAY_API_KEY = os.environ.get("BTCPAY_API_KEY", "")
-BTCPAY_STORE_ID = os.environ.get("BTCPAY_STORE_ID", "")
-CRYPTO_CODE = os.environ.get("BTCPAY_CRYPTO", "BTC")  # BTC, USDT, etc.
 ADMIN_IDS = {int(x) for x in os.environ.get("WALLET_ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
-# --- Direct TRON (USDT TRC20) — personal wallet mode ---
 USE_TRON = os.environ.get("WALLET_USE_TRON", "false").lower() == "true"
 TRON_PRIVATE_KEY = os.environ.get("TRON_PRIVATE_KEY", "").strip()
+
 try:
     import tron_pay
-    TRON_AVAILABLE = bool(TRON_PRIVATE_KEY)
+    TRON_AVAILABLE = bool(TRON_PRIVATE_KEY) and bool(os.environ.get("WALLET_SEED_PHRASE", "").strip())
 except ImportError:
     TRON_AVAILABLE = False
     tron_pay = None
@@ -42,293 +39,284 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Per-user state for send flow
+USERS_FILE = "/root/wallet_users.json"
 user_state: dict[int, dict] = {}
-
-
-def _headers() -> dict:
-    return {"Authorization": f"token {BTCPAY_API_KEY}", "Content-Type": "application/json"}
-
-
-def _base() -> str:
-    return f"{BTCPAY_URL}/api/v1/stores/{BTCPAY_STORE_ID}/wallets/{CRYPTO_CODE}"
-
-
-async def _btcpay_get(path: str) -> dict:
-    async with aiohttp.ClientSession() as s:
-        async with s.get(f"{_base()}{path}", headers=_headers(), timeout=30) as r:
-            return {"ok": r.status < 300, "status": r.status, "data": await r.json() if r.status < 500 else {}}
-
-
-async def _btcpay_post(path: str, payload: dict) -> dict:
-    async with aiohttp.ClientSession() as s:
-        async with s.post(f"{_base()}{path}", headers=_headers(), json=payload, timeout=60) as r:
-            try:
-                data = await r.json()
-            except Exception:
-                data = {}
-            return {"ok": r.status < 300, "status": r.status, "data": data}
 
 
 def _is_admin(user_id: int) -> bool:
     return not ADMIN_IDS or user_id in ADMIN_IDS
 
 
-def main_menu() -> InlineKeyboardMarkup:
+def load_users() -> dict:
+    try:
+        with open(USERS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_users(users: dict):
+    with open(USERS_FILE, "w") as f:
+        json.dump(users, f)
+
+
+def get_or_create_user(user_id: int, username: str, first_name: str) -> dict:
+    """Get user record, creating with unique HD address if new."""
+    users = load_users()
+    uid = str(user_id)
+    if uid not in users:
+        # Assign next index
+        used = {u.get("index", 0) for u in users.values()}
+        idx = 0
+        while idx in used:
+            idx += 1
+        address = tron_pay.get_user_deposit_address(idx)
+        users[uid] = {
+            "index": idx,
+            "address": address,
+            "username": username or "",
+            "first_name": first_name or "",
+            "seen_txids": [],
+        }
+        save_users(users)
+        logger.info(f"New wallet user {user_id} -> index {idx}, {address}")
+    else:
+        # Update username/name if changed
+        if users[uid].get("username") != (username or "") or users[uid].get("first_name") != (first_name or ""):
+            users[uid]["username"] = username or ""
+            users[uid]["first_name"] = first_name or ""
+            save_users(users)
+    return users[uid]
+
+
+def user_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 Balance", callback_data="w_balance")],
-        [InlineKeyboardButton(text="📥 Receive", callback_data="w_receive")],
-        [InlineKeyboardButton(text="💸 Send", callback_data="w_send")],
-        [InlineKeyboardButton(text="📊 History", callback_data="w_history")],
+        [InlineKeyboardButton(text="📥 My Deposit Address", callback_data="u_address")],
+        [InlineKeyboardButton(text="💰 My Balance", callback_data="u_balance")],
+    ])
+
+
+def admin_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📥 My Deposit Address", callback_data="u_address")],
+        [InlineKeyboardButton(text="💰 My Balance", callback_data="u_balance")],
+        [InlineKeyboardButton(text="💸 Send (Admin)", callback_data="w_send")],
+        [InlineKeyboardButton(text="👥 Users", callback_data="a_users")],
     ])
 
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    if not _is_admin(message.from_user.id):
-        await message.answer("⛔ Unauthorized.")
+    if not (USE_TRON and TRON_AVAILABLE):
+        await message.answer("⛔ Wallet not configured.")
         return
-    if USE_TRON and TRON_AVAILABLE:
-        await message.answer(
-            f"👛 <b>My Wallet</b>\n\n"
-            f"Network: <b>TRON</b>\n"
-            f"Token: <b>USDT (TRC20)</b>\n\n"
-            f"Choose an action:",
-            parse_mode="HTML",
-            reply_markup=main_menu(),
-        )
-        return
+    u = message.from_user
+    rec = await asyncio.get_event_loop().run_in_executor(
+        None, get_or_create_user, u.id, u.username, u.first_name)
+    menu = admin_menu() if _is_admin(u.id) else user_menu()
+    role = " (Admin)" if _is_admin(u.id) else ""
     await message.answer(
-        f"👛 <b>My Wallet</b>\n\n"
+        f"👛 <b>My Wallet</b>{role}\n\n"
+        f"Network: <b>TRON</b> | Token: <b>USDT (TRC20)</b>\n\n"
+        f"Your deposit address:\n<code>{rec['address']}</code>\n\n"
         f"Choose an action:",
         parse_mode="HTML",
-        reply_markup=main_menu(),
+        reply_markup=menu,
     )
 
 
-@dp.callback_query(F.data == "w_balance")
-async def cb_balance(callback: types.CallbackQuery):
+@dp.callback_query(F.data == "u_address")
+async def cb_u_address(callback: types.CallbackQuery):
+    await callback.answer()
+    u = callback.from_user
+    rec = await asyncio.get_event_loop().run_in_executor(
+        None, get_or_create_user, u.id, u.username, u.first_name)
+    await callback.message.answer(
+        f"📥 <b>Your USDT (TRC20) Deposit Address</b>\n\n"
+        f"<code>{rec['address']}</code>\n\n"
+        f"Send USDT here. Admin is notified automatically on deposit!",
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data == "u_balance")
+async def cb_u_balance(callback: types.CallbackQuery):
     await callback.answer("Checking...")
+    u = callback.from_user
+    rec = await asyncio.get_event_loop().run_in_executor(
+        None, get_or_create_user, u.id, u.username, u.first_name)
+    loop = asyncio.get_event_loop()
+    bal = await loop.run_in_executor(None, tron_pay.get_usdt_balance, rec["address"])
+    await callback.message.answer(
+        f"💰 <b>Your Balance</b>\n\nUSDT: <b>{bal:.2f}</b>",
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data == "a_users")
+async def cb_a_users(callback: types.CallbackQuery):
+    await callback.answer()
     if not _is_admin(callback.from_user.id):
         return
-    if USE_TRON and TRON_AVAILABLE:
-        import asyncio as aio
-        loop = aio.get_event_loop()
-        addr = await loop.run_in_executor(None, tron_pay.get_hot_wallet_address)
-        usdt = await loop.run_in_executor(None, tron_pay.get_usdt_balance, addr)
-        trx = await loop.run_in_executor(None, tron_pay.get_trx_balance, addr)
-        await callback.message.answer(
-            f"💰 <b>Wallet Balance</b>\n\n"
-            f"USDT (TRC20): <b>{usdt:.2f}</b>\n"
-            f"TRX (gas): <b>{trx:.2f}</b>\n\n"
-            f"<code>{addr}</code>",
-            parse_mode="HTML",
-        )
+    users = load_users()
+    if not users:
+        await callback.message.answer("👥 No users yet.")
         return
-    resp = await _btcpay_get("")
-    if resp["ok"]:
-        data = resp["data"]
-        confirmed = data.get("confirmedBalance", "?")
-        unconfirmed = data.get("unconfirmedBalance", "?")
-        await callback.message.answer(
-            f"💰 <b>Balance ({CRYPTO_CODE})</b>\n\n"
-            f"Confirmed: <b>{confirmed}</b>\n"
-            f"Unconfirmed: <b>{unconfirmed}</b>",
-            parse_mode="HTML",
-        )
-    else:
-        await callback.message.answer(f"❌ Failed to get balance (HTTP {resp['status']}).")
-
-
-@dp.callback_query(F.data == "w_receive")
-async def cb_receive(callback: types.CallbackQuery):
-    await callback.answer("Generating...")
-    if not _is_admin(callback.from_user.id):
-        return
-    if USE_TRON and TRON_AVAILABLE:
-        import asyncio as aio
-        loop = aio.get_event_loop()
-        addr = await loop.run_in_executor(None, tron_pay.get_hot_wallet_address)
-        await callback.message.answer(
-            f"📥 <b>Your USDT (TRC20) Address</b>\n\n<code>{addr}</code>\n\n"
-            f"Send USDT (TRC20) here. Deposits are detected automatically!",
-            parse_mode="HTML",
-        )
-        return
-    resp = await _btcpay_post("/addresses", {})
-    if resp["ok"]:
-        addr = resp["data"].get("address", "?")
-        await callback.message.answer(
-            f"📥 <b>New {CRYPTO_CODE} Address</b>\n\n<code>{addr}</code>\n\n"
-            f"Tap to copy. Each address is unique!",
-            parse_mode="HTML",
-        )
-    else:
-        await callback.message.answer(f"❌ Failed to generate address (HTTP {resp['status']}).")
-
-
-@dp.callback_query(F.data == "w_history")
-async def cb_history(callback: types.CallbackQuery):
-    await callback.answer("Loading...")
-    if not _is_admin(callback.from_user.id):
-        return
-    if USE_TRON and TRON_AVAILABLE:
-        import asyncio as aio
-        import requests
-        loop = aio.get_event_loop()
-        def _fetch():
-            addr = tron_pay.get_hot_wallet_address()
-            r = requests.get(
-                f"https://api.trongrid.io/v1/accounts/{addr}/transactions/trc20",
-                params={"limit": 10, "only_confirmed": "true",
-                        "contract_address": tron_pay.USDT_CONTRACT},
-                timeout=15,
-            )
-            return r.json().get("data", []) if r.status_code == 200 else []
-        txs = await loop.run_in_executor(None, _fetch)
-        if not txs:
-            await callback.message.answer("📊 No USDT transactions yet.")
-            return
-        addr = tron_pay.get_hot_wallet_address()
-        lines = ["📊 <b>Recent USDT Transactions</b>\n"]
-        for t in txs[:10]:
-            txid = str(t.get("transaction_id", "?"))[:12]
-            amt = int(t.get("value", 0)) / 1_000_000
-            direction = "📥 In" if t.get("to") == addr else "📤 Out"
-            lines.append(f"{direction} <code>{txid}...</code> — {amt:.2f} USDT")
-        await callback.message.answer("\n".join(lines), parse_mode="HTML")
-        return
-    resp = await _btcpay_get("/transactions?limit=10")
-    if resp["ok"]:
-        txs = resp["data"] if isinstance(resp["data"], list) else resp["data"].get("transactions", [])
-        if not txs:
-            await callback.message.answer("📊 No transactions yet.")
-            return
-        lines = [f"📊 <b>Recent Transactions ({CRYPTO_CODE})</b>\n"]
-        for t in txs[:10]:
-            txid = str(t.get("txid", "?"))[:12]
-            amt = t.get("amount", "?")
-            status = t.get("status", "?")
-            lines.append(f"• <code>{txid}...</code> — {amt} ({status})")
-        await callback.message.answer("\n".join(lines), parse_mode="HTML")
-    else:
-        await callback.message.answer(f"❌ Failed to load history (HTTP {resp['status']}).")
+    loop = asyncio.get_event_loop()
+    lines = ["👥 <b>Wallet Users</b>\n"]
+    for uid, rec in list(users.items())[:20]:
+        bal = await loop.run_in_executor(None, tron_pay.get_usdt_balance, rec["address"])
+        un = f"@{rec['username']}" if rec.get("username") else rec.get("first_name", uid)
+        lines.append(f"• {un} — <b>{bal:.2f}</b> USDT\n  <code>{rec['address']}</code>")
+    await callback.message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "w_send")
 async def cb_send(callback: types.CallbackQuery):
     await callback.answer()
     if not _is_admin(callback.from_user.id):
+        await callback.message.answer("⛔ Admin only.")
         return
     user_state[callback.from_user.id] = {"step": "address"}
-    await callback.message.answer("💸 <b>Send Payment</b>\n\nSend the destination address:", parse_mode="HTML")
+    await callback.message.answer(
+        "💸 <b>Send USDT</b> (Admin)\n\nSend the destination TRON address:",
+        parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("send_confirm_"))
 async def cb_send_confirm(callback: types.CallbackQuery):
     await callback.answer()
+    if not _is_admin(callback.from_user.id):
+        return
     uid = callback.from_user.id
-    if not _is_admin(uid):
-        return
-    st = user_state.get(uid)
-    if not st or st.get("step") != "confirm":
-        await callback.message.answer("❌ No pending payment.")
-        return
+    st = user_state.get(uid, {})
     if callback.data == "send_confirm_no":
         user_state.pop(uid, None)
-        await callback.message.answer("❌ Cancelled.", reply_markup=main_menu())
+        await callback.message.answer("❌ Cancelled.", reply_markup=admin_menu())
         return
-    # Yes — broadcast the transaction
-    await callback.message.answer("⏳ Broadcasting transaction...")
-    if USE_TRON and TRON_AVAILABLE:
-        import asyncio as aio
-        loop = aio.get_event_loop()
-        result = await loop.run_in_executor(
-            None, lambda: tron_pay.send_usdt(st["address"], st["amount"]))
-        user_state.pop(uid, None)
-        if result.get("ok"):
-            txid = result.get("txid", "")
-            await callback.message.answer(
-                f"✅ <b>USDT Sent!</b>\n\nTxID: <code>{txid}</code>\n"
-                f"https://tronscan.org/#/transaction/{txid}",
-                parse_mode="HTML",
-                reply_markup=main_menu(),
-            )
-        else:
-            await callback.message.answer(
-                f"❌ Send failed: {result.get('error', 'unknown')}",
-                parse_mode="HTML",
-                reply_markup=main_menu(),
-            )
-        return
-    payload = {
-        "destinations": [{"destination": st["address"], "amount": st["amount"]}],
-        "proceedWithBroadcast": True,
-    }
-    # Optional: fee rate
-    if st.get("fee_rate"):
-        payload["feeRate"] = st["fee_rate"]
-    resp = await _btcpay_post("/transactions", payload)
+    # Yes — send via hot wallet
+    await callback.message.answer("⏳ Broadcasting...")
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None, lambda: tron_pay.send_usdt(st["address"], st["amount"]))
     user_state.pop(uid, None)
-    if resp["ok"]:
-        txid = resp["data"].get("txid", "?")
+    if result.get("ok"):
+        txid = result.get("txid", "")
         await callback.message.answer(
-            f"✅ <b>Payment Sent!</b>\n\nTxID: <code>{txid}</code>",
-            parse_mode="HTML",
-            reply_markup=main_menu(),
-        )
+            f"✅ <b>Sent!</b>\n\nTxID: <code>{txid}</code>\n"
+            f"https://tronscan.org/#/transaction/{txid}",
+            parse_mode="HTML", reply_markup=admin_menu())
     else:
-        err = resp["data"]
         await callback.message.answer(
-            f"❌ Payment failed (HTTP {resp['status']}).\n<code>{err}</code>",
-            parse_mode="HTML",
-            reply_markup=main_menu(),
-        )
+            f"❌ Failed: {result.get('error', '?')}",
+            parse_mode="HTML", reply_markup=admin_menu())
 
 
 @dp.message(F.text)
 async def handle_text(message: types.Message):
     uid = message.from_user.id
-    if not _is_admin(uid):
-        return
     st = user_state.get(uid)
     if not st:
         return
-    text = (message.text or "").strip()
-
+    if not _is_admin(uid):
+        user_state.pop(uid, None)
+        return
+    text = message.text.strip()
     if st["step"] == "address":
-        if len(text) < 20:
-            await message.answer("❌ That doesn't look like a valid address. Try again:")
+        if not (text.startswith("T") and len(text) == 34):
+            await message.answer("❌ Invalid TRON address. Try again:")
             return
         st["address"] = text
         st["step"] = "amount"
-        await message.answer(f"Address saved: <code>{text}</code>\n\nNow send the <b>amount</b> in {CRYPTO_CODE}:", parse_mode="HTML")
+        await message.answer("💰 Send the amount in USDT:")
     elif st["step"] == "amount":
         try:
-            amt = float(text.replace(",", ""))
+            amt = float(text)
             if amt <= 0:
                 raise ValueError
         except ValueError:
-            await message.answer("❌ Invalid amount. Send a number:")
+            await message.answer("❌ Invalid amount. Try again:")
             return
         st["amount"] = amt
-        st["step"] = "confirm"
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Confirm & Send", callback_data="send_confirm_yes"),
-            InlineKeyboardButton(text="❌ Cancel", callback_data="send_confirm_no"),
-        ]])
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Confirm", callback_data="send_confirm_yes")],
+            [InlineKeyboardButton(text="❌ Cancel", callback_data="send_confirm_no")],
+        ])
         await message.answer(
-            f"💸 <b>Confirm Payment</b>\n\n"
-            f"To: <code>{st['address']}</code>\n"
-            f"Amount: <b>{amt} {CRYPTO_CODE}</b>\n\n"
-            f"Network fee will apply. Proceed?",
-            parse_mode="HTML",
-            reply_markup=kb,
-        )
+            f"Confirm send:\n\n<b>{amt} USDT</b>\nTo: <code>{st['address']}</code>",
+            parse_mode="HTML", reply_markup=kb)
+
+
+async def deposit_monitor():
+    """Background: poll all user addresses, notify admin on new deposits."""
+    import requests
+    await asyncio.sleep(10)  # let bot start first
+    logger.info("Deposit monitor started")
+    while True:
+        try:
+            users = load_users()
+            for uid, rec in users.items():
+                addr = rec.get("address", "")
+                if not addr:
+                    continue
+                seen = set(rec.get("seen_txids", []))
+                try:
+                    r = requests.get(
+                        f"https://api.trongrid.io/v1/accounts/{addr}/transactions/trc20",
+                        params={"limit": 10, "only_confirmed": "true",
+                                "contract_address": tron_pay.USDT_CONTRACT},
+                        timeout=15,
+                    )
+                    if r.status_code != 200:
+                        continue
+                    for t in r.json().get("data", []):
+                        txid = t.get("transaction_id", "")
+                        if txid in seen or t.get("to", "") != addr:
+                            continue
+                        amt = int(t.get("value", 0)) / 1_000_000
+                        seen.add(txid)
+                        # Notify admin
+                        un = f"@{rec['username']}" if rec.get("username") else ""
+                        name = rec.get("first_name", "")
+                        for aid in ADMIN_IDS:
+                            try:
+                                await bot.send_message(
+                                    aid,
+                                    f"💰 <b>Deposit Received!</b>\n\n"
+                                    f"User: {un} ({name})\n"
+                                    f"Amount: <b>{amt:.2f} USDT</b>\n"
+                                    f"Address: <code>{addr}</code>\n"
+                                    f"TxID: <code>{txid[:16]}...</code>",
+                                    parse_mode="HTML",
+                                )
+                            except Exception as e:
+                                logger.warning(f"Admin notify failed: {e}")
+                        # Notify the user too
+                        try:
+                            await bot.send_message(
+                                int(uid),
+                                f"✅ <b>Deposit confirmed!</b>\n\n"
+                                f"<b>{amt:.2f} USDT</b> received.",
+                                parse_mode="HTML",
+                            )
+                        except Exception:
+                            pass
+                    # Persist seen txids (keep last 50)
+                    rec["seen_txids"] = list(seen)[-50:]
+                except Exception as e:
+                    logger.warning(f"Monitor poll error for {addr}: {e}")
+            save_users(users)
+        except Exception as e:
+            logger.error(f"Deposit monitor error: {e}")
+        await asyncio.sleep(30)
 
 
 async def main():
-    logger.info(f"Wallet bot starting (crypto={CRYPTO_CODE}, store={BTCPAY_STORE_ID[:8]}...)")
+    if not (USE_TRON and TRON_AVAILABLE):
+        logger.error("TRON not configured! Set WALLET_USE_TRON=true, TRON_PRIVATE_KEY, WALLET_SEED_PHRASE")
+        sys.exit(1)
+    asyncio.create_task(deposit_monitor())
+    logger.info("Wallet bot starting (TRON multi-user)")
     await dp.start_polling(bot)
 
 

@@ -45,6 +45,42 @@ def _get_master_key() -> PrivateKey:
     return _master_key
 
 
+# --- HD Wallet (BIP44) for per-user deposit addresses ---
+# Path: m/44'/195'/0'/0/{index}  (195 = TRON coin type)
+_hd_ctx = None
+
+
+def _get_hd_ctx():
+    """Get BIP44 HD context from seed phrase."""
+    global _hd_ctx
+    if _hd_ctx is None:
+        from bip_utils import Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
+        seed_phrase = os.environ.get("WALLET_SEED_PHRASE", "").strip()
+        if not seed_phrase:
+            raise RuntimeError("WALLET_SEED_PHRASE not set — needed for per-user addresses")
+        seed = Bip39SeedGenerator(seed_phrase).Generate()
+        _hd_ctx = Bip44.FromSeed(seed, Bip44Coins.TRON).Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT)
+    return _hd_ctx
+
+
+def get_user_deposit_address(user_index: int) -> str:
+    """
+    Derive a unique TRON deposit address for a user.
+    Path: m/44'/195'/0'/0/{user_index}
+    Same seed phrase recovers all addresses in any BIP44 TRON wallet.
+    """
+    ctx = _get_hd_ctx()
+    addr = ctx.AddressIndex(user_index).PublicKey().ToAddress()
+    return addr
+
+
+def get_user_private_key(user_index: int) -> PrivateKey:
+    """Get the private key for a user's derived address (for sweeping)."""
+    ctx = _get_hd_ctx()
+    raw_hex = ctx.AddressIndex(user_index).PrivateKey().Raw().ToHex()
+    return PrivateKey(bytes.fromhex(raw_hex))
+
+
 def get_hot_wallet_address() -> str:
     """Return the main hot wallet TRON address."""
     return _get_master_key().public_key.to_base58check_address()
