@@ -45,3 +45,4 @@ if [ "$LOCAL" != "$REMOTE" ]; then
 else
   echo "[$(date)] No updates."
 fi
+# Auto-deploy trigger
