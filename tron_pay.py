@@ -215,6 +215,57 @@ def send_usdt_from(priv_key: PrivateKey, to_address: str, amount_usdt: float) ->
         return {"ok": False, "error": str(e)}
 
 
+def send_trx(to_address: str, amount_trx: float) -> dict:
+    """Send TRX from hot wallet (for gas funding)."""
+    try:
+        client = _get_client()
+        priv_key = _get_master_key()
+        from_addr = priv_key.public_key.to_base58check_address()
+        txn = (
+            client.trx.transfer(from_addr, to_address, int(amount_trx * 1_000_000))
+            .build()
+            .sign(priv_key)
+        )
+        result = txn.broadcast()
+        return {"ok": True, "txid": result.get("txid", "")}
+    except Exception as e:
+        logger.error(f"TRX send failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+def ensure_gas(address: str, min_trx: float = 5.0) -> bool:
+    """
+    Ensure an address has enough TRX for gas.
+    If not, send TRX from hot wallet automatically.
+    Returns True if gas is available (or was funded).
+    """
+    try:
+        bal = get_trx_balance(address)
+        if bal >= min_trx:
+            return True
+        logger.info(f"Funding gas: {address} has {bal} TRX, sending {min_trx}")
+        result = send_trx(address, min_trx)
+        if result.get("ok"):
+            # Wait for confirmation
+            time.sleep(10)
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"ensure_gas failed: {e}")
+        return False
+
+
+def send_usdt_from_with_gas(priv_key: PrivateKey, to_address: str, amount_usdt: float) -> dict:
+    """
+    Send USDT from a derived address, auto-funding TRX for gas if needed.
+    This is the 'just works' version — user never manually sends TRX.
+    """
+    from_addr = priv_key.public_key.to_base58check_address()
+    if not ensure_gas(from_addr):
+        return {"ok": False, "error": "Could not fund gas (TRX). Hot wallet may be empty."}
+    return send_usdt_from(priv_key, to_address, amount_usdt)
+
+
 def wait_for_deposit(address: str, expected_usdt: float, timeout_sec: int = 7200,
                      poll_interval: int = 10, tolerance: float = 0.01) -> dict:
     """

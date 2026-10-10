@@ -1241,7 +1241,7 @@ async def payout_via_tron(address: str, amount: float, chat_id: int) -> tuple[bo
             send_fn = lambda: tron_pay.send_usdt(address, amount)
         else:
             priv_key = tron_pay.get_user_private_key(hd_index)
-            send_fn = lambda: tron_pay.send_usdt_from(priv_key, address, amount)
+            send_fn = lambda: tron_pay.send_usdt_from_with_gas(priv_key, address, amount)
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, send_fn)
         if result.get("ok"):

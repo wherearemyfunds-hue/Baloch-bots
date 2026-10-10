@@ -268,7 +268,7 @@ async def cb_deal_wd_confirm(callback: types.CallbackQuery):
     loop = asyncio.get_event_loop()
     def _do():
         pk = tron_pay.get_user_private_key(st["hd_index"])
-        return tron_pay.send_usdt_from(pk, st["address"], st["amount"])
+        return tron_pay.send_usdt_from_with_gas(pk, st["address"], st["amount"])
     result = await loop.run_in_executor(None, _do)
     user_state.pop(uid, None)
     if result.get("ok"):
