@@ -27,8 +27,39 @@ _master_key = None
 def _get_client() -> Tron:
     global _client
     if _client is None:
-        _client = Tron(network="mainnet")
+        from tronpy.providers import HTTPProvider
+        api_key = os.environ.get("TRONGRID_API_KEY", "").strip()
+        if api_key:
+            # Use API key for higher rate limits (free at trongrid.io)
+            provider = HTTPProvider(
+                endpoint_uri="https://api.trongrid.io",
+                api_key=api_key,
+            )
+            _client = Tron(provider=provider, network="mainnet")
+        else:
+            _client = Tron(network="mainnet")
     return _client
+
+
+def _trongrid_headers() -> dict:
+    """Headers for direct TronGrid REST calls (with API key if set)."""
+    h = {"Content-Type": "application/json"}
+    api_key = os.environ.get("TRONGRID_API_KEY", "").strip()
+    if api_key:
+        h["TRON-PRO-API-KEY"] = api_key
+    return h
+
+
+def _get_with_retry(url: str, params: dict = None, max_retries: int = 5) -> requests.Response:
+    """GET with exponential backoff on 429 rate limits."""
+    for attempt in range(max_retries):
+        r = requests.get(url, params=params, headers=_trongrid_headers(), timeout=15)
+        if r.status_code != 429:
+            return r
+        wait = (2 ** attempt) + 1  # 2, 3, 5, 9, 17 seconds
+        logger.warning(f"TronGrid 429 rate limit, retrying in {wait}s (attempt {attempt+1}/{max_retries})")
+        time.sleep(wait)
+    return r  # return last response even if 429
 
 
 def _get_master_key() -> PrivateKey:
@@ -107,7 +138,7 @@ def get_usdt_balance(address: str) -> float:
     """Get USDT (TRC20) balance for an address via TronGrid."""
     try:
         # Use TronGrid account info
-        resp = requests.get(
+        resp = _get_with_retry(
             f"{TRONGRID_API}/v1/accounts/{address}",
             params={"only_confirmed": "true"},
             timeout=15,
@@ -130,7 +161,7 @@ def get_usdt_balance(address: str) -> float:
 def get_trx_balance(address: str) -> float:
     """Get TRX balance (for gas estimation)."""
     try:
-        resp = requests.get(f"{TRONGRID_API}/v1/accounts/{address}", timeout=15)
+        resp = _get_with_retry(f"{TRONGRID_API}/v1/accounts/{address}")
         if resp.status_code != 200:
             return 0.0
         data = resp.json().get("data", [{}])[0]
@@ -187,7 +218,7 @@ def wait_for_deposit(address: str, expected_usdt: float, timeout_sec: int = 7200
     seen_txids: set = set()
     # Baseline: current TRC20 transfers to avoid counting old ones
     try:
-        resp = requests.get(
+        resp = _get_with_retry(
             f"{TRONGRID_API}/v1/accounts/{address}/transactions/trc20",
             params={"limit": 20, "only_confirmed": "true",
                     "contract_address": USDT_CONTRACT},
@@ -201,7 +232,7 @@ def wait_for_deposit(address: str, expected_usdt: float, timeout_sec: int = 7200
 
     while time.time() - start < timeout_sec:
         try:
-            resp = requests.get(
+            resp = _get_with_retry(
                 f"{TRONGRID_API}/v1/accounts/{address}/transactions/trc20",
                 params={"limit": 20, "only_confirmed": "true",
                         "contract_address": USDT_CONTRACT},
@@ -230,7 +261,7 @@ def wait_for_deposit(address: str, expected_usdt: float, timeout_sec: int = 7200
 def check_txid_confirmed(txid: str) -> bool:
     """Check if a transaction is confirmed on-chain."""
     try:
-        resp = requests.get(f"{TRONGRID_API}/v1/transactions/{txid}", timeout=15)
+        resp = _get_with_retry(f"{TRONGRID_API}/v1/transactions/{txid}")
         if resp.status_code != 200:
             return False
         data = resp.json().get("data", [{}])[0]

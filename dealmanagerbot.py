@@ -1064,11 +1064,10 @@ async def tron_payment_monitoring(chat_id: int, address: str, expected: float, d
 
     # Baseline: ignore txs that existed before monitoring started
     try:
-        r = requests.get(
+        r = tron_pay._get_with_retry(
             f"https://api.trongrid.io/v1/accounts/{address}/transactions/trc20",
             params={"limit": 20, "only_confirmed": "true",
                     "contract_address": tron_pay.USDT_CONTRACT},
-            timeout=15,
         )
         if r.status_code == 200:
             for t in r.json().get("data", []):
@@ -1084,11 +1083,10 @@ async def tron_payment_monitoring(chat_id: int, address: str, expected: float, d
             if stage not in ("payment", "payment_monitoring"):
                 break
             try:
-                r = requests.get(
+                r = tron_pay._get_with_retry(
                     f"https://api.trongrid.io/v1/accounts/{address}/transactions/trc20",
                     params={"limit": 20, "only_confirmed": "true",
                             "contract_address": tron_pay.USDT_CONTRACT},
-                    timeout=15,
                 )
                 if r.status_code == 200:
                     for t in r.json().get("data", []):

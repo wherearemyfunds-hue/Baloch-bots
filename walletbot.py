@@ -261,11 +261,10 @@ async def deposit_monitor():
                     continue
                 seen = set(rec.get("seen_txids", []))
                 try:
-                    r = requests.get(
+                    r = tron_pay._get_with_retry(
                         f"https://api.trongrid.io/v1/accounts/{addr}/transactions/trc20",
                         params={"limit": 10, "only_confirmed": "true",
                                 "contract_address": tron_pay.USDT_CONTRACT},
-                        timeout=15,
                     )
                     if r.status_code != 200:
                         continue
