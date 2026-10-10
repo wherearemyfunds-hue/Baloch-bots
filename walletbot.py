@@ -88,10 +88,18 @@ async def cmd_start(message: types.Message):
     if not _is_admin(message.from_user.id):
         await message.answer("⛔ Unauthorized.")
         return
+    if USE_TRON and TRON_AVAILABLE:
+        await message.answer(
+            f"👛 <b>My Wallet</b>\n\n"
+            f"Network: <b>TRON</b>\n"
+            f"Token: <b>USDT (TRC20)</b>\n\n"
+            f"Choose an action:",
+            parse_mode="HTML",
+            reply_markup=main_menu(),
+        )
+        return
     await message.answer(
-        f"👛 <b>Baloch Wallet Bot</b>\n\n"
-        f"Connected to BTCPay: <code>{BTCPAY_URL}</code>\n"
-        f"Crypto: <b>{CRYPTO_CODE}</b>\n\n"
+        f"👛 <b>My Wallet</b>\n\n"
         f"Choose an action:",
         parse_mode="HTML",
         reply_markup=main_menu(),
