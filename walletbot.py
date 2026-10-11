@@ -205,12 +205,71 @@ async def cb_a_users(callback: types.CallbackQuery):
         await callback.message.answer("👥 No users yet.")
         return
     loop = asyncio.get_event_loop()
-    lines = ["👥 <b>Wallet Users</b>\n"]
+    lines = ["👥 <b>Users Wallet</b>\n"]
+    kb_rows = []
     for uid, rec in list(users.items())[:20]:
         bal = await loop.run_in_executor(None, tron_pay.get_usdt_balance, rec["address"])
         un = f"@{rec['username']}" if rec.get("username") else rec.get("first_name", uid)
         lines.append(f"• {un} — <b>{bal:.2f}</b> USDT\n  <code>{rec['address']}</code>")
-    await callback.message.answer("\n".join(lines), parse_mode="HTML")
+        if bal > 0.01:
+            kb_rows.append([InlineKeyboardButton(
+                text=f"💸 Withdraw {bal:.2f} USDT ({un})",
+                callback_data=f"user_wd_{uid}")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
+    await callback.message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("user_wd_") & ~F.data.startswith("user_wd_confirm_"))
+async def cb_user_withdraw(callback: types.CallbackQuery):
+    """Start withdraw from a user's deposit address (admin only). Gas auto-funded from hot wallet."""
+    await callback.answer()
+    if not _is_admin(callback.from_user.id):
+        return
+    uid = callback.data[len("user_wd_"):]
+    users = load_users()
+    rec = users.get(uid)
+    if not rec:
+        await callback.message.answer("❌ User not found.")
+        return
+    user_state[callback.from_user.id] = {"step": "user_withdraw", "target_uid": uid}
+    un = f"@{rec['username']}" if rec.get("username") else rec.get("first_name", uid)
+    await callback.message.answer(
+        f"💸 <b>Withdraw from {un}</b>\n\n"
+        f"From: <code>{rec['address']}</code>\n\n"
+        f"Send the destination TRON address:",
+        parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("user_wd_confirm_"))
+async def cb_user_wd_confirm(callback: types.CallbackQuery):
+    await callback.answer()
+    if not _is_admin(callback.from_user.id):
+        return
+    uid = callback.from_user.id
+    st = user_state.get(uid, {})
+    if callback.data == "user_wd_confirm_no":
+        user_state.pop(uid, None)
+        await callback.message.answer("❌ Cancelled.", reply_markup=admin_menu())
+        return
+    await callback.message.answer("⏳ Funding gas from hot wallet + broadcasting...")
+    loop = asyncio.get_event_loop()
+    def _do():
+        pk = tron_pay.get_user_private_key(st["user_index"])
+        return tron_pay.send_usdt_from_with_gas(pk, st["address"], st["amount"])
+    result = await loop.run_in_executor(None, _do)
+    user_state.pop(uid, None)
+    if result.get("ok"):
+        txid = result.get("txid", "")
+        await callback.message.answer(
+            f"✅ <b>Withdrawn!</b>\n\nAmount: <b>{st.get('amount', 0)} USDT</b>\n"
+            f"TxID: <code>{txid}</code>\n"
+            f"https://tronscan.org/#/transaction/{txid}",
+            parse_mode="HTML", reply_markup=admin_menu())
+    else:
+        await callback.message.answer(
+            f"❌ Failed: {result.get('error', '?')}\n\n"
+            f"Tip: hot wallet needs enough TRX for gas!",
+            parse_mode="HTML", reply_markup=admin_menu())
 
 
 @dp.callback_query(F.data == "a_deals")
@@ -470,6 +529,48 @@ async def handle_text(message: types.Message):
         ])
         await message.answer(
             f"Confirm swap:\n\n<b>{amt} USDT</b> → TRX\n<i>Via SunSwap V2</i>",
+            parse_mode="HTML", reply_markup=kb)
+        return
+    if st["step"] == "user_withdraw":
+        # Step 1: get destination address for user withdraw
+        if not (text.startswith("T") and len(text) == 34):
+            await message.answer("❌ Invalid TRON address. Try again:")
+            return
+        st["address"] = text
+        st["step"] = "user_withdraw_amount"
+        await message.answer("💰 Send the amount in USDT (or 'max' for full balance):")
+        return
+    if st["step"] == "user_withdraw_amount":
+        users = load_users()
+        rec = users.get(st.get("target_uid", ""), {})
+        user_addr = rec.get("address", "")
+        user_index = rec.get("index")
+        if user_index is None:
+            await message.answer("❌ User address not found.")
+            user_state.pop(uid, None)
+            return
+        if text.lower() == "max":
+            bal = await loop.run_in_executor(None, tron_pay.get_usdt_balance, user_addr)
+            amt = round(bal - 0.01, 2) if bal > 0.01 else 0
+        else:
+            try:
+                amt = float(text)
+                if amt <= 0:
+                    raise ValueError
+            except ValueError:
+                await message.answer("❌ Invalid amount. Try again (or 'max'):")
+                return
+        st["amount"] = amt
+        st["user_addr"] = user_addr
+        st["user_index"] = user_index
+        un = f"@{rec['username']}" if rec.get("username") else rec.get("first_name", "")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Confirm", callback_data="user_wd_confirm_yes")],
+            [InlineKeyboardButton(text="❌ Cancel", callback_data="user_wd_confirm_no")],
+        ])
+        await message.answer(
+            f"Confirm withdraw:\n\n<b>{amt} USDT</b>\nFrom: {un}\n<code>{user_addr}</code>\nTo: <code>{st['address']}</code>\n\n"
+            f"<i>⛽ Gas (TRX) auto-funded from your hot wallet, leftover swept back.</i>",
             parse_mode="HTML", reply_markup=kb)
         return
     if st["step"] == "deal_withdraw":
