@@ -29,13 +29,9 @@ if [ "$LOCAL" != "$REMOTE" ]; then
   chmod +x /root/auto_deploy.sh
 
   # Env files safe tareeqe se load karo (seed phrase me spaces hote hain,
-  # is liye kabhi `export $(cat | xargs)` use na karo)
-  load_env() {
-    set -a
-    # shellcheck disable=SC1090
-    source "$1"
-    set +a
-  }
+  # is liye kabhi `export $(cat | xargs)` use na karo).
+  # NOTE: function ki jagah inline likha hai taake purana script bhi
+  # ye update lagate waqt break na ho.
 
   # Ensure tronpy and bip-utils are installed (for Direct TRON USDT)
   pip3 show tronpy >/dev/null 2>&1 || pip3 install --break-system-packages tronpy 2>&1 | tail -1
@@ -46,7 +42,7 @@ if [ "$LOCAL" != "$REMOTE" ]; then
   python3 -m py_compile /root/dealmanagerbot.py || { echo "Syntax failed!"; exit 1; }
   pkill -f dealmanagerbot.py
   sleep 2
-  load_env /root/.secrets/deal_manager.env
+  set -a; source /root/.secrets/deal_manager.env; set +a
   nohup python3 /root/dealmanagerbot.py > /root/dealbot.log 2>&1 &
 
   # Escrow Bot
@@ -54,7 +50,7 @@ if [ "$LOCAL" != "$REMOTE" ]; then
   python3 -m py_compile /root/dealcreaterbot.py || { echo "Syntax failed!"; exit 1; }
   pkill -f dealcreaterbot.py
   sleep 2
-  load_env /root/.secrets/escrow_bot.env
+  set -a; source /root/.secrets/escrow_bot.env; set +a
   nohup python3 /root/dealcreaterbot.py > /root/escrowbot.log 2>&1 &
 
   # Wallet Bot (BTCPay)
@@ -64,7 +60,7 @@ if [ "$LOCAL" != "$REMOTE" ]; then
     pkill -f walletbot.py
     sleep 2
     if [ -f /root/.secrets/wallet_bot.env ]; then
-      load_env /root/.secrets/wallet_bot.env
+      set -a; source /root/.secrets/wallet_bot.env; set +a
       nohup python3 /root/walletbot.py > /root/walletbot.log 2>&1 &
       echo "[$(date)] Wallet bot restarted."
     else
