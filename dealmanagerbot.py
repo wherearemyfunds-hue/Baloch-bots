@@ -77,6 +77,10 @@ except ImportError:
     BSC_AVAILABLE = False
 BSC_ENABLED = USE_BSC and BSC_AVAILABLE
 
+# Flat manual-withdraw fee (wallet bot) — shown in deal bot messages so the
+# seller/buyer knows the net they will receive. KEEP IN SYNC with walletbot.py.
+WITHDRAW_FEE = {"tron": 3.0, "bsc": 1.0}
+
 # Payment addresses (displayed as reference in messages)
 BEP20_ADDRESS = "0xf1a0fade24678e3331eaf915840cc6cf6a831d80"
 TRC20_ADDRESS = "TV1ddqZd6KeiMc1AKpDkqDf5hcAgSiWo6t"
@@ -927,15 +931,96 @@ async def handle_payment_detected(chat_id: int, actual_amount: float, difference
             f"Received: {actual_amount} USDT"
         )
 
+        # Auto-sweep the FULL deal balance to the hot wallet (feeless).
+        # Runs in background so confirmations aren't delayed.
+        if chain in ("tron", "bsc"):
+            asyncio.create_task(auto_sweep_deal_to_hotwallet(chat_id, chain))
+
         asyncio.create_task(schedule_deadline_reminder(chat_id))
 
     except Exception as e:
         logger.error(f"Error handling payment detection for chat {chat_id}: {e}")
 
 
+async def auto_sweep_deal_to_hotwallet(chat_id: int, chain: str = None):
+    """
+    Sweep the FULL deal balance to the hot wallet (Shawn's main wallet).
+    Feeless: no deduction from the deal amount; gas is auto-funded from the
+    hot wallet itself (never from the deal funds).
+    Best-effort: on failure the admin is notified to sweep manually via the
+    wallet bot's Deal Funds section.
+    chain: "tron"/"bsc", or None to sweep both addresses.
+    """
+    state = deal_states.get(chat_id, {})
+    if state.get("swept"):
+        return
+    chains = [chain] if chain in ("tron", "bsc") else ["tron", "bsc"]
+    loop = asyncio.get_event_loop()
+    for ch in chains:
+        try:
+            if ch == "bsc":
+                if not BSC_ENABLED:
+                    continue
+                import bsc_pay
+                addr = state.get("bsc_deposit_address", "")
+                hd_index = state.get("hd_index")
+                if not addr or hd_index is None:
+                    continue
+                bal = await loop.run_in_executor(None, bsc_pay.get_usdt_balance, addr)
+                if bal < 0.01:
+                    continue
+                hot = bsc_pay.get_hot_wallet_address()
+                if addr.lower() == hot.lower():
+                    continue
+                pk_hex = bsc_pay.get_user_private_key_hex(hd_index)
+                amt = round(bal - 0.01, 2)
+                r = await loop.run_in_executor(
+                    None, lambda: bsc_pay.send_usdt_from_with_gas(pk_hex, addr, hot, amt))
+                label = "BSC"
+            else:
+                import tron_pay
+                addr = state.get("tron_deposit_address", "")
+                hd_index = state.get("hd_index", state.get("tron_hd_index"))
+                if not addr or hd_index is None:
+                    continue
+                bal = await loop.run_in_executor(None, tron_pay.get_usdt_balance, addr)
+                if bal < 0.01:
+                    continue
+                hot = tron_pay.get_hot_wallet_address()
+                if addr == hot:
+                    continue
+                pk = tron_pay.get_user_private_key(hd_index)
+                amt = round(bal - 0.01, 2)
+                r = await loop.run_in_executor(
+                    None, lambda: tron_pay.send_usdt_from_with_gas(pk, hot, amt))
+                label = "TRON"
+            if r.get("ok"):
+                state["swept"] = True
+                state["swept_chain"] = ch
+                state["swept_amount"] = amt
+                state["swept_txid"] = r.get("txid", "")
+                save_deal_states()
+                logger.info(f"[Sweep] Chat {chat_id}: {amt} USDT ({label}) -> hot wallet, txid={r.get('txid')}")
+            else:
+                logger.warning(f"[Sweep] Chat {chat_id} ({label}) failed: {r.get('error')}")
+                await safe_notify_admin(
+                    f"⚠️ AUTO-SWEEP FAILED\n"
+                    f"Deal: {chat_id} ({label})\n"
+                    f"Amount: {amt} USDT on <code>{addr}</code>\n"
+                    f"Error: {r.get('error', '?')}\n"
+                    f"Sweep it manually via wallet bot → 🤝 Deal Funds."
+                )
+        except Exception as e:
+            logger.error(f"[Sweep] Chat {chat_id} ({ch}) error: {e}")
+            await safe_notify_admin(
+                f"⚠️ AUTO-SWEEP ERROR\nDeal: {chat_id} ({ch})\nError: {e}\n"
+                f"Sweep it manually via wallet bot → 🤝 Deal Funds."
+            )
+
+
 async def send_action_buttons_to_all(chat_id: int):
     """Send role-specific quick actions: HYBRID — buttons for payment
-    actions (primary), typed commands as fallback. Dispute stays text-only.
+    actions (primary), typed commands as fallback.
 
     Permission checks are enforced in the do_* handlers.
     """
@@ -944,16 +1029,17 @@ async def send_action_buttons_to_all(chat_id: int):
     seller_name = await get_username(state.get("seller", 0), "Seller")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Release Payment", callback_data="release")],
+        [InlineKeyboardButton(text="Release To Seller", callback_data="release")],
         [InlineKeyboardButton(text="Refund to Buyer", callback_data="refund")],
+        [InlineKeyboardButton(text="⚠️ Dispute", callback_data="dispute")],
     ])
 
     await bot.send_message(
         chat_id,
         f"<b>Quick Actions:</b>\n\n"
-        f"<i>• {buyer_name} (Buyer) → tap <b>Release Payment</b> (or type <b>release</b>)\n"
+        f"<i>• {buyer_name} (Buyer) → tap <b>Release To Seller</b> (or type <b>release</b>)\n"
         f"• {seller_name} (Seller) → tap <b>Refund to Buyer</b> (or type <b>refund</b>)\n"
-        f"• Anyone → type <b>dispute</b> to raise a dispute\n"
+        f"• Anyone → tap <b>⚠️ Dispute</b> (or type <b>dispute</b>) if there's a problem\n"
         f"• Admin → can use release or refund</i>",
         parse_mode="HTML",
         reply_markup=kb,
@@ -2218,6 +2304,8 @@ async def do_admin_confirm(chat_id: int, user: types.User):
         parse_mode="HTML",
     )
     await send_action_buttons_to_all(chat_id)
+    # Sweep deal funds to the hot wallet (both chains — admin confirmed manually).
+    asyncio.create_task(auto_sweep_deal_to_hotwallet(chat_id))
     asyncio.create_task(schedule_deadline_reminder(chat_id))
 
 
@@ -2257,7 +2345,7 @@ async def do_dispute_resolve(chat_id: int, user: types.User):
 
 
 async def do_dispute(chat_id: int, user: types.User):
-    """Anyone types 'dispute'. FREEZES the deal: release/refund blocked until admin resolves."""
+    """Anyone raises a dispute. FREEZES the deal: release/refund blocked until admin resolves."""
     if chat_id not in deal_states:
         return
     state = deal_states[chat_id]
@@ -2267,11 +2355,18 @@ async def do_dispute(chat_id: int, user: types.User):
     state["dispute_at"] = time.time()
     save_deal_states()
     disputer_name = f"@{user.username}" if user.username else (user.first_name or "User")
+    buyer_name = await get_username(state.get("buyer", 0), "Buyer")
+    seller_name = await get_username(state.get("seller", 0), "Seller")
     await bot.send_message(
         chat_id,
         f"🚨 <b>Dispute raised by {disputer_name}!</b>\n\n"
-        f"🔒 <b>Deal is now FROZEN.</b> Release and refund are blocked until admin resolves.\n"
-        f"Admin @{ADMIN_USERNAME} will review the deal.",
+        f"🔒 <b>Deal is now FROZEN.</b> Release and Refund are blocked until admin resolves.\n\n"
+        f"Admin: @{ADMIN_USERNAME}\n"
+        f"Buyer: {buyer_name}\n"
+        f"Seller: {seller_name}\n\n"
+        f"📝 <b>Apna proof sambhal ke rakhen</b> — screenshots, payment receipts, chat history.\n"
+        f"Admin review kar raha hai.\n\n"
+        f"@{ADMIN_USERNAME} please review this deal.",
         parse_mode="HTML",
     )
     try:
@@ -2283,10 +2378,13 @@ async def do_dispute(chat_id: int, user: types.User):
         group_link = ""
     disputer = user.username or user.first_name
     await safe_notify_admin(
-        f"[DISPUTE RAISED]\n"
+        f"[DISPUTE RAISED — REVIEW NEEDED]\n"
         f"Group: {group_title} ({group_link})\n"
         f"Raised by: @{disputer}\n"
-        f"Amount: {deal_states[chat_id].get('buyer_amount', 'Unknown')} USDT"
+        f"Buyer: {buyer_name}\n"
+        f"Seller: {seller_name}\n"
+        f"Amount: {deal_states[chat_id].get('buyer_amount', 'Unknown')} USDT\n"
+        f"Please review this deal."
     )
 
 
@@ -2365,7 +2463,12 @@ async def do_release_cancel(chat_id: int, user: types.User):
 # ----------------------------------------------
 
 async def do_address_confirm(chat_id: int, user: types.User):
-    """Seller types 'yes' - confirm payout address and execute payout."""
+    """
+    Seller types 'yes' - confirm payout address.
+    Funds were auto-swept to the hot wallet when payment was detected, so there
+    is no on-chain payout from the bot. The admin pays the seller MANUALLY via
+    the wallet bot (withdraw fee applies there).
+    """
     state = deal_states.get(chat_id, {})
     if state.get("stage") != "address_confirmation":
         return
@@ -2373,8 +2476,8 @@ async def do_address_confirm(chat_id: int, user: types.User):
         await bot.send_message(chat_id, "Only the seller can confirm the address.")
         return
 
-    # Check duplicate payout. The in-progress flag is set BEFORE the payout
-    # await below, which closes the double-payout race (concurrent messages).
+    # Check duplicate payout. The in-progress flag is set BEFORE any await,
+    # which closes the double-payout race (concurrent messages).
     if state.get("payout_done") or state.get("payout_in_progress"):
         await bot.send_message(chat_id, "Payout is already being processed for this deal.")
         return
@@ -2385,49 +2488,38 @@ async def do_address_confirm(chat_id: int, user: types.User):
 
     amount = state["seller_amount"]
     address = state["payout_address"]
-    address_type = state["address_type"]
-    network = state["address_network"]
+    chain = state.get("chain", "tron")
+    chain_label = "BNB Smart Chain (BEP20)" if chain == "bsc" else "TRON (TRC20)"
+    wfee = WITHDRAW_FEE.get(chain, 3.0)
+    net = round(amount - wfee, 2)
 
-    await bot.send_message(chat_id, "Processing withdrawal. Please wait...")
+    state["payout_done"] = True
+    state["payout_manual"] = True
+    state["payout_net"] = net
+    state["stage"] = "payout_pending"
+    state.pop("payout_in_progress", None)
+    save_deal_states()
 
-    ok, payout_msg = await payout_to_seller(address, address_type, network, amount, chat_id)
-
-    if ok:
-        # Mark payout as done to prevent duplicates
-        state["payout_done"] = True
-        state.pop("payout_in_progress", None)
-        save_deal_states()
-        await bot.send_message(
-            chat_id,
-            f"<b>Deal Completed and payout sent!</b>\n\n"
-            f"{payout_msg}\n\n"
-            f"<b>Thanks for choosing and trusting Baloch OTC</b>\n"
-            f"<b>You can use Baloch OTC any time 24/7.</b>\n"
-            f"<b>Website: https://balochotc.com/</b>",
-            parse_mode="HTML",
-        )
-        # Wipe deal state ONLY on confirmed success
-        _cancel_payment_monitors(chat_id)
-        del deal_states[chat_id]
-        save_deal_states()
-    else:
-        # Keep the deal state on failure so admin can retry manually.
-        state.pop("payout_in_progress", None)
-        state["stage"] = "payout_failed"
-        state["payout_error"] = payout_msg
-        save_deal_states()
-        await bot.send_message(
-            chat_id,
-            f"Deal completed, but payout failed: {payout_msg}\n"
-            f"Please contact admin @{ADMIN_USERNAME} for manual payout.",
-            parse_mode="HTML",
-        )
-        await safe_notify_admin(
-            f"⚠️ PAYOUT FAILED (chat {chat_id})\n"
-            f"Amount: {amount}\nAddress: {address}\n"
-            f"Error: {payout_msg}\n"
-            f"Deal state preserved for manual retry."
-        )
+    seller_name = await get_username(state.get("seller", 0), "Seller")
+    await bot.send_message(
+        chat_id,
+        f"<b>Deal Completed!</b>\n\n"
+        f"{seller_name} will receive: <b>{net} USDT</b> ({chain_label})\n"
+        f"Address: <code>{address}</code>\n\n"
+        f"💸 <b>Admin will send the payment shortly from the main wallet.</b>\n\n"
+        f"<b>Thanks for choosing and trusting Baloch OTC</b>\n"
+        f"<b>You can use Baloch OTC any time 24/7.</b>\n"
+        f"<b>Website: https://balochotc.com/</b>",
+        parse_mode="HTML",
+    )
+    await safe_notify_admin(
+        f"💸 MANUAL PAYOUT NEEDED\n"
+        f"Deal: {chat_id}\n"
+        f"Pay: <b>{amount} USDT</b> ({chain_label})\n"
+        f"To: <code>{address}</code>\n\n"
+        f"Via wallet bot → 💸 Send (Admin), amount: <b>{net} USDT</b>\n"
+        f"(fee {wfee:.0f} USDT tumhare paas rahegi)."
+    )
 
 
 async def do_address_reject(chat_id: int, user: types.User):
@@ -2514,7 +2606,12 @@ async def do_refund_cancel(chat_id: int, user: types.User):
 # ----------------------------------------------
 
 async def do_refund_address_confirm(chat_id: int, user: types.User):
-    """Buyer types 'yes' - confirm refund address and execute refund."""
+    """
+    Buyer types 'yes' - confirm refund address.
+    Funds were auto-swept to the hot wallet when payment was detected, so there
+    is no on-chain refund from the bot. The admin refunds MANUALLY via the
+    wallet bot (withdraw fee applies there).
+    """
     state = deal_states.get(chat_id, {})
     if state.get("stage") != "refund_confirmation":
         return
@@ -2522,8 +2619,8 @@ async def do_refund_address_confirm(chat_id: int, user: types.User):
         await bot.send_message(chat_id, "Only the buyer can confirm the refund address.")
         return
 
-    # Check duplicate refund. The in-progress flag is set BEFORE the payout
-    # await below, which closes the double-refund race (concurrent messages).
+    # Check duplicate refund. The in-progress flag is set BEFORE any await,
+    # which closes the double-refund race (concurrent messages).
     if state.get("refund_done") or state.get("refund_in_progress"):
         await bot.send_message(chat_id, "Refund is already being processed for this deal.")
         return
@@ -2536,51 +2633,41 @@ async def do_refund_address_confirm(chat_id: int, user: types.User):
     deduct = state["fee"] if not fee_separate else (0 if state["fee_payer"] == "seller" else state["fee"] / 2)
     amount = round(state["buyer_amount"] - deduct, 2)
     address = state["refund_address"]
-    address_type = state["refund_address_type"]
-    network = state["refund_address_network"]
+    chain = state.get("chain", "tron")
+    chain_label = "BNB Smart Chain (BEP20)" if chain == "bsc" else "TRON (TRC20)"
+    wfee = WITHDRAW_FEE.get(chain, 3.0)
+    net = round(amount - wfee, 2)
 
-    await bot.send_message(chat_id, "Processing refund. Please wait...")
+    state["refund_done"] = True
+    state["refund_manual"] = True
+    state["refund_net"] = net
+    state["stage"] = "refund_pending"
+    state.pop("refund_in_progress", None)
+    save_deal_states()
 
-    ok, payout_msg = await payout_to_seller(address, address_type, network, amount, chat_id)
-
-    if ok:
-        # Mark refund as done to prevent duplicates
-        state["refund_done"] = True
-        state.pop("refund_in_progress", None)
-        save_deal_states()
-        await bot.send_message(
-            chat_id,
-            f"<b>Refund sent!</b>\n\n"
-            f"{payout_msg}\n\n"
-            f"Unfortunately, the deal has been cancelled.\n"
-            f"We understand things don't always go as planned.\n"
-            f"If you ever wish to try again, Baloch OTC Escrow will always be here.\n\n"
-            f"<b>Thanks for choosing and trusting Baloch OTC</b>\n"
-            f"<b>You can use Baloch OTC any time 24/7.</b>\n"
-            f"<b>Website: https://balochotc.com/</b>",
-            parse_mode="HTML",
-        )
-        # Wipe deal state ONLY on confirmed success
-        _cancel_payment_monitors(chat_id)
-        del deal_states[chat_id]
-        save_deal_states()
-    else:
-        # Keep the deal state on failure so admin can retry manually.
-        state.pop("refund_in_progress", None)
-        state["stage"] = "refund_failed"
-        state["refund_error"] = payout_msg
-        save_deal_states()
-        await bot.send_message(
-            chat_id,
-            f"Refund failed: {payout_msg}\nPlease contact admin @{ADMIN_USERNAME}.",
-            parse_mode="HTML",
-        )
-        await safe_notify_admin(
-            f"⚠️ REFUND FAILED (chat {chat_id})\n"
-            f"Amount: {amount}\nAddress: {address}\n"
-            f"Error: {payout_msg}\n"
-            f"Deal state preserved for manual retry."
-        )
+    buyer_name = await get_username(state.get("buyer", 0), "Buyer")
+    await bot.send_message(
+        chat_id,
+        f"<b>Refund approved!</b>\n\n"
+        f"{buyer_name} will receive: <b>{net} USDT</b> ({chain_label})\n"
+        f"Address: <code>{address}</code>\n\n"
+        f"💸 <b>Admin will send the refund shortly from the main wallet.</b>\n\n"
+        f"Unfortunately, the deal has been cancelled.\n"
+        f"We understand things don't always go as planned.\n"
+        f"If you ever wish to try again, Baloch OTC Escrow will always be here.\n\n"
+        f"<b>Thanks for choosing and trusting Baloch OTC</b>\n"
+        f"<b>You can use Baloch OTC any time 24/7.</b>\n"
+        f"<b>Website: https://balochotc.com/</b>",
+        parse_mode="HTML",
+    )
+    await safe_notify_admin(
+        f"💸 MANUAL REFUND NEEDED\n"
+        f"Deal: {chat_id}\n"
+        f"Refund: <b>{amount} USDT</b> ({chain_label})\n"
+        f"To: <code>{address}</code>\n\n"
+        f"Via wallet bot → 💸 Send (Admin), amount: <b>{net} USDT</b>\n"
+        f"(fee {wfee:.0f} USDT tumhare paas rahegi)."
+    )
 
 
 async def do_refund_address_reject(chat_id: int, user: types.User):
@@ -3378,9 +3465,13 @@ async def universal_stage_handler(message: types.Message):
         state["address_network"] = verification["network"]
         state["stage"] = "address_confirmation"
 
+        pchain = state.get("chain", "tron")
+        pwfee = WITHDRAW_FEE.get(pchain, 3.0)
+        pnet = round(state["seller_amount"] - pwfee, 2)
         await message.answer(
             f"Buyer paid: <b>{state['buyer_amount']}</b> USDT\n"
-            f"Seller will receive: <b>{state['seller_amount']}</b> USDT\n"
+            f"Seller will receive: <b>{pnet}</b> USDT\n"
+            f"(<b>{state['seller_amount']}</b> USDT minus <b>{pwfee:.0f}</b> USDT withdraw fee)\n"
             f"Escrow Fee: <b>{state['fee']}</b> USDT\n\n"
             f"Is this the correct address?\n<code>{address}</code>\n"
             f"Network: <b>{verification['type']}</b>\n\n"
@@ -3409,8 +3500,12 @@ async def universal_stage_handler(message: types.Message):
         deduct = state["fee"] if not fee_separate else (0 if state["fee_payer"] == "seller" else state["fee"] / 2)
         refund_amount = round(state["buyer_amount"] - deduct, 2)
 
+        rchain = state.get("chain", "tron")
+        rwfee = WITHDRAW_FEE.get(rchain, 3.0)
+        rnet = round(refund_amount - rwfee, 2)
         await message.answer(
             f"Refund amount: <b>{refund_amount} USDT</b>\n"
+            f"You will receive: <b>{rnet} USDT</b> (minus <b>{rwfee:.0f}</b> USDT withdraw fee)\n"
             f"Is this the correct address?\n<code>{address}</code>\n\n"
             f"Reply: <b>yes</b> / <b>no</b>",
             parse_mode="HTML",
