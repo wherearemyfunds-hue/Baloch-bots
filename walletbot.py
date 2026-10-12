@@ -707,22 +707,11 @@ async def cb_a_withdraw_all(callback: types.CallbackQuery):
         parse_mode="HTML", reply_markup=kb)
 
 
-@dp.callback_query(F.data.startswith("withdraw_all_confirm_"))
-async def cb_withdraw_all_confirm(callback: types.CallbackQuery):
-    await callback.answer()
-    if not _is_admin(callback.from_user.id):
-        return
-    uid = callback.from_user.id
-    st = user_state.get(uid, {})
-    if callback.data == "withdraw_all_confirm_no" or st.get("step") != "withdraw_all":
-        user_state.pop(uid, None)
-        await callback.message.answer("❌ Cancelled.", reply_markup=admin_menu())
-        return
-    items = st.get("items", [])
-    user_state.pop(uid, None)
-    if not items:
-        await callback.message.answer("Nothing to withdraw.")
-        return
+_sweep_running = False  # global guard: never run two master sweeps at once
+
+
+async def _run_withdraw_all_sweep(callback: types.CallbackQuery, items: list):
+    """Master sweep run — called with the _sweep_running guard held."""
     prog = await callback.message.answer(
         f"⏳ <b>Withdrawing from {len(items)} addresses...</b>\nThis may take a few minutes.",
         parse_mode="HTML")
@@ -780,6 +769,33 @@ async def cb_withdraw_all_confirm(callback: types.CallbackQuery):
         pass
     await callback.message.answer("\n".join(lines), parse_mode="HTML",
                                   reply_markup=admin_menu())
+
+
+@dp.callback_query(F.data.startswith("withdraw_all_confirm_"))
+async def cb_withdraw_all_confirm(callback: types.CallbackQuery):
+    await callback.answer()
+    if not _is_admin(callback.from_user.id):
+        return
+    uid = callback.from_user.id
+    st = user_state.get(uid, {})
+    if callback.data == "withdraw_all_confirm_no" or st.get("step") != "withdraw_all":
+        user_state.pop(uid, None)
+        await callback.message.answer("❌ Cancelled.", reply_markup=admin_menu())
+        return
+    items = st.get("items", [])
+    user_state.pop(uid, None)
+    if not items:
+        await callback.message.answer("Nothing to withdraw.")
+        return
+    global _sweep_running
+    if _sweep_running:
+        await callback.message.answer("⏳ A Withdraw ALL sweep is already running. Please wait for it to finish.")
+        return
+    _sweep_running = True
+    try:
+        await _run_withdraw_all_sweep(callback, items)
+    finally:
+        _sweep_running = False
 
 
 @dp.callback_query(F.data == "a_swap")
