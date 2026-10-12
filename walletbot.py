@@ -208,7 +208,8 @@ def admin_menu(chain: str = "tron") -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="💸 Send (Admin)", callback_data="w_send")],
         [InlineKeyboardButton(text="🔄 Swap USDT→TRX", callback_data="a_swap")],
         [InlineKeyboardButton(text="👥 Users", callback_data="a_users")],
-        [InlineKeyboardButton(text="🤝 Deal Funds (TRON)", callback_data="a_deals")],
+        [InlineKeyboardButton(text="🤝 Deal Funds", callback_data="a_deals")],
+        [InlineKeyboardButton(text="💰 Withdraw ALL → My Wallet", callback_data="a_withdraw_all")],
         [InlineKeyboardButton(text="📦 Backup Deals", callback_data="a_backup")],
         [InlineKeyboardButton(text="🧹 Recover TRX", callback_data="a_sweep")],
     ])
@@ -444,7 +445,7 @@ async def cb_user_wd_confirm(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "a_deals")
 async def cb_a_deals(callback: types.CallbackQuery):
-    """Show all deal escrow addresses with balances (admin only)."""
+    """Show all deal escrow addresses with balances (admin only) — TRON + BSC."""
     await callback.answer("Loading...")
     if not _is_admin(callback.from_user.id):
         return
@@ -457,23 +458,37 @@ async def cb_a_deals(callback: types.CallbackQuery):
         except Exception:
             return {}
     states = await loop.run_in_executor(None, _load)
-    deals = [(cid, s) for cid, s in states.items() if s.get("tron_deposit_address")]
+    # (chat_id, chain, address, hd_index, stage)
+    deals = []
+    for cid, s in states.items():
+        if s.get("tron_deposit_address"):
+            deals.append((cid, "tron", s["tron_deposit_address"],
+                          s.get("hd_index", s.get("tron_hd_index")), s.get("stage", "?")))
+        if s.get("bsc_deposit_address"):
+            deals.append((cid, "bsc", s["bsc_deposit_address"],
+                          s.get("hd_index"), s.get("stage", "?")))
     if not deals:
         await callback.message.answer("🤝 No deal escrow addresses yet.")
         return
     lines = ["🤝 <b>Deal Escrow Funds</b>\n"]
     kb_rows = []
-    for cid, s in deals[-10:]:  # last 10
-        addr = s["tron_deposit_address"]
-        bal = await loop.run_in_executor(None, tron_pay.get_usdt_balance, addr)
-        trx = await loop.run_in_executor(None, tron_pay.get_trx_balance, addr)
-        stage = s.get("stage", "?")
-        gas_warn = " ⚠️" if trx < 5 else ""
-        lines.append(f"• Chat {cid} — <b>{bal:.2f}</b> USDT | <b>{trx:.1f}</b> TRX{gas_warn} ({stage})\n  <code>{addr}</code>")
+    for cid, chain, addr, hd_index, stage in deals[-12:]:  # last 12
+        if chain == "bsc":
+            bal = await loop.run_in_executor(None, bsc_pay.get_usdt_balance, addr)
+            gas = await loop.run_in_executor(None, bsc_pay.get_bnb_balance, addr)
+            gas_warn = " ⚠️" if gas < 0.004 else ""
+            gas_txt = f"{gas:.4f} BNB{gas_warn}"
+        else:
+            bal = await loop.run_in_executor(None, tron_pay.get_usdt_balance, addr)
+            gas = await loop.run_in_executor(None, tron_pay.get_trx_balance, addr)
+            gas_warn = " ⚠️" if gas < 5 else ""
+            gas_txt = f"{gas:.1f} TRX{gas_warn}"
+        no_key = " 🔑❌" if hd_index is None else ""
+        lines.append(f"• {CHAIN_LABEL[chain]} Chat {cid} — <b>{bal:.2f}</b> USDT | <b>{gas_txt}</b> ({stage}){no_key}\n  <code>{addr}</code>")
         if bal > 0.01:
             kb_rows.append([InlineKeyboardButton(
-                text=f"💸 Withdraw {bal:.2f} from {cid}",
-                callback_data=f"deal_wd_{cid}")])
+                text=f"💸 Withdraw {bal:.2f} ({CHAIN_LABEL[chain]}) {cid}",
+                callback_data=f"deal_wd_{chain}_{cid}")])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
     await callback.message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb)
 
@@ -484,10 +499,13 @@ async def cb_deal_withdraw(callback: types.CallbackQuery):
     await callback.answer()
     if not _is_admin(callback.from_user.id):
         return
-    chat_id = callback.data[len("deal_wd_"):]
-    user_state[callback.from_user.id] = {"step": "deal_withdraw", "deal_chat_id": chat_id}
+    rest = callback.data[len("deal_wd_"):]  # "{chain}_{chat_id}"
+    chain, _, chat_id = rest.partition("_")
+    if chain not in ("tron", "bsc"):
+        chain, chat_id = "tron", rest  # back-compat: old "deal_wd_{cid}" buttons
+    user_state[callback.from_user.id] = {"step": "deal_withdraw", "deal_chat_id": chat_id, "chain": chain}
     await callback.message.answer(
-        f"💸 <b>Withdraw from Deal {chat_id}</b>\n\nSend the destination TRON address:",
+        f"💸 <b>Withdraw from Deal {chat_id}</b> ({CHAIN_LABEL[chain]})\n\nSend the destination {_dest_kind_label(chain)} address:",
         parse_mode="HTML")
 
 
@@ -498,14 +516,23 @@ async def cb_deal_wd_confirm(callback: types.CallbackQuery):
         return
     uid = callback.from_user.id
     st = user_state.get(uid, {})
-    chain = _chain_of(uid)
+    chain = st.get("chain", "tron")
     if callback.data == "deal_wd_confirm_no":
         user_state.pop(uid, None)
         await callback.message.answer("❌ Cancelled.", reply_markup=admin_menu(chain))
         return
-    await callback.message.answer("⏳ Broadcasting...")
+    await callback.message.answer("⏳ Funding gas from hot wallet + broadcasting...")
     loop = asyncio.get_event_loop()
     def _do():
+        if chain == "bsc":
+            if st.get("hd_index") is None:
+                # v1-style deal: funds sit on the hot wallet itself
+                return bsc_pay.send_usdt(st["address"], st["amount"])
+            pk_hex = bsc_pay.get_user_private_key_hex(st["hd_index"])
+            return bsc_pay.send_usdt_from_with_gas(pk_hex, st["deal_addr"], st["address"], st["amount"])
+        if st.get("hd_index") is None:
+            # v1-style deal: funds sit on the hot wallet itself
+            return tron_pay.send_usdt(st["address"], st["amount"])
         pk = tron_pay.get_user_private_key(st["hd_index"])
         return tron_pay.send_usdt_from_with_gas(pk, st["address"], st["amount"])
     result = await loop.run_in_executor(None, _do)
@@ -513,13 +540,13 @@ async def cb_deal_wd_confirm(callback: types.CallbackQuery):
     if result.get("ok"):
         txid = result.get("txid", "")
         await callback.message.answer(
-            f"✅ <b>Withdrawn!</b>\n\nTxID: <code>{txid}</code>\n"
-            f"https://tronscan.org/#/transaction/{txid}",
+            f"✅ <b>Withdrawn!</b> ({CHAIN_LABEL[chain]})\n\nTxID: <code>{txid}</code>\n"
+            f"{EXPLORER_TX[chain]}{txid}",
             parse_mode="HTML", reply_markup=admin_menu(chain))
     else:
         await callback.message.answer(
             f"❌ Failed: {result.get('error', '?')}\n\n"
-            f"Tip: deal address needs TRX for gas!",
+            f"Tip: hot wallet needs enough {GAS_LABEL[chain]} for gas!",
             parse_mode="HTML", reply_markup=admin_menu(chain))
 
 
@@ -571,6 +598,189 @@ async def cb_a_sweep(callback: types.CallbackQuery):
             lines.append(f"✅ {addr[:10]}...: {amt:.2f} TRX")
     await callback.message.answer("\n".join(lines), parse_mode="HTML",
                                       reply_markup=admin_menu(_chain_of(callback.from_user.id)))
+
+
+# ============================================================
+# MASTER SWEEP — Withdraw ALL funds (users + deals, both chains)
+# to the hot wallet ("my wallet"). Bot takes ZERO fee; only
+# network gas applies (auto-funded, leftover swept back).
+# ============================================================
+SWEEP_DUST = 1.0  # skip balances below this (gas would eat them)
+
+
+def _scan_all_funds():
+    """Blocking scan: returns list of (kind, label, chain, addr, key_kind, key_index, bal)."""
+    import json
+    items = []
+    try:
+        users = load_users()
+    except Exception:
+        users = {}
+    try:
+        with open("/root/deal_states.json") as f:
+            states = json.load(f)
+    except Exception:
+        states = {}
+    # --- user deposits (both chains) ---
+    for uid, rec in users.items():
+        idx = rec.get("index")
+        un = f"@{rec['username']}" if rec.get("username") else rec.get("first_name", uid)
+        taddr = rec.get("address", "")
+        if taddr and idx is not None:
+            try:
+                bal = tron_pay.get_usdt_balance(taddr)
+            except Exception:
+                bal = 0
+            items.append(("user", f"User {un}", "tron", taddr, "user", idx, bal))
+        baddr = rec.get("bsc_address") or ""
+        if not baddr and idx is not None and BSC_ENABLED:
+            try:
+                baddr = bsc_pay.get_user_deposit_address(idx)
+            except Exception:
+                baddr = ""
+        if baddr and idx is not None:
+            try:
+                bal = bsc_pay.get_usdt_balance(baddr)
+            except Exception:
+                bal = 0
+            items.append(("user", f"User {un}", "bsc", baddr, "user", idx, bal))
+    # --- deal escrow (both chains) ---
+    for cid, s in states.items():
+        taddr = s.get("tron_deposit_address")
+        if taddr:
+            idx = s.get("hd_index", s.get("tron_hd_index"))
+            try:
+                bal = tron_pay.get_usdt_balance(taddr)
+            except Exception:
+                bal = 0
+            items.append(("deal", f"Deal {cid}", "tron", taddr, "deal", idx, bal))
+        baddr = s.get("bsc_deposit_address")
+        if baddr:
+            idx = s.get("hd_index")
+            try:
+                bal = bsc_pay.get_usdt_balance(baddr)
+            except Exception:
+                bal = 0
+            items.append(("deal", f"Deal {cid}", "bsc", baddr, "deal", idx, bal))
+    return items
+
+
+@dp.callback_query(F.data == "a_withdraw_all")
+async def cb_a_withdraw_all(callback: types.CallbackQuery):
+    """Scan everything and ask for confirmation before the master sweep."""
+    await callback.answer("Scanning all funds...")
+    if not _is_admin(callback.from_user.id):
+        return
+    uid = callback.from_user.id
+    await callback.message.answer("🔍 <b>Scanning all addresses (TRON + BSC)...</b>", parse_mode="HTML")
+    loop = asyncio.get_event_loop()
+    items = await loop.run_in_executor(None, _scan_all_funds)
+    movable = [it for it in items if it[6] >= SWEEP_DUST]
+    dust = [it for it in items if 0 < it[6] < SWEEP_DUST]
+    if not movable:
+        await callback.message.answer(
+            "💰 <b>Withdraw ALL</b>\n\nNo withdrawable funds found "
+            f"(everything below {SWEEP_DUST} USDT).",
+            parse_mode="HTML", reply_markup=admin_menu(_chain_of(uid)))
+        return
+    tot_tron = sum(it[6] for it in movable if it[2] == "tron")
+    tot_bsc = sum(it[6] for it in movable if it[2] == "bsc")
+    n_tron = sum(1 for it in movable if it[2] == "tron")
+    n_bsc = sum(1 for it in movable if it[2] == "bsc")
+    hot_tron = tron_pay.get_hot_wallet_address()
+    hot_bsc = bsc_pay.get_hot_wallet_address() if BSC_ENABLED else ""
+    user_state[uid] = {"step": "withdraw_all", "items": movable}
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Yes, withdraw ALL", callback_data="withdraw_all_confirm_yes")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="withdraw_all_confirm_no")],
+    ])
+    await callback.message.answer(
+        f"💰 <b>Withdraw ALL → My Wallet</b>\n\n"
+        f"🔴 TRON: <b>{tot_tron:.2f} USDT</b> ({n_tron} addresses)\n"
+        f"💛 BSC: <b>{tot_bsc:.2f} USDT</b> ({n_bsc} addresses)\n"
+        f"Skipped dust (<{SWEEP_DUST} USDT): {len(dust)}\n\n"
+        f"To:\n<code>{hot_tron}</code>\n" +
+        (f"<code>{hot_bsc}</code>\n\n" if hot_bsc else "\n") +
+        f"⛽ <b>Bot ki koi fee nahi.</b> Sirf network gas lagegi — "
+        f"TRON pe har address ~13 TRX, BSC pe ~$0.20. "
+        f"Gas hot wallet se auto-fund hogi, bachi hui wapas aa jayegi.\n\n"
+        f"⏳ Ye kuch minute le sakta hai. Confirm karoon?",
+        parse_mode="HTML", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("withdraw_all_confirm_"))
+async def cb_withdraw_all_confirm(callback: types.CallbackQuery):
+    await callback.answer()
+    if not _is_admin(callback.from_user.id):
+        return
+    uid = callback.from_user.id
+    st = user_state.get(uid, {})
+    if callback.data == "withdraw_all_confirm_no" or st.get("step") != "withdraw_all":
+        user_state.pop(uid, None)
+        await callback.message.answer("❌ Cancelled.", reply_markup=admin_menu(_chain_of(uid)))
+        return
+    items = st.get("items", [])
+    user_state.pop(uid, None)
+    if not items:
+        await callback.message.answer("Nothing to withdraw.")
+        return
+    prog = await callback.message.answer(
+        f"⏳ <b>Withdrawing from {len(items)} addresses...</b>\nIs me kuch minute lag sakte hain.",
+        parse_mode="HTML")
+    loop = asyncio.get_event_loop()
+
+    def _run():
+        out = []
+        hot_tron = tron_pay.get_hot_wallet_address()
+        hot_bsc = bsc_pay.get_hot_wallet_address() if BSC_ENABLED else ""
+        for kind, label, chain, addr, key_kind, key_index, bal in items:
+            amt = round(bal - 0.01, 2)
+            if amt <= 0:
+                out.append((label, chain, 0, "skip"))
+                continue
+            try:
+                if chain == "bsc":
+                    dest = hot_bsc
+                    if key_index is None:
+                        # already on hot wallet (v1-style) — nothing to move
+                        out.append((label, chain, amt, "already_home"))
+                        continue
+                    pk_hex = bsc_pay.get_user_private_key_hex(key_index)
+                    r = bsc_pay.send_usdt_from_with_gas(pk_hex, addr, dest, amt)
+                else:
+                    dest = hot_tron
+                    if key_index is None:
+                        out.append((label, chain, amt, "already_home"))
+                        continue
+                    pk = tron_pay.get_user_private_key(key_index)
+                    r = tron_pay.send_usdt_from_with_gas(pk, dest, amt)
+                if r.get("ok"):
+                    out.append((label, chain, amt, "ok"))
+                else:
+                    out.append((label, chain, amt, f"fail: {r.get('error', '?')}"))
+            except Exception as e:
+                out.append((label, chain, amt, f"fail: {e}"))
+        return out
+
+    results = await loop.run_in_executor(None, _run)
+    ok = [r for r in results if r[3] == "ok"]
+    failed = [r for r in results if r[3] not in ("ok", "already_home", "skip")]
+    home = [r for r in results if r[3] == "already_home"]
+    tot = sum(r[2] for r in ok)
+    lines = [f"💰 <b>Withdraw ALL — Done!</b>\n",
+             f"Moved: <b>{tot:.2f} USDT</b> ({len(ok)} addresses)"]
+    if home:
+        lines.append(f"Already in wallet: {len(home)}")
+    for label, chain, amt, err in failed:
+        lines.append(f"❌ {label} ({CHAIN_LABEL[chain]}): {amt:.2f} — {err}")
+    if failed:
+        lines.append("\n<i>Failed wale dobara try karo ya alag se withdraw karo.</i>")
+    try:
+        await prog.delete()
+    except Exception:
+        pass
+    await callback.message.answer("\n".join(lines), parse_mode="HTML",
+                                  reply_markup=admin_menu(_chain_of(uid)))
 
 
 @dp.callback_query(F.data == "a_swap")
@@ -760,15 +970,17 @@ async def handle_text(message: types.Message):
         return
     if st["step"] == "deal_withdraw":
         # Step 1: get destination address for deal withdraw
-        if not (text.startswith("T") and len(text) == 34):
-            await message.answer("❌ Invalid TRON address. Try again:")
+        chain = st.get("chain", "tron")
+        if not _valid_dest(text, chain):
+            await message.answer(f"❌ Invalid {_dest_kind_label(chain)} address. Try again:")
             return
-        st["address"] = text
+        st["address"] = text.strip()
         st["step"] = "deal_withdraw_amount"
         await message.answer("💰 Send the amount in USDT (or 'max' for full balance):")
         return
     if st["step"] == "deal_withdraw_amount":
         import json
+        chain = st.get("chain", "tron")
         loop = asyncio.get_event_loop()
         def _load():
             try:
@@ -778,10 +990,16 @@ async def handle_text(message: types.Message):
                 return {}
         states = await loop.run_in_executor(None, _load)
         deal = states.get(st["deal_chat_id"], {})
-        deal_addr = deal.get("tron_deposit_address", "")
-        hd_index = deal.get("tron_hd_index")
+        if chain == "bsc":
+            deal_addr = deal.get("bsc_deposit_address", "")
+            hd_index = deal.get("hd_index")
+            get_bal = bsc_pay.get_usdt_balance
+        else:
+            deal_addr = deal.get("tron_deposit_address", "")
+            hd_index = deal.get("hd_index", deal.get("tron_hd_index"))
+            get_bal = tron_pay.get_usdt_balance
         if text.lower() == "max":
-            bal = await loop.run_in_executor(None, tron_pay.get_usdt_balance, deal_addr)
+            bal = await loop.run_in_executor(None, get_bal, deal_addr)
             # Leave a tiny bit for safety, withdraw almost all
             amt = round(bal - 0.01, 2) if bal > 0.01 else 0
         else:

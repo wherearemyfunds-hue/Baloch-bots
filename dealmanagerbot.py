@@ -68,6 +68,15 @@ try:
 except ImportError:
     TRON_AVAILABLE = False
 
+# --- BNB Smart Chain (USDT BEP20) — second network, TRON stays default ---
+USE_BSC = os.environ.get("WALLET_USE_BSC", "true").lower() == "true"
+try:
+    import bsc_pay  # noqa: F401
+    BSC_AVAILABLE = bool(WALLET_SEED_PHRASE)
+except ImportError:
+    BSC_AVAILABLE = False
+BSC_ENABLED = USE_BSC and BSC_AVAILABLE
+
 # Payment addresses (displayed as reference in messages)
 BEP20_ADDRESS = "0xf1a0fade24678e3331eaf915840cc6cf6a831d80"
 TRC20_ADDRESS = "TV1ddqZd6KeiMc1AKpDkqDf5hcAgSiWo6t"
@@ -294,31 +303,38 @@ def detect_address_type(address: str) -> dict:
     return {"valid": False, "type": None, "network": None}
 
 
-def validate_payout_address(address: str) -> tuple[bool, str]:
+def validate_payout_address(address: str, chain: str = "tron") -> tuple[bool, str]:
     """
-    Validate payout/refund address.
-    In TRON mode: ONLY TRC20 accepted. Otherwise both TRC20/BEP20.
+    Validate payout/refund address — must match the DEAL's chain.
+    chain="tron": only TRC20. chain="bsc": only BEP20.
     Returns (valid, error_message).
     """
+    want = "BEP20" if chain == "bsc" else "TRC20"
     v = detect_address_type(address)
     if not v["valid"]:
-        if USE_TRON and TRON_AVAILABLE:
-            return False, "❌ Invalid address. Please send your <b>USDT TRC20</b> address (starts with T)."
-        return False, "Invalid address. Please send a valid USDT TRC20 or USDT BEP20 address."
-    if USE_TRON and TRON_AVAILABLE and v["type"] != "TRC20":
-        return False, "❌ Only <b>USDT TRC20</b> is supported. Please send a TRON address (starts with T)."
+        if want == "BEP20":
+            return False, "❌ Invalid address. Please send your <b>USDT BEP20</b> address (starts with 0x)."
+        return False, "❌ Invalid address. Please send your <b>USDT TRC20</b> address (starts with T)."
+    if v["type"] != want:
+        if want == "BEP20":
+            return False, "❌ This deal is on <b>BNB Smart Chain</b>. Please send a USDT <b>BEP20</b> address (starts with 0x)."
+        return False, "❌ This deal is on <b>TRON</b>. Please send a USDT <b>TRC20</b> address (starts with T)."
     return True, ""
 
 
-def payout_prompt_text() -> str:
-    """Payout address prompt — TRC20 only in TRON mode."""
+def payout_prompt_text(chain: str = "tron") -> str:
+    """Payout address prompt — matches the deal's chain."""
+    if chain == "bsc":
+        return "please send your payout address (USDT <b>BEP20</b> only — starts with 0x)."
     if USE_TRON and TRON_AVAILABLE:
         return "please send your payout address (USDT <b>TRC20</b> only — starts with T)."
     return "please send your payout address (USDT TRC20 or USDT BEP20 only)."
 
 
-def refund_prompt_text() -> str:
-    """Refund address prompt — TRC20 only in TRON mode."""
+def refund_prompt_text(chain: str = "tron") -> str:
+    """Refund address prompt — matches the deal's chain."""
+    if chain == "bsc":
+        return "please send your refund address (USDT <b>BEP20</b> only — starts with 0x)."
     if USE_TRON and TRON_AVAILABLE:
         return "please send your refund address (USDT <b>TRC20</b> only — starts with T)."
     return "please send your refund address (USDT TRC20 or USDT BEP20 only)."
@@ -1015,9 +1031,9 @@ async def schedule_deadline_reminder(chat_id: int):
 # ==============================================
 
 async def show_payment_info(chat_id: int):
-    """Create payment info — TRON direct (zero fee) or Cryptomus invoice."""
+    """Create payment info — direct chain (zero platform fee) or Cryptomus invoice."""
     if USE_TRON and TRON_AVAILABLE and TRON_PRIVATE_KEY:
-        await show_payment_info_tron(chat_id)
+        await show_payment_info_chain(chat_id, "tron")
         return
     await show_payment_info_cryptomus(chat_id)
 
@@ -1030,37 +1046,61 @@ def deal_hd_index(chat_id: int) -> int:
     return 100000 + (abs(chat_id) % 8000000)
 
 
-async def show_payment_info_tron(chat_id: int):
-    """Show TRON USDT (TRC20) deposit address — unique per deal, zero platform fee."""
-    import tron_pay
+async def show_payment_info_chain(chat_id: int, chain: str = "tron"):
+    """Show USDT deposit address — unique per deal. TRON (TRC20) default, BSC (BEP20) optional."""
     state = deal_states[chat_id]
     buyer_amount = state["buyer_amount"]
     seller_amount = state["seller_amount"]
     fee = state["fee"]
 
-    # Unique HD address per deal
-    hd_index = deal_hd_index(chat_id)
-    deposit_address = tron_pay.get_user_deposit_address(hd_index)
-    state["tron_deposit_address"] = deposit_address
-    state["tron_hd_index"] = hd_index
-    state["payment_order_id"] = f"tron-{abs(chat_id)}-{int(time.time())}"
+    if chain == "bsc":
+        import bsc_pay
+        chain_label = "BNB Smart Chain (BEP20)"
+        token_label = "BEP20"
+        net_note = "only BNB network fee"
+    else:
+        import tron_pay
+        chain = "tron"
+        chain_label = "TRON (TRC20)"
+        token_label = "TRC20"
+        net_note = "only TRON network fee"
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    # Unique HD address per deal (same index scheme on both chains)
+    hd_index = deal_hd_index(chat_id)
+    if chain == "bsc":
+        deposit_address = bsc_pay.get_user_deposit_address(hd_index)
+        state["bsc_deposit_address"] = deposit_address
+    else:
+        deposit_address = tron_pay.get_user_deposit_address(hd_index)
+        state["tron_deposit_address"] = deposit_address
+        state["tron_hd_index"] = hd_index
+    state["chain"] = chain
+    state["deposit_address"] = deposit_address
+    state["hd_index"] = hd_index
+    state["payment_order_id"] = f"{chain}-{abs(chat_id)}-{int(time.time())}"
+
+    kb_rows = [
         [InlineKeyboardButton(text="Money Received (Admin Only)", callback_data="admin_confirm")]
-    ])
+    ]
+    if BSC_ENABLED:
+        if chain == "tron":
+            kb_rows.append([InlineKeyboardButton(text="💛 Pay with BNB (BEP20) instead", callback_data="paychain_bsc")])
+        else:
+            kb_rows.append([InlineKeyboardButton(text="🔴 Pay with TRON (TRC20) instead", callback_data="paychain_tron")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
     payment_msg = (
         f"<b>PAYMENT INFORMATION</b>\n"
         f"{'=' * 30}\n\n"
-        f"Buyer needs to pay: <b>{buyer_amount} USDT</b> (TRC20)\n"
+        f"Buyer needs to pay: <b>{buyer_amount} USDT</b> ({token_label})\n"
         f"Seller will receive: <b>{seller_amount} USDT</b>\n"
         f"Escrow Fee: <b>{fee} USDT</b>\n\n"
         f"<b>Baloch Escrow fee: 3% (minimum $3)</b>\n\n"
-        f"Send <b>exactly {buyer_amount} USDT</b> (TRC20) to:\n"
+        f"Send <b>exactly {buyer_amount} USDT</b> ({token_label}) to:\n"
         f"<code>{deposit_address}</code>\n\n"
-        f"⚡ <b>Zero platform fee</b> — only TRON network fee!\n"
+        f"⚡ <b>Zero platform fee</b> — {net_note}!\n"
         f"🔒 <b>Unique address</b> for this deal only!\n\n"
-        f"Payment will be <b>automatically detected</b> once confirmed on TRON.\n\n"
+        f"Payment will be <b>automatically detected</b> once confirmed on {chain_label}.\n\n"
         f"{'=' * 30}\n\n"
         f"<i>Admin: tap the button or reply <b>received</b> to confirm manually if needed.</i>"
     )
@@ -1070,8 +1110,16 @@ async def show_payment_info_tron(chat_id: int):
     state["payment_start_time"] = time.time()
     if chat_id in payment_monitoring_tasks:
         payment_monitoring_tasks[chat_id].cancel()
-    task = asyncio.create_task(tron_payment_monitoring(chat_id, deposit_address, buyer_amount, duration_minutes=120))
+    if chain == "bsc":
+        task = asyncio.create_task(bsc_payment_monitoring(chat_id, deposit_address, buyer_amount, duration_minutes=120))
+    else:
+        task = asyncio.create_task(tron_payment_monitoring(chat_id, deposit_address, buyer_amount, duration_minutes=120))
     payment_monitoring_tasks[chat_id] = task
+
+
+# Back-compat alias (single caller updated below, kept for safety)
+async def show_payment_info_tron(chat_id: int):
+    await show_payment_info_chain(chat_id, "tron")
 
 
 async def tron_payment_monitoring(chat_id: int, address: str, expected: float, duration_minutes: int = 120):
@@ -1175,6 +1223,91 @@ async def tron_payment_monitoring(chat_id: int, address: str, expected: float, d
         logger.error(f"[TRON Monitor] Chat {chat_id} - error: {e}")
 
 
+async def bsc_payment_monitoring(chat_id: int, address: str, expected: float, duration_minutes: int = 120):
+    """
+    Monitor BNB Smart Chain for USDT (BEP20) deposits.
+    Mirrors tron_payment_monitoring: cumulative >= expected - $3 accepts.
+    """
+    import bsc_pay
+    state = deal_states.get(chat_id)
+    if not state:
+        return
+    logger.info(f"[BSC Monitor] Started for chat {chat_id}, address {address}")
+    end_time = time.time() + (duration_minutes * 60)
+    total_received = 0.0
+    underpay_notified = False
+
+    # Start from the current block — ignore anything before monitoring started
+    try:
+        last_block = bsc_pay.get_latest_block() or 0
+    except Exception as e:
+        logger.warning(f"[BSC Monitor] Could not get latest block: {e}")
+        last_block = 0
+    state["bsc_last_block"] = last_block
+
+    try:
+        while time.time() < end_time:
+            if chat_id not in deal_states:
+                break
+            stage = deal_states[chat_id].get("stage", "")
+            if stage not in ("payment", "payment_monitoring"):
+                break
+            try:
+                deposits = bsc_pay.get_new_deposits(address, last_block)
+                for d in deposits:
+                    last_block = max(last_block, d["block"])
+                    amt = d["amount"]
+                    total_received = round(total_received + amt, 2)
+                    logger.info(f"[BSC Monitor] Chat {chat_id}: +{amt} USDT (total {total_received}/{expected})")
+                state["bsc_last_block"] = last_block
+                shortfall = round(expected - total_received, 2)
+                if total_received > 0 and shortfall <= 3.0:
+                    # Accept: exact, overpaid, or within $3 tolerance
+                    await handle_payment_detected(chat_id, total_received, max(shortfall, 0))
+                    return
+                elif total_received > 0 and not underpay_notified:
+                    underpay_notified = True
+                    buyer_name = await get_username(deal_states[chat_id].get("buyer", 0), "Buyer")
+                    await bot.send_message(
+                        chat_id,
+                        f"<b>Partial Payment Detected</b>\n\n"
+                        f"{buyer_name}, we received <b>{total_received} USDT</b> "
+                        f"but the required amount is <b>{expected} USDT</b>.\n\n"
+                        f"<b>Remaining: {shortfall} USDT</b>\n\n"
+                        f"Please send the remaining amount to the same address.\n"
+                        f"The system will automatically detect the additional payment.",
+                        parse_mode="HTML",
+                    )
+                    await safe_notify_admin(
+                        f"[Partial Payment - BSC]\nChat: {chat_id}\n"
+                        f"Expected: {expected} USDT\nReceived: {total_received} USDT\n"
+                        f"Shortfall: {shortfall} USDT"
+                    )
+            except Exception as e:
+                logger.warning(f"[BSC Monitor] Poll error: {e}")
+            await asyncio.sleep(15)
+        # Timeout
+        state = deal_states.get(chat_id)
+        if state and state.get("stage") in ("payment", "payment_monitoring"):
+            if total_received > 0:
+                await bot.send_message(
+                    chat_id,
+                    f"⏰ Payment timeout. Received <b>{total_received} USDT</b> of <b>{expected} USDT</b>.\n"
+                    f"Contact admin @{ADMIN_USERNAME}.",
+                    parse_mode="HTML",
+                )
+            else:
+                await bot.send_message(
+                    chat_id,
+                    "⏰ Payment timeout (120 min). If you already sent USDT, contact admin.",
+                    parse_mode="HTML",
+                )
+    except asyncio.CancelledError:
+        logger.info(f"[BSC Monitor] Chat {chat_id} - cancelled")
+    except Exception as e:
+        logger.error(f"[BSC Monitor] Chat {chat_id} - error: {e}")
+
+
 async def show_payment_info_cryptomus(chat_id: int):
     """Create Cryptomus invoice and show payment information (text-based, no buttons)."""
     state = deal_states[chat_id]
@@ -1247,24 +1380,45 @@ async def show_payment_info_cryptomus(chat_id: int):
 # ==============================================
 
 async def payout_to_seller(address: str, address_type: str, network: str, amount: float, chat_id: int) -> tuple[bool, str]:
-    """Process automatic payout — TRON direct (zero fee) or Cryptomus."""
+    """Process automatic payout — direct chain (zero platform fee) or Cryptomus."""
     if USE_TRON and TRON_AVAILABLE and TRON_PRIVATE_KEY:
-        return await payout_via_tron(address, amount, chat_id)
+        return await payout_via_chain(address, amount, chat_id)
     return await payout_via_cryptomus(address, address_type, network, amount, chat_id)
 
 
-async def payout_via_tron(address: str, amount: float, chat_id: int) -> tuple[bool, str]:
+async def payout_via_chain(address: str, amount: float, chat_id: int) -> tuple[bool, str]:
     """
-    Send USDT (TRC20) via TRON — ONLY TRC20, no other networks.
-    Pays directly from the deal's unique HD address (saves a sweep tx).
+    Send USDT from the deal's unique HD address (saves a sweep tx).
+    Chain-aware: TRON (TRC20) or BNB Smart Chain (BEP20), matching the deal.
     """
-    import tron_pay
+    state = deal_states.get(chat_id, {})
+    chain = state.get("chain", "tron")
     try:
+        if chain == "bsc":
+            import bsc_pay
+            if not (address.startswith("0x") and len(address) == 42):
+                return False, "Only USDT BEP20 addresses supported for BNB deals."
+            hd_index = state.get("hd_index", state.get("tron_hd_index"))
+            if hd_index is None:
+                logger.warning(f"No HD index for chat {chat_id}, using hot wallet")
+                send_fn = lambda: bsc_pay.send_usdt(address, amount)
+            else:
+                pk_hex = bsc_pay.get_user_private_key_hex(hd_index)
+                from_addr = bsc_pay.get_user_deposit_address(hd_index)
+                send_fn = lambda: bsc_pay.send_usdt_from_with_gas(pk_hex, from_addr, address, amount)
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, send_fn)
+            if result.get("ok"):
+                txid = result.get("txid", "")
+                logger.info(f"BSC payout: {amount} USDT -> {address}, txid={txid}")
+                return True, f"Payout successful!\nTx ID: {txid}\nView: https://bscscan.com/tx/{txid}"
+            return False, f"BSC payout failed: {result.get('error', 'unknown')}"
+        # TRON (default)
+        import tron_pay
         # STRICT: only TRC20 TRON addresses
         if not (address.startswith("T") and len(address) == 34):
             return False, "Only USDT TRC20 addresses supported (must start with T)."
-        state = deal_states.get(chat_id, {})
-        hd_index = state.get("tron_hd_index")
+        hd_index = state.get("hd_index", state.get("tron_hd_index"))
         if hd_index is None:
             # Fallback: hot wallet (should not happen for TRON deals)
             logger.warning(f"No HD index for chat {chat_id}, using hot wallet")
@@ -1280,8 +1434,13 @@ async def payout_via_tron(address: str, amount: float, chat_id: int) -> tuple[bo
             return True, f"Payout successful!\nTx ID: {txid}\nView: https://tronscan.org/#/transaction/{txid}"
         return False, f"TRON payout failed: {result.get('error', 'unknown')}"
     except Exception as e:
-        logger.error(f"TRON payout error: {e}")
+        logger.error(f"{chain.upper()} payout error: {e}")
         return False, f"Withdrawal error: {str(e)}"
+
+
+# Back-compat alias
+async def payout_via_tron(address: str, amount: float, chat_id: int) -> tuple[bool, str]:
+    return await payout_via_chain(address, amount, chat_id)
 
 
 async def payout_via_cryptomus(address: str, address_type: str, network: str, amount: float, chat_id: int) -> tuple[bool, str]:
@@ -2145,7 +2304,7 @@ async def do_release_confirm(chat_id: int, user: types.User):
     state.pop("awaiting", None)
     seller_name = await get_username(state["seller"], "Seller")
     state["stage"] = "payout_address"
-    await bot.send_message(chat_id, f"{seller_name}, {payout_prompt_text()}")
+    await bot.send_message(chat_id, f"{seller_name}, {payout_prompt_text(state.get('chain', 'tron'))}")
 
 
 async def do_release_cancel(chat_id: int, user: types.User):
@@ -2242,7 +2401,7 @@ async def do_address_reject(chat_id: int, user: types.User):
         return
     seller_name = await get_username(state["seller"], "Seller")
     state["stage"] = "payout_address"
-    await bot.send_message(chat_id, f"{seller_name}, please send your payout address again. {payout_prompt_text()}")
+    await bot.send_message(chat_id, f"{seller_name}, please send your payout address again. {payout_prompt_text(state.get('chain', 'tron'))}")
 
 
 # ----------------------------------------------
@@ -2296,7 +2455,7 @@ async def do_refund_confirm(chat_id: int, user: types.User):
     state.pop("awaiting", None)
     buyer_name = await get_username(state["buyer"], "Buyer")
     state["stage"] = "refund_address"
-    await bot.send_message(chat_id, f"{buyer_name}, {refund_prompt_text()}")
+    await bot.send_message(chat_id, f"{buyer_name}, {refund_prompt_text(state.get('chain', 'tron'))}")
 
 
 async def do_refund_cancel(chat_id: int, user: types.User):
@@ -2397,7 +2556,7 @@ async def do_refund_address_reject(chat_id: int, user: types.User):
         return
     buyer_name = await get_username(state["buyer"], "Buyer")
     state["stage"] = "refund_address"
-    await bot.send_message(chat_id, f"{buyer_name}, please send your refund address again. {refund_prompt_text()}")
+    await bot.send_message(chat_id, f"{buyer_name}, please send your refund address again. {refund_prompt_text(state.get('chain', 'tron'))}")
 
 
 # ----------------------------------------------
@@ -3174,7 +3333,7 @@ async def universal_stage_handler(message: types.Message):
     # ======================================================
     if stage == "payout_address" and user_id == state.get("seller"):
         address = message.text.strip()
-        ok, err = validate_payout_address(address)
+        ok, err = validate_payout_address(address, state.get("chain", "tron"))
         if not ok:
             await message.answer(err, parse_mode="HTML")
             return
@@ -3201,7 +3360,7 @@ async def universal_stage_handler(message: types.Message):
     # ======================================================
     if stage == "refund_address" and user_id == state.get("buyer"):
         address = message.text.strip()
-        ok, err = validate_payout_address(address)
+        ok, err = validate_payout_address(address, state.get("chain", "tron"))
         if not ok:
             await message.answer(err, parse_mode="HTML")
             return
@@ -3561,6 +3720,34 @@ async def handle_admin_confirm(callback: CallbackQuery):
         await callback.message.delete()
     except Exception:
         pass
+
+
+# -- Payment chain toggle: TRON (TRC20) <-> BSC (BEP20) --
+@dp.callback_query(F.data.in_(["paychain_bsc", "paychain_tron"]))
+async def handle_paychain_toggle(callback: CallbackQuery):
+    chat_id = callback.message.chat.id
+    user = callback.from_user
+    state = deal_states.get(chat_id, {})
+    if state.get("stage") not in ("payment", "payment_monitoring"):
+        await callback.answer("Payment window is over.", show_alert=True)
+        return
+    # Only the buyer (who pays) or an admin may switch the network
+    if not (user.id == state.get("buyer") or _is_admin_user(user)):
+        await callback.answer("Only the buyer or admin can switch the network.", show_alert=True)
+        return
+    if not BSC_ENABLED:
+        await callback.answer("BNB network is not enabled.", show_alert=True)
+        return
+    new_chain = "bsc" if callback.data == "paychain_bsc" else "tron"
+    if state.get("chain", "tron") == new_chain:
+        await callback.answer()
+        return
+    await callback.answer(f"Switched to {'BNB (BEP20)' if new_chain == 'bsc' else 'TRON (TRC20)'}")
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await show_payment_info_chain(chat_id, new_chain)
 
 
 # -- Dispute callback (legacy: old button messages still work) --
