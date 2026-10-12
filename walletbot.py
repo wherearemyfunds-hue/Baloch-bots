@@ -28,7 +28,8 @@ TRON_PRIVATE_KEY = os.environ.get("TRON_PRIVATE_KEY", "").strip()
 try:
     import tron_pay
     TRON_AVAILABLE = bool(TRON_PRIVATE_KEY) and bool(os.environ.get("WALLET_SEED_PHRASE", "").strip())
-except ImportError:
+except Exception as e:  # broken chain deps must never kill the bot (chains are optional)
+    logger.warning(f"tron_pay unavailable: {e}")
     TRON_AVAILABLE = False
     tron_pay = None
 
@@ -39,7 +40,8 @@ USE_BSC = os.environ.get("WALLET_USE_BSC", "true").lower() == "true"
 try:
     import bsc_pay
     BSC_AVAILABLE = bool(os.environ.get("WALLET_SEED_PHRASE", "").strip())
-except ImportError:
+except Exception as e:  # broken chain deps must never kill the bot (chains are optional)
+    logger.warning(f"bsc_pay unavailable: {e}")
     BSC_AVAILABLE = False
     bsc_pay = None
 

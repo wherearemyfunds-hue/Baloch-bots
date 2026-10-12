@@ -37,7 +37,13 @@ if [ "$LOCAL" != "$REMOTE" ]; then
   pip3 show tronpy >/dev/null 2>&1 || pip3 install --break-system-packages tronpy 2>&1 | tail -1
   pip3 show bip-utils >/dev/null 2>&1 || pip3 install --break-system-packages bip-utils 2>&1 | tail -1
   # web3 for BNB Smart Chain USDT (BEP20) in the wallet bot
-  pip3 show web3 >/dev/null 2>&1 || pip3 install --break-system-packages web3 2>&1 | tail -1
+  # NOTE: pin web3<8 — v8 pulls eth-abi 6.x which breaks tronpy (needs eth-abi<6).
+  # web3 v7 works with eth-abi 5.x alongside tronpy.
+  pip3 show web3 >/dev/null 2>&1 || pip3 install --break-system-packages "web3<8" 2>&1 | tail -1
+  # Guard: web3's dependency install can downgrade pydantic-core and break
+  # aiogram at startup (SystemError: pydantic-core incompatible). Restore it.
+  python3 -c "import pydantic" 2>/dev/null || \
+    pip3 install --break-system-packages --force-reinstall --no-deps "pydantic-core==2.50.0" 2>&1 | tail -1
 
   # Deal Manager Bot
   cp dealmanagerbot.py /root/dealmanagerbot.py

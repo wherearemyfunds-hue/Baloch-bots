@@ -65,7 +65,8 @@ WALLET_SEED_PHRASE = os.environ.get("WALLET_SEED_PHRASE", "").strip()
 try:
     import tron_pay  # noqa: F401
     TRON_AVAILABLE = bool(TRON_PRIVATE_KEY) and bool(WALLET_SEED_PHRASE)
-except ImportError:
+except Exception as e:  # broken chain deps must never kill the bot (chains are optional)
+    logger.warning(f"tron_pay unavailable: {e}")
     TRON_AVAILABLE = False
 
 # --- BNB Smart Chain (USDT BEP20) — second network, TRON stays default ---
@@ -73,7 +74,8 @@ USE_BSC = os.environ.get("WALLET_USE_BSC", "true").lower() == "true"
 try:
     import bsc_pay  # noqa: F401
     BSC_AVAILABLE = bool(WALLET_SEED_PHRASE)
-except ImportError:
+except Exception as e:  # broken chain deps must never kill the bot (chains are optional)
+    logger.warning(f"bsc_pay unavailable: {e}")
     BSC_AVAILABLE = False
 BSC_ENABLED = USE_BSC and BSC_AVAILABLE
 
