@@ -1084,91 +1084,15 @@ async def handle_payment_detected(chat_id: int, actual_amount: float, difference
             f"Received: {actual_amount} USDT"
         )
 
-        # Auto-sweep the FULL deal balance to the hot wallet (feeless).
-        # Runs in background so confirmations aren't delayed.
-        # Sweeps BOTH chains: if the buyer paid on both, nothing is left behind.
-        asyncio.create_task(auto_sweep_deal_to_hotwallet(chat_id))
+        # NOTE (Shawn, 2026-10-12): NO auto-sweep — funds stay on the deal
+        # address until release/refund, so only ONE gas hop is ever paid
+        # (no double fee). Admin pays out directly from the deal address
+        # via the wallet bot's Deal Funds section.
 
         asyncio.create_task(schedule_deadline_reminder(chat_id))
 
     except Exception as e:
         logger.error(f"Error handling payment detection for chat {chat_id}: {e}")
-
-
-async def auto_sweep_deal_to_hotwallet(chat_id: int, chain: str = None):
-    """
-    Sweep the FULL deal balance to the hot wallet (Shawn's main wallet).
-    Feeless: no deduction from the deal amount; gas is auto-funded from the
-    hot wallet itself (never from the deal funds).
-    Best-effort: on failure the admin is notified to sweep manually via the
-    wallet bot's Deal Funds section.
-    chain: "tron"/"bsc", or None to sweep both addresses.
-    """
-    state = deal_states.get(chat_id, {})
-    if state.get("swept"):
-        return
-    chains = [chain] if chain in ("tron", "bsc") else ["tron", "bsc"]
-    loop = asyncio.get_event_loop()
-    for ch in chains:
-        try:
-            if ch == "bsc":
-                if not BSC_ENABLED:
-                    continue
-                import bsc_pay
-                addr = state.get("bsc_deposit_address", "")
-                hd_index = state.get("hd_index")
-                if not addr or hd_index is None:
-                    continue
-                bal = await loop.run_in_executor(None, bsc_pay.get_usdt_balance, addr)
-                if bal < 0.01:
-                    continue
-                hot = bsc_pay.get_hot_wallet_address()
-                if addr.lower() == hot.lower():
-                    continue
-                pk_hex = bsc_pay.get_user_private_key_hex(hd_index)
-                amt = round(bal - 0.01, 2)
-                r = await loop.run_in_executor(
-                    None, lambda: bsc_pay.send_usdt_from_with_gas(pk_hex, addr, hot, amt))
-                label = "BSC"
-            else:
-                import tron_pay
-                addr = state.get("tron_deposit_address", "")
-                hd_index = state.get("hd_index", state.get("tron_hd_index"))
-                if not addr or hd_index is None:
-                    continue
-                bal = await loop.run_in_executor(None, tron_pay.get_usdt_balance, addr)
-                if bal < 0.01:
-                    continue
-                hot = tron_pay.get_hot_wallet_address()
-                if addr == hot:
-                    continue
-                pk = tron_pay.get_user_private_key(hd_index)
-                amt = round(bal - 0.01, 2)
-                r = await loop.run_in_executor(
-                    None, lambda: tron_pay.send_usdt_from_with_gas(pk, hot, amt))
-                label = "TRON"
-            if r.get("ok"):
-                state["swept"] = True
-                state["swept_chain"] = ch
-                state["swept_amount"] = amt
-                state["swept_txid"] = r.get("txid", "")
-                save_deal_states()
-                logger.info(f"[Sweep] Chat {chat_id}: {amt} USDT ({label}) -> hot wallet, txid={r.get('txid')}")
-            else:
-                logger.warning(f"[Sweep] Chat {chat_id} ({label}) failed: {r.get('error')}")
-                await safe_notify_admin(
-                    f"⚠️ AUTO-SWEEP FAILED\n"
-                    f"Deal: {chat_id} ({label})\n"
-                    f"Amount: {amt} USDT on <code>{addr}</code>\n"
-                    f"Error: {r.get('error', '?')}\n"
-                    f"Sweep it manually via wallet bot → 🤝 Deal Funds."
-                )
-        except Exception as e:
-            logger.error(f"[Sweep] Chat {chat_id} ({ch}) error: {e}")
-            await safe_notify_admin(
-                f"⚠️ AUTO-SWEEP ERROR\nDeal: {chat_id} ({ch})\nError: {e}\n"
-                f"Sweep it manually via wallet bot → 🤝 Deal Funds."
-            )
 
 
 async def send_action_buttons_to_all(chat_id: int):
@@ -2517,8 +2441,8 @@ async def do_admin_confirm(chat_id: int, user: types.User):
         parse_mode="HTML",
     )
     await send_action_buttons_to_all(chat_id)
-    # Sweep deal funds to the hot wallet (both chains — admin confirmed manually).
-    asyncio.create_task(auto_sweep_deal_to_hotwallet(chat_id))
+    # NOTE (Shawn, 2026-10-12): NO auto-sweep — funds stay on the deal address
+    # (no double fee). Admin pays out directly from the deal address.
     asyncio.create_task(schedule_deadline_reminder(chat_id))
 
 
@@ -2698,9 +2622,9 @@ async def do_release_cancel(chat_id: int, user: types.User):
 async def do_address_confirm(chat_id: int, user: types.User):
     """
     Seller types 'yes' - confirm payout address.
-    Funds were auto-swept to the hot wallet when payment was detected, so there
-    is no on-chain payout from the bot. The admin pays the seller MANUALLY via
-    the wallet bot (withdraw fee applies there).
+    Funds stay on the deal address (no auto-sweep — single gas hop).
+    The admin pays the seller MANUALLY from the deal address via the wallet
+    bot's Deal Funds section (withdraw fee applies there).
     """
     state = deal_states.get(chat_id, {})
     if state.get("stage") != "address_confirmation":
@@ -2745,7 +2669,7 @@ async def do_address_confirm(chat_id: int, user: types.User):
         f"<b>Deal Completed!</b>\n\n"
         f"{seller_name} will receive: <b>{net} USDT</b> ({chain_label})\n"
         f"Address: <code>{address}</code>\n\n"
-        f"💸 <b>Admin will send the payment shortly from the main wallet.</b>\n\n"
+        f"💸 <b>Admin will send the payment shortly from the deal escrow.</b>\n\n"
         f"<b>Thanks for choosing and trusting Baloch OTC</b>\n"
         f"<b>You can use Baloch OTC any time 24/7.</b>\n"
         f"<b>Website: https://balochotc.com/</b>",
@@ -2756,8 +2680,9 @@ async def do_address_confirm(chat_id: int, user: types.User):
         f"Deal: {chat_id}\n"
         f"Pay: <b>{amount} USDT</b> ({chain_label})\n"
         f"To: <code>{address}</code>\n\n"
-        f"Via wallet bot → 💸 Send (Admin), amount: <b>{net} USDT</b>\n"
-        f"(fee {wfee:.0f} USDT stays with you)."
+        f"Via wallet bot → 🤝 Deal Funds → 💸 Withdraw (Deal {chat_id}),\n"
+        f"enter <b>{amount} USDT</b> — seller gets <b>{net} USDT</b>\n"
+        f"(fee {wfee:.0f} USDT stays on the deal address; sweep later via Withdraw ALL)."
     )
 
 
@@ -2861,9 +2786,9 @@ async def do_refund_cancel(chat_id: int, user: types.User):
 async def do_refund_address_confirm(chat_id: int, user: types.User):
     """
     Buyer types 'yes' - confirm refund address.
-    Funds were auto-swept to the hot wallet when payment was detected, so there
-    is no on-chain refund from the bot. The admin refunds MANUALLY via the
-    wallet bot (withdraw fee applies there).
+    Funds stay on the deal address (no auto-sweep — single gas hop).
+    The admin refunds MANUALLY from the deal address via the wallet bot's
+    Deal Funds section (withdraw fee applies there).
     """
     state = deal_states.get(chat_id, {})
     if state.get("stage") != "refund_confirmation":
@@ -2924,8 +2849,9 @@ async def do_refund_address_confirm(chat_id: int, user: types.User):
         f"Deal: {chat_id}\n"
         f"Refund: <b>{amount} USDT</b> ({chain_label})\n"
         f"To: <code>{address}</code>\n\n"
-        f"Via wallet bot → 💸 Send (Admin), amount: <b>{net} USDT</b>\n"
-        f"(fee {wfee:.0f} USDT stays with you)."
+        f"Via wallet bot → 🤝 Deal Funds → 💸 Withdraw (Deal {chat_id}),\n"
+        f"enter <b>{amount} USDT</b> — buyer gets <b>{net} USDT</b>\n"
+        f"(fee {wfee:.0f} USDT stays on the deal address; sweep later via Withdraw ALL)."
     )
 
 
