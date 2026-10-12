@@ -126,7 +126,37 @@ openai_client = ai_client
 # STATE STORAGE (persisted to disk so restarts don't lose deals)
 # ----------------------------------------------
 deal_states: dict[int, dict] = {}
-payment_monitoring_tasks: dict[int, asyncio.Task] = {}
+payment_monitoring_tasks: dict[int, object] = {}  # chat_id -> task or list[task]
+
+
+def _cancel_payment_monitors(chat_id: int):
+    """Cancel payment monitor task(s) for a chat — handles a single task or a list."""
+    tasks = payment_monitoring_tasks.pop(chat_id, None)
+    if tasks is None:
+        return
+    if not isinstance(tasks, list):
+        tasks = [tasks]
+    for t in tasks:
+        try:
+            t.cancel()
+        except Exception:
+            pass
+
+
+def _cancel_sibling_monitors(chat_id: int):
+    """Cancel all payment monitors for a chat EXCEPT the currently running task."""
+    me = asyncio.current_task()
+    tasks = payment_monitoring_tasks.pop(chat_id, None)
+    if tasks is None:
+        return
+    if not isinstance(tasks, list):
+        tasks = [tasks]
+    for t in tasks:
+        if t is not me:
+            try:
+                t.cancel()
+            except Exception:
+                pass
 
 
 def save_deal_states():
@@ -796,12 +826,14 @@ async def continuous_payment_monitoring(chat_id: int, order_id: str, duration_mi
         logger.error(f"[Monitor] Chat {chat_id} - error: {e}")
 
 
-async def handle_payment_detected(chat_id: int, actual_amount: float, difference: float):
+async def handle_payment_detected(chat_id: int, actual_amount: float, difference: float, chain: str = None):
     """Handle a detected payment: auto-notify buyer, confirm deal, pin details, start deadline timer.
-    
+
     - Overpayment (difference <= 0): accept silently
     - Shortfall $1-$3 (difference 0.01-3.0): accept with note
     - Exact payment: confirm normally
+    - chain: when a chain monitor detects the payment, records which chain was paid
+      (payout/refund then follow that chain).
     """
     try:
         state = deal_states[chat_id]
@@ -813,6 +845,15 @@ async def handle_payment_detected(chat_id: int, actual_amount: float, difference
         state["stage"] = "work"
         state["payment_confirmed_at"] = time.time()
         state["actual_payment"] = actual_amount
+        if chain in ("tron", "bsc"):
+            state["chain"] = chain
+            state["deposit_address"] = state.get(
+                "bsc_deposit_address" if chain == "bsc" else "tron_deposit_address",
+                state.get("deposit_address"))
+        # NOTE: do NOT cancel monitors here — the detecting monitor is calling us,
+        # and cancelling the current task would abort this confirmation flow.
+        # Sibling monitors exit on their own once stage leaves payment_monitoring
+        # (each monitor also cancels its sibling explicitly after detection).
 
         buyer_name = await get_username(state["buyer"], "Buyer")
         seller_name = await get_username(state["seller"], "Seller")
@@ -1047,60 +1088,57 @@ def deal_hd_index(chat_id: int) -> int:
 
 
 async def show_payment_info_chain(chat_id: int, chain: str = "tron"):
-    """Show USDT deposit address — unique per deal. TRON (TRC20) default, BSC (BEP20) optional."""
+    """
+    Show USDT deposit addresses — unique per deal, BOTH networks at once.
+    Buyer pays on either TRON (TRC20) or BSC (BEP20); both are monitored and
+    the first confirmed payment wins. Payout follows the paid chain.
+    The `chain` arg is kept for back-compat and now only sets the default hint.
+    """
+    import tron_pay
     state = deal_states[chat_id]
     buyer_amount = state["buyer_amount"]
     seller_amount = state["seller_amount"]
     fee = state["fee"]
 
-    if chain == "bsc":
-        import bsc_pay
-        chain_label = "BNB Smart Chain (BEP20)"
-        token_label = "BEP20"
-        net_note = "only BNB network fee"
-    else:
-        import tron_pay
-        chain = "tron"
-        chain_label = "TRON (TRC20)"
-        token_label = "TRC20"
-        net_note = "only TRON network fee"
-
-    # Unique HD address per deal (same index scheme on both chains)
+    # Unique HD addresses per deal (same index scheme on both chains)
     hd_index = deal_hd_index(chat_id)
-    if chain == "bsc":
-        deposit_address = bsc_pay.get_user_deposit_address(hd_index)
-        state["bsc_deposit_address"] = deposit_address
-    else:
-        deposit_address = tron_pay.get_user_deposit_address(hd_index)
-        state["tron_deposit_address"] = deposit_address
-        state["tron_hd_index"] = hd_index
-    state["chain"] = chain
-    state["deposit_address"] = deposit_address
-    state["hd_index"] = hd_index
-    state["payment_order_id"] = f"{chain}-{abs(chat_id)}-{int(time.time())}"
-
-    kb_rows = [
-        [InlineKeyboardButton(text="Money Received (Admin Only)", callback_data="admin_confirm")]
-    ]
+    tron_address = tron_pay.get_user_deposit_address(hd_index)
+    state["tron_deposit_address"] = tron_address
+    state["tron_hd_index"] = hd_index
     if BSC_ENABLED:
-        if chain == "tron":
-            kb_rows.append([InlineKeyboardButton(text="💛 Pay with BNB (BEP20) instead", callback_data="paychain_bsc")])
-        else:
-            kb_rows.append([InlineKeyboardButton(text="🔴 Pay with TRON (TRC20) instead", callback_data="paychain_tron")])
-    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+        import bsc_pay
+        bsc_address = bsc_pay.get_user_deposit_address(hd_index)
+        state["bsc_deposit_address"] = bsc_address
+    else:
+        bsc_address = ""
+    state["hd_index"] = hd_index
+    state["deposit_address"] = tron_address  # default hint
+    state["chain"] = "tron"  # default hint; the paid chain overwrites this on detection
+    state["payment_order_id"] = f"deal-{abs(chat_id)}-{int(time.time())}"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Money Received (Admin Only)", callback_data="admin_confirm")]
+    ])
+
+    bsc_block = (
+        f"\n<b>USDT BEP20</b>\n"
+        f"<code>{bsc_address}</code>\n"
+    ) if bsc_address else ""
 
     payment_msg = (
         f"<b>PAYMENT INFORMATION</b>\n"
         f"{'=' * 30}\n\n"
-        f"Buyer needs to pay: <b>{buyer_amount} USDT</b> ({token_label})\n"
+        f"Buyer needs to pay: <b>{buyer_amount} USDT</b>\n"
         f"Seller will receive: <b>{seller_amount} USDT</b>\n"
         f"Escrow Fee: <b>{fee} USDT</b>\n\n"
         f"<b>Baloch Escrow fee: 3% (minimum $3)</b>\n\n"
-        f"Send <b>exactly {buyer_amount} USDT</b> ({token_label}) to:\n"
-        f"<code>{deposit_address}</code>\n\n"
-        f"⚡ <b>Zero platform fee</b> — {net_note}!\n"
-        f"🔒 <b>Unique address</b> for this deal only!\n\n"
-        f"Payment will be <b>automatically detected</b> once confirmed on {chain_label}.\n\n"
+        f"Send <b>exactly {buyer_amount} USDT</b> to <b>ONE</b> of these addresses:\n\n"
+        f"<b>USDT TRC20</b>\n"
+        f"<code>{tron_address}</code>\n"
+        f"{bsc_block}\n"
+        f"⚡ <b>Zero platform fee</b> — only network fee!\n"
+        f"🔒 <b>Unique addresses</b> for this deal only!\n\n"
+        f"Payment will be <b>automatically detected</b> once confirmed.\n\n"
         f"{'=' * 30}\n\n"
         f"<i>Admin: tap the button or reply <b>received</b> to confirm manually if needed.</i>"
     )
@@ -1108,13 +1146,13 @@ async def show_payment_info_chain(chat_id: int, chain: str = "tron"):
 
     state["stage"] = "payment_monitoring"
     state["payment_start_time"] = time.time()
-    if chat_id in payment_monitoring_tasks:
-        payment_monitoring_tasks[chat_id].cancel()
-    if chain == "bsc":
-        task = asyncio.create_task(bsc_payment_monitoring(chat_id, deposit_address, buyer_amount, duration_minutes=120))
-    else:
-        task = asyncio.create_task(tron_payment_monitoring(chat_id, deposit_address, buyer_amount, duration_minutes=120))
-    payment_monitoring_tasks[chat_id] = task
+    _cancel_payment_monitors(chat_id)
+    tasks = [asyncio.create_task(
+        tron_payment_monitoring(chat_id, tron_address, buyer_amount, duration_minutes=120))]
+    if bsc_address:
+        tasks.append(asyncio.create_task(
+            bsc_payment_monitoring(chat_id, bsc_address, buyer_amount, duration_minutes=120)))
+    payment_monitoring_tasks[chat_id] = tasks
 
 
 # Back-compat alias (single caller updated below, kept for safety)
@@ -1178,7 +1216,8 @@ async def tron_payment_monitoring(chat_id: int, address: str, expected: float, d
                         shortfall = round(expected - total_received, 2)
                         if shortfall <= 3.0:
                             # Accept: exact, overpaid, or within $3 tolerance
-                            await handle_payment_detected(chat_id, total_received, max(shortfall, 0))
+                            await handle_payment_detected(chat_id, total_received, max(shortfall, 0), chain="tron")
+                            _cancel_sibling_monitors(chat_id)
                             return
                         elif not underpay_notified:
                             underpay_notified = True
@@ -1263,7 +1302,8 @@ async def bsc_payment_monitoring(chat_id: int, address: str, expected: float, du
                 shortfall = round(expected - total_received, 2)
                 if total_received > 0 and shortfall <= 3.0:
                     # Accept: exact, overpaid, or within $3 tolerance
-                    await handle_payment_detected(chat_id, total_received, max(shortfall, 0))
+                    await handle_payment_detected(chat_id, total_received, max(shortfall, 0), chain="bsc")
+                    _cancel_sibling_monitors(chat_id)
                     return
                 elif total_received > 0 and not underpay_notified:
                     underpay_notified = True
@@ -1368,8 +1408,7 @@ async def show_payment_info_cryptomus(chat_id: int):
     state["stage"] = "payment_monitoring"
     state["payment_start_time"] = time.time()
 
-    if chat_id in payment_monitoring_tasks:
-        payment_monitoring_tasks[chat_id].cancel()
+    _cancel_payment_monitors(chat_id)
 
     task = asyncio.create_task(continuous_payment_monitoring(chat_id, order_id, duration_minutes=120))
     payment_monitoring_tasks[chat_id] = task
@@ -2063,8 +2102,7 @@ async def do_fee_option_buyer_confirm(chat_id: int, user: types.User, action: st
         await bot.send_message(chat_id, fee_msg, parse_mode="HTML", reply_markup=fee_kb)
         state["stage"] = "seller_fee_payment"
 
-        if chat_id in payment_monitoring_tasks:
-            payment_monitoring_tasks[chat_id].cancel()
+        _cancel_payment_monitors(chat_id)
 
         async def monitor_seller_fee():
             try:
@@ -2369,9 +2407,7 @@ async def do_address_confirm(chat_id: int, user: types.User):
             parse_mode="HTML",
         )
         # Wipe deal state ONLY on confirmed success
-        if chat_id in payment_monitoring_tasks:
-            payment_monitoring_tasks[chat_id].cancel()
-            del payment_monitoring_tasks[chat_id]
+        _cancel_payment_monitors(chat_id)
         del deal_states[chat_id]
         save_deal_states()
     else:
@@ -2525,9 +2561,7 @@ async def do_refund_address_confirm(chat_id: int, user: types.User):
             parse_mode="HTML",
         )
         # Wipe deal state ONLY on confirmed success
-        if chat_id in payment_monitoring_tasks:
-            payment_monitoring_tasks[chat_id].cancel()
-            del payment_monitoring_tasks[chat_id]
+        _cancel_payment_monitors(chat_id)
         del deal_states[chat_id]
         save_deal_states()
     else:
@@ -3722,34 +3756,6 @@ async def handle_admin_confirm(callback: CallbackQuery):
         pass
 
 
-# -- Payment chain toggle: TRON (TRC20) <-> BSC (BEP20) --
-@dp.callback_query(F.data.in_(["paychain_bsc", "paychain_tron"]))
-async def handle_paychain_toggle(callback: CallbackQuery):
-    chat_id = callback.message.chat.id
-    user = callback.from_user
-    state = deal_states.get(chat_id, {})
-    if state.get("stage") not in ("payment", "payment_monitoring"):
-        await callback.answer("Payment window is over.", show_alert=True)
-        return
-    # Only the buyer (who pays) or an admin may switch the network
-    if not (user.id == state.get("buyer") or _is_admin_user(user)):
-        await callback.answer("Only the buyer or admin can switch the network.", show_alert=True)
-        return
-    if not BSC_ENABLED:
-        await callback.answer("BNB network is not enabled.", show_alert=True)
-        return
-    new_chain = "bsc" if callback.data == "paychain_bsc" else "tron"
-    if state.get("chain", "tron") == new_chain:
-        await callback.answer()
-        return
-    await callback.answer(f"Switched to {'BNB (BEP20)' if new_chain == 'bsc' else 'TRON (TRC20)'}")
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-    await show_payment_info_chain(chat_id, new_chain)
-
-
 # -- Dispute callback (legacy: old button messages still work) --
 @dp.callback_query(F.data == "dispute")
 async def handle_dispute(callback: CallbackQuery):
@@ -3961,6 +3967,25 @@ async def main():
                     f"Status unknown - verify on Cryptomus before re-attempting."
                 )
             elif r_state.get("stage") == "payment_monitoring" and r_state.get("payment_order_id"):
+                order_id = r_state.get("payment_order_id", "")
+                if order_id.startswith("deal-"):
+                    # Direct-chain deal: resume BOTH chain monitors
+                    import tron_pay as _tp
+                    tasks = []
+                    taddr = r_state.get("tron_deposit_address")
+                    if taddr:
+                        tasks.append(asyncio.create_task(tron_payment_monitoring(
+                            r_chat_id, taddr, r_state.get("buyer_amount", 0), duration_minutes=120)))
+                    if BSC_ENABLED:
+                        import bsc_pay as _bp
+                        baddr = r_state.get("bsc_deposit_address")
+                        if baddr:
+                            tasks.append(asyncio.create_task(bsc_payment_monitoring(
+                                r_chat_id, baddr, r_state.get("buyer_amount", 0), duration_minutes=120)))
+                    if tasks:
+                        payment_monitoring_tasks[r_chat_id] = tasks
+                        logger.info(f"Resumed chain payment monitoring for chat {r_chat_id}")
+                    continue
                 task = asyncio.create_task(
                     continuous_payment_monitoring(
                         r_chat_id, r_state["payment_order_id"], duration_minutes=120

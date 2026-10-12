@@ -47,6 +47,14 @@ BSC_ENABLED = USE_BSC and BSC_AVAILABLE
 
 CHAIN_LABEL = {"tron": "TRON (TRC20)", "bsc": "BNB Smart Chain (BEP20)"}
 GAS_LABEL = {"tron": "TRX", "bsc": "BNB"}
+# Flat withdraw fee (deducted from the amount; recipient gets amount - fee).
+# Gas is separate: always auto-funded from the hot wallet, never from the user.
+WITHDRAW_FEE = {"tron": 3.0, "bsc": 1.0}
+
+
+def _fee_notice(chain: str) -> str:
+    return (f"⛽ Deduction fee: <b>{WITHDRAW_FEE[chain]:.0f} USDT</b> "
+            f"({CHAIN_LABEL[chain]}) — recipient ko itna kam milega.")
 EXPLORER_TX = {
     "tron": "https://tronscan.org/#/transaction/",
     "bsc": "https://bscscan.com/tx/",
@@ -421,18 +429,19 @@ async def cb_user_wd_confirm(callback: types.CallbackQuery):
         return
     await callback.message.answer("⏳ Funding gas from hot wallet + broadcasting...")
     loop = asyncio.get_event_loop()
+    net = st.get("net", st.get("amount", 0))
     def _do():
         if chain == "bsc":
             pk_hex = bsc_pay.get_user_private_key_hex(st["user_index"])
-            return bsc_pay.send_usdt_from_with_gas(pk_hex, st["user_addr"], st["address"], st["amount"])
+            return bsc_pay.send_usdt_from_with_gas(pk_hex, st["user_addr"], st["address"], net)
         pk = tron_pay.get_user_private_key(st["user_index"])
-        return tron_pay.send_usdt_from_with_gas(pk, st["address"], st["amount"])
+        return tron_pay.send_usdt_from_with_gas(pk, st["address"], net)
     result = await loop.run_in_executor(None, _do)
     user_state.pop(uid, None)
     if result.get("ok"):
         txid = result.get("txid", "")
         await callback.message.answer(
-            f"✅ <b>Withdrawn!</b> ({CHAIN_LABEL[chain]})\n\nAmount: <b>{st.get('amount', 0)} USDT</b>\n"
+            f"✅ <b>Withdrawn!</b> ({CHAIN_LABEL[chain]})\n\nRecipient got: <b>{net} USDT</b>\n"
             f"TxID: <code>{txid}</code>\n"
             f"{EXPLORER_TX[chain]}{txid}",
             parse_mode="HTML", reply_markup=admin_menu(chain))
@@ -523,24 +532,26 @@ async def cb_deal_wd_confirm(callback: types.CallbackQuery):
         return
     await callback.message.answer("⏳ Funding gas from hot wallet + broadcasting...")
     loop = asyncio.get_event_loop()
+    net = st.get("net", st.get("amount", 0))
     def _do():
         if chain == "bsc":
             if st.get("hd_index") is None:
                 # v1-style deal: funds sit on the hot wallet itself
-                return bsc_pay.send_usdt(st["address"], st["amount"])
+                return bsc_pay.send_usdt(st["address"], net)
             pk_hex = bsc_pay.get_user_private_key_hex(st["hd_index"])
-            return bsc_pay.send_usdt_from_with_gas(pk_hex, st["deal_addr"], st["address"], st["amount"])
+            return bsc_pay.send_usdt_from_with_gas(pk_hex, st["deal_addr"], st["address"], net)
         if st.get("hd_index") is None:
             # v1-style deal: funds sit on the hot wallet itself
-            return tron_pay.send_usdt(st["address"], st["amount"])
+            return tron_pay.send_usdt(st["address"], net)
         pk = tron_pay.get_user_private_key(st["hd_index"])
-        return tron_pay.send_usdt_from_with_gas(pk, st["address"], st["amount"])
+        return tron_pay.send_usdt_from_with_gas(pk, st["address"], net)
     result = await loop.run_in_executor(None, _do)
     user_state.pop(uid, None)
     if result.get("ok"):
         txid = result.get("txid", "")
         await callback.message.answer(
-            f"✅ <b>Withdrawn!</b> ({CHAIN_LABEL[chain]})\n\nTxID: <code>{txid}</code>\n"
+            f"✅ <b>Withdrawn!</b> ({CHAIN_LABEL[chain]})\n\nRecipient got: <b>{net} USDT</b>\n"
+            f"TxID: <code>{txid}</code>\n"
             f"{EXPLORER_TX[chain]}{txid}",
             parse_mode="HTML", reply_markup=admin_menu(chain))
     else:
@@ -929,7 +940,9 @@ async def handle_text(message: types.Message):
             return
         st["address"] = text
         st["step"] = "user_withdraw_amount"
-        await message.answer("💰 Send the amount in USDT (or 'max' for full balance):")
+        await message.answer(
+            f"💰 Send the amount in USDT (or 'max' for full balance):\n\n{_fee_notice(chain)}",
+            parse_mode="HTML")
         return
     if st["step"] == "user_withdraw_amount":
         chain = st.get("chain", "tron")
@@ -955,7 +968,17 @@ async def handle_text(message: types.Message):
             except ValueError:
                 await message.answer("❌ Invalid amount. Try again (or 'max'):")
                 return
+        fee = WITHDRAW_FEE[chain]
+        if amt <= fee:
+            await message.answer(
+                f"❌ Amount fee se zyada hona chahiye.\n"
+                f"Deduction fee: <b>{fee:.0f} USDT</b> — kam se kam <b>{fee + 0.01:.2f} USDT</b> likho.",
+                parse_mode="HTML")
+            return
+        net = round(amt - fee, 2)
         st["amount"] = amt
+        st["fee"] = fee
+        st["net"] = net
         st["user_addr"] = user_addr
         st["user_index"] = user_index
         un = f"@{rec['username']}" if rec.get("username") else rec.get("first_name", "")
@@ -964,7 +987,9 @@ async def handle_text(message: types.Message):
             [InlineKeyboardButton(text="❌ Cancel", callback_data="user_wd_confirm_no")],
         ])
         await message.answer(
-            f"Confirm withdraw ({CHAIN_LABEL[chain]}):\n\n<b>{amt} USDT</b>\nFrom: {un}\n<code>{user_addr}</code>\nTo: <code>{st['address']}</code>\n\n"
+            f"Confirm withdraw ({CHAIN_LABEL[chain]}):\n\nAmount: <b>{amt} USDT</b>\n"
+            f"Deduction fee: <b>{fee:.0f} USDT</b>\n"
+            f"Recipient gets: <b>{net} USDT</b>\n\nFrom: {un}\n<code>{user_addr}</code>\nTo: <code>{st['address']}</code>\n\n"
             f"<i>⛽ Gas ({GAS_LABEL[chain]}) auto-funded from your hot wallet, leftover swept back.</i>",
             parse_mode="HTML", reply_markup=kb)
         return
@@ -976,7 +1001,9 @@ async def handle_text(message: types.Message):
             return
         st["address"] = text.strip()
         st["step"] = "deal_withdraw_amount"
-        await message.answer("💰 Send the amount in USDT (or 'max' for full balance):")
+        await message.answer(
+            f"💰 Send the amount in USDT (or 'max' for full balance):\n\n{_fee_notice(chain)}",
+            parse_mode="HTML")
         return
     if st["step"] == "deal_withdraw_amount":
         import json
@@ -1010,7 +1037,17 @@ async def handle_text(message: types.Message):
             except ValueError:
                 await message.answer("❌ Invalid amount. Try again (or 'max'):")
                 return
+        fee = WITHDRAW_FEE[chain]
+        if amt <= fee:
+            await message.answer(
+                f"❌ Amount fee se zyada hona chahiye.\n"
+                f"Deduction fee: <b>{fee:.0f} USDT</b> — kam se kam <b>{fee + 0.01:.2f} USDT</b> likho.",
+                parse_mode="HTML")
+            return
+        net = round(amt - fee, 2)
         st["amount"] = amt
+        st["fee"] = fee
+        st["net"] = net
         st["deal_addr"] = deal_addr
         st["hd_index"] = hd_index
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1018,7 +1055,9 @@ async def handle_text(message: types.Message):
             [InlineKeyboardButton(text="❌ Cancel", callback_data="deal_wd_confirm_no")],
         ])
         await message.answer(
-            f"Confirm withdraw from deal:\n\n<b>{amt} USDT</b>\nFrom: <code>{deal_addr}</code>\nTo: <code>{st['address']}</code>",
+            f"Confirm withdraw from deal ({CHAIN_LABEL[chain]}):\n\nAmount: <b>{amt} USDT</b>\n"
+            f"Deduction fee: <b>{fee:.0f} USDT</b>\n"
+            f"Recipient gets: <b>{net} USDT</b>\n\nFrom: <code>{deal_addr}</code>\nTo: <code>{st['address']}</code>",
             parse_mode="HTML", reply_markup=kb)
         return
     if st["step"] == "address":
