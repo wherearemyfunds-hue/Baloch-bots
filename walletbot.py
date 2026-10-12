@@ -51,7 +51,7 @@ CHAIN_LABEL = {"tron": "TRON (TRC20)", "bsc": "BNB Smart Chain (BEP20)"}
 GAS_LABEL = {"tron": "TRX", "bsc": "BNB"}
 # Flat withdraw fee (deducted from the amount; recipient gets amount - fee).
 # Gas is separate: always auto-funded from the hot wallet, never from the user.
-WITHDRAW_FEE = {"tron": 3.0, "bsc": 1.0}
+WITHDRAW_FEE = {"tron": 3.5, "bsc": 1.0}
 
 
 def _fee_notice(chain: str) -> str:
@@ -996,7 +996,7 @@ async def handle_text(message: types.Message):
         if amt <= fee:
             await message.answer(
                 f"❌ Amount must be greater than the fee.\n"
-                f"Deduction fee: <b>{fee:.0f} USDT</b> — enter at least <b>{fee + 0.01:.2f} USDT</b>.",
+                f"Deduction fee: <b>{fee:g} USDT</b> — enter at least <b>{fee + 0.01:.2f} USDT</b>.",
                 parse_mode="HTML")
             return
         net = round(amt - fee, 2)
@@ -1012,7 +1012,7 @@ async def handle_text(message: types.Message):
         ])
         await message.answer(
             f"Confirm withdraw ({CHAIN_LABEL[chain]}):\n\nAmount: <b>{amt} USDT</b>\n"
-            f"Deduction fee: <b>{fee:.0f} USDT</b>\n"
+            f"Deduction fee: <b>{fee:g} USDT</b>\n"
             f"Recipient gets: <b>{net} USDT</b>\n\nFrom: {un}\n<code>{user_addr}</code>\nTo: <code>{st['address']}</code>\n\n"
             f"<i>⛽ Gas ({GAS_LABEL[chain]}) auto-funded from your hot wallet, leftover swept back.</i>",
             parse_mode="HTML", reply_markup=kb)
@@ -1065,7 +1065,7 @@ async def handle_text(message: types.Message):
         if amt <= fee:
             await message.answer(
                 f"❌ Amount must be greater than the fee.\n"
-                f"Deduction fee: <b>{fee:.0f} USDT</b> — enter at least <b>{fee + 0.01:.2f} USDT</b>.",
+                f"Deduction fee: <b>{fee:g} USDT</b> — enter at least <b>{fee + 0.01:.2f} USDT</b>.",
                 parse_mode="HTML")
             return
         net = round(amt - fee, 2)
@@ -1080,7 +1080,7 @@ async def handle_text(message: types.Message):
         ])
         await message.answer(
             f"Confirm withdraw from deal ({CHAIN_LABEL[chain]}):\n\nAmount: <b>{amt} USDT</b>\n"
-            f"Deduction fee: <b>{fee:.0f} USDT</b>\n"
+            f"Deduction fee: <b>{fee:g} USDT</b>\n"
             f"Recipient gets: <b>{net} USDT</b>\n\nFrom: <code>{deal_addr}</code>\nTo: <code>{st['address']}</code>",
             parse_mode="HTML", reply_markup=kb)
         return

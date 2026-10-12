@@ -81,7 +81,10 @@ BSC_ENABLED = USE_BSC and BSC_AVAILABLE
 
 # Flat manual-withdraw fee (wallet bot) — shown in deal bot messages so the
 # seller/buyer knows the net they will receive. KEEP IN SYNC with walletbot.py.
-WITHDRAW_FEE = {"tron": 3.0, "bsc": 1.0}
+WITHDRAW_FEE = {"tron": 3.5, "bsc": 1.0}
+# Shawn (2026-10-12): deals under 500 USDT -> BEP20 ONLY (gas ~$0.15 vs ~$2+);
+# 500 USDT and above -> both chains shown, buyer picks.
+BEP20_ONLY_BELOW = 500
 
 # Payment addresses (displayed as reference in messages)
 BEP20_ADDRESS = "0xf1a0fade24678e3331eaf915840cc6cf6a831d80"
@@ -366,11 +369,11 @@ def payout_prompt_text(chain: str = "tron") -> str:
     if chain == "bsc":
         return (f"please send your payout address (USDT <b>BEP20</b> only — starts with 0x). "
                 f"The buyer paid on BNB Smart Chain, so payout stays on this network — no conversion fee. "
-                f"Deduction fee: <b>{fee:.0f} USDT</b>.")
+                f"Deduction fee: <b>{fee:g} USDT</b>.")
     if USE_TRON and TRON_AVAILABLE:
         return (f"please send your payout address (USDT <b>TRC20</b> only — starts with T). "
                 f"The buyer paid on TRON, so payout stays on this network — no conversion fee. "
-                f"Deduction fee: <b>{fee:.0f} USDT</b>.")
+                f"Deduction fee: <b>{fee:g} USDT</b>.")
     return "please send your payout address (USDT TRC20 or USDT BEP20 only)."
 
 
@@ -380,11 +383,11 @@ def refund_prompt_text(chain: str = "tron") -> str:
     if chain == "bsc":
         return (f"please send your refund address (USDT <b>BEP20</b> only — starts with 0x). "
                 f"The buyer paid on BNB Smart Chain, so refund stays on this network — no conversion fee. "
-                f"Deduction fee: <b>{fee:.0f} USDT</b>.")
+                f"Deduction fee: <b>{fee:g} USDT</b>.")
     if USE_TRON and TRON_AVAILABLE:
         return (f"please send your refund address (USDT <b>TRC20</b> only — starts with T). "
                 f"The buyer paid on TRON, so refund stays on this network — no conversion fee. "
-                f"Deduction fee: <b>{fee:.0f} USDT</b>.")
+                f"Deduction fee: <b>{fee:g} USDT</b>.")
     return "please send your refund address (USDT TRC20 or USDT BEP20 only)."
 
 
@@ -820,7 +823,7 @@ Deal context: {context}
 Rules:
 - Chat like a smart, warm human admin. Keep it short: 1-3 sentences, chat tone.
 - {greet_rule}
-- You may explain: how escrow works; fees — escrow fee is 3% of the deal amount (minimum 3 USDT), paid by buyer / seller / split as agreed; withdraw fee 3 USDT on TRC20, 1 USDT on BEP20; blockchain gas is covered by the admin; safety tips; what happens next at this stage; timelines.
+- You may explain: how escrow works; fees — escrow fee is 3% of the deal amount (minimum 3 USDT), paid by buyer / seller / split as agreed; withdraw fee 3.5 USDT on TRC20, 1 USDT on BEP20; deals under 500 USDT go BEP20 only (cheap gas); blockchain gas is covered by the admin; safety tips; what happens next at this stage; timelines.
 - Greetings (salam/hello/hi): only on the first message, per the rule above.
 - You NEVER take deal actions yourself: never release, refund, confirm a payment, file a dispute, or change addresses. If the user asks for an action, guide them to the right button in the group (Release To Seller / Refund to Buyer / Dispute).
 - NEVER claim money was sent, released, refunded, or confirmed.
@@ -1275,47 +1278,79 @@ async def show_payment_info_chain(chat_id: int, chain: str = "tron"):
     else:
         bsc_address = ""
     state["hd_index"] = hd_index
-    state["deposit_address"] = tron_address  # default hint
-    state["chain"] = "tron"  # default hint; the paid chain overwrites this on detection
+    # Shawn (2026-10-12): small deals (< 500 USDT) -> BEP20 ONLY.
+    # Payout always follows the chain the deposit arrived on.
+    deal_amount = state.get("amount", buyer_amount)
+    bep20_only = bool(bsc_address) and deal_amount < BEP20_ONLY_BELOW
+    if bep20_only:
+        state["deposit_address"] = bsc_address
+        state["chain"] = "bsc"
+    else:
+        state["deposit_address"] = tron_address  # default hint
+        state["chain"] = "tron"  # default hint; the paid chain overwrites this on detection
     state["payment_order_id"] = f"deal-{abs(chat_id)}-{int(time.time())}"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Money Received (Admin Only)", callback_data="admin_confirm")]
     ])
 
-    bsc_block = (
-        f"\n<b>USDT BEP20</b>\n"
-        f"<code>{bsc_address}</code>\n"
-    ) if bsc_address else ""
+    if bep20_only:
+        payment_msg = (
+            f"<b>PAYMENT INFORMATION</b>\n"
+            f"{'=' * 30}\n\n"
+            f"Buyer needs to pay: <b>{buyer_amount} USDT</b>\n"
+            f"Seller will receive: <b>{seller_amount} USDT</b>\n"
+            f"Escrow Fee: <b>{fee} USDT</b>\n\n"
+            f"<b>Baloch Escrow fee: 3% (minimum $3)</b>\n\n"
+            f"💡 <i>Small deal (&lt; 500 USDT) → <b>BEP20 only</b>: "
+            f"gas ~$0.15 vs ~$2+ on TRON.</i>\n\n"
+            f"Send <b>exactly {buyer_amount} USDT</b> to this address:\n\n"
+            f"<b>USDT BEP20</b>\n"
+            f"<code>{bsc_address}</code>\n\n"
+            f"⚡ <b>Zero platform fee</b> — only network fee!\n"
+            f"🔒 <b>Unique address</b> for this deal only!\n\n"
+            f"Payment will be <b>automatically detected</b> once confirmed.\n\n"
+            f"{'=' * 30}\n\n"
+            f"<i>Admin: tap the button or reply <b>received</b> to confirm manually if needed.</i>"
+        )
+    else:
+        bsc_block = (
+            f"\n<b>USDT BEP20</b>\n"
+            f"<code>{bsc_address}</code>\n"
+        ) if bsc_address else ""
 
-    payment_msg = (
-        f"<b>PAYMENT INFORMATION</b>\n"
-        f"{'=' * 30}\n\n"
-        f"Buyer needs to pay: <b>{buyer_amount} USDT</b>\n"
-        f"Seller will receive: <b>{seller_amount} USDT</b>\n"
-        f"Escrow Fee: <b>{fee} USDT</b>\n\n"
-        f"<b>Baloch Escrow fee: 3% (minimum $3)</b>\n\n"
-        f"Send <b>exactly {buyer_amount} USDT</b> to <b>ONE</b> of these addresses:\n\n"
-        f"<b>USDT TRC20</b>\n"
-        f"<code>{tron_address}</code>\n"
-        f"{bsc_block}\n"
-        f"⚡ <b>Zero platform fee</b> — only network fee!\n"
-        f"🔒 <b>Unique addresses</b> for this deal only!\n\n"
-        f"Payment will be <b>automatically detected</b> once confirmed.\n\n"
-        f"{'=' * 30}\n\n"
-        f"<i>Admin: tap the button or reply <b>received</b> to confirm manually if needed.</i>"
-    )
+        payment_msg = (
+            f"<b>PAYMENT INFORMATION</b>\n"
+            f"{'=' * 30}\n\n"
+            f"Buyer needs to pay: <b>{buyer_amount} USDT</b>\n"
+            f"Seller will receive: <b>{seller_amount} USDT</b>\n"
+            f"Escrow Fee: <b>{fee} USDT</b>\n\n"
+            f"<b>Baloch Escrow fee: 3% (minimum $3)</b>\n\n"
+            f"Send <b>exactly {buyer_amount} USDT</b> to <b>ONE</b> of these addresses:\n\n"
+            f"<b>USDT TRC20</b>\n"
+            f"<code>{tron_address}</code>\n"
+            f"{bsc_block}\n"
+            f"⚡ <b>Zero platform fee</b> — only network fee!\n"
+            f"🔒 <b>Unique addresses</b> for this deal only!\n\n"
+            f"Payment will be <b>automatically detected</b> once confirmed.\n\n"
+            f"{'=' * 30}\n\n"
+            f"<i>Admin: tap the button or reply <b>received</b> to confirm manually if needed.</i>"
+        )
     await bot.send_message(chat_id, payment_msg, parse_mode="HTML", reply_markup=kb)
 
     state["stage"] = "payment_monitoring"
     state["payment_start_time"] = time.time()
     _cancel_payment_monitors(chat_id)
-    tasks = [asyncio.create_task(
-        tron_payment_monitoring(chat_id, tron_address, buyer_amount, duration_minutes=120))]
-    if bsc_address:
-        tasks.append(asyncio.create_task(
-            bsc_payment_monitoring(chat_id, bsc_address, buyer_amount, duration_minutes=120)))
-    payment_monitoring_tasks[chat_id] = tasks
+    if bep20_only:
+        payment_monitoring_tasks[chat_id] = [asyncio.create_task(
+            bsc_payment_monitoring(chat_id, bsc_address, buyer_amount, duration_minutes=120))]
+    else:
+        tasks = [asyncio.create_task(
+            tron_payment_monitoring(chat_id, tron_address, buyer_amount, duration_minutes=120))]
+        if bsc_address:
+            tasks.append(asyncio.create_task(
+                bsc_payment_monitoring(chat_id, bsc_address, buyer_amount, duration_minutes=120)))
+        payment_monitoring_tasks[chat_id] = tasks
 
 
 # Back-compat alias (single caller updated below, kept for safety)
@@ -2682,7 +2717,7 @@ async def do_address_confirm(chat_id: int, user: types.User):
         f"To: <code>{address}</code>\n\n"
         f"Via wallet bot → 🤝 Deal Funds → 💸 Withdraw (Deal {chat_id}),\n"
         f"enter <b>{amount} USDT</b> — seller gets <b>{net} USDT</b>\n"
-        f"(fee {wfee:.0f} USDT stays on the deal address; sweep later via Withdraw ALL)."
+        f"(fee {wfee:g} USDT stays on the deal address; sweep later via Withdraw ALL)."
     )
 
 
@@ -2851,7 +2886,7 @@ async def do_refund_address_confirm(chat_id: int, user: types.User):
         f"To: <code>{address}</code>\n\n"
         f"Via wallet bot → 🤝 Deal Funds → 💸 Withdraw (Deal {chat_id}),\n"
         f"enter <b>{amount} USDT</b> — buyer gets <b>{net} USDT</b>\n"
-        f"(fee {wfee:.0f} USDT stays on the deal address; sweep later via Withdraw ALL)."
+        f"(fee {wfee:g} USDT stays on the deal address; sweep later via Withdraw ALL)."
     )
 
 
@@ -3720,7 +3755,7 @@ async def universal_stage_handler(message: types.Message):
         await message.answer(
             f"Buyer paid: <b>{state['buyer_amount']}</b> USDT\n"
             f"Seller will receive: <b>{pnet}</b> USDT\n"
-            f"(<b>{state['seller_amount']}</b> USDT minus <b>{pwfee:.0f}</b> USDT withdraw fee)\n"
+            f"(<b>{state['seller_amount']}</b> USDT minus <b>{pwfee:g}</b> USDT withdraw fee)\n"
             f"Escrow Fee: <b>{state['fee']}</b> USDT\n\n"
             f"Is this the correct address?\n<code>{address}</code>\n"
             f"Network: <b>{verification['type']}</b>\n\n"
@@ -3754,7 +3789,7 @@ async def universal_stage_handler(message: types.Message):
         rnet = round(refund_amount - rwfee, 2)
         await message.answer(
             f"Refund amount: <b>{refund_amount} USDT</b>\n"
-            f"You will receive: <b>{rnet} USDT</b> (minus <b>{rwfee:.0f}</b> USDT withdraw fee)\n"
+            f"You will receive: <b>{rnet} USDT</b> (minus <b>{rwfee:g}</b> USDT withdraw fee)\n"
             f"Is this the correct address?\n<code>{address}</code>\n\n"
             f"Reply: <b>yes</b> / <b>no</b>",
             parse_mode="HTML",
