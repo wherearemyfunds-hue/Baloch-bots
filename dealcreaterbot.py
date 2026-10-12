@@ -27,20 +27,28 @@ import os
 import re
 import sys
 import tempfile
+import time
 import traceback
 import urllib.parse
 from datetime import datetime, date
 from logging.handlers import RotatingFileHandler
 
 from telethon import TelegramClient, events, Button
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, UserAlreadyParticipantError
 from telethon.tl.functions.channels import (
     CreateChannelRequest,
     InviteToChannelRequest,
     EditAdminRequest,
+    EditTitleRequest,
+    EditBannedRequest,
 )
-from telethon.tl.functions.messages import ExportChatInviteRequest, ImportChatInviteRequest
-from telethon.tl.types import ChatAdminRights
+from telethon.tl.functions.messages import (
+    ExportChatInviteRequest,
+    ImportChatInviteRequest,
+    EditExportedChatInviteRequest,
+    GetExportedChatInvitesRequest,
+)
+from telethon.tl.types import ChatAdminRights, ChatBannedRights
 
 # ==================== BASE DIRECTORY (absolute paths) ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -203,6 +211,297 @@ async def commit_group_number(number):
         if number > _counter_high_water[0]:
             _counter_high_water[0] = number
         _write_counter_atomic(_counter_high_water[0])
+
+
+# ==================== GROUP RECYCLE POOL ====================
+# Shawn (2026-10-12): reuse dead deal groups instead of creating new ones.
+# A group becomes spare when: age >= 2 days, NO payment ever confirmed,
+# and no messages for 2 days. Reuse renames it, wipes history, kicks
+# non-service members, revokes invite links, and bumps addr_gen so the
+# new deal gets FRESH deposit addresses (no confusion with late payments
+# to the old address). Deal numbers keep incrementing normally.
+POOL_FILE = os.path.join(BASE_DIR, "group_pool.json")
+RECYCLE_AFTER_DAYS = 2
+RECYCLE_IDLE_DAYS = 2
+DEAL_BOT_USERNAME = "Baloch_Escrow2_bot"
+
+
+def _load_pool() -> dict:
+    try:
+        if os.path.exists(POOL_FILE):
+            with open(POOL_FILE, "r") as f:
+                d = json.load(f)
+                d.setdefault("groups", {})
+                d.setdefault("needs_reset", [])
+                return d
+    except Exception as e:
+        logger.error(f"pool load failed: {e}")
+    return {"groups": {}, "needs_reset": []}
+
+
+def _save_pool(pool: dict):
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=BASE_DIR, prefix=".pool", suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(pool, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, POOL_FILE)
+    except Exception as e:
+        logger.error(f"pool save failed: {e}")
+        try:
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+def _full_chat_id(bare_id: int) -> int:
+    """Telethon channel id -> full -100... chat id (matches deal bot's chat_id)."""
+    return int(f"-100{bare_id}")
+
+
+def _register_group(chat_id: int, deal_no: int, title: str):
+    pool = _load_pool()
+    g = pool["groups"].setdefault(str(chat_id), {})
+    g.update({
+        "created_at": time.time(),
+        "status": "active",
+        "deal_no": deal_no,
+        "title": title,
+        "addr_gen": g.get("addr_gen", 0),
+    })
+    _save_pool(pool)
+
+
+def _get_spare_group():
+    """Oldest spare group's full chat id, or None."""
+    pool = _load_pool()
+    spares = [
+        (g.get("created_at", 0), cid)
+        for cid, g in pool["groups"].items()
+        if g.get("status") == "spare"
+    ]
+    if not spares:
+        return None
+    spares.sort()
+    return int(spares[0][1])
+
+
+def _mark_active(chat_id: int, deal_no: int, title: str):
+    """Mark a reused spare as active; bump addr_gen for fresh deposit addresses."""
+    pool = _load_pool()
+    g = pool["groups"].setdefault(str(chat_id), {})
+    g.update({
+        "created_at": g.get("created_at", time.time()),
+        "status": "active",
+        "deal_no": deal_no,
+        "title": title,
+        "addr_gen": g.get("addr_gen", 0) + 1,
+    })
+    _save_pool(pool)
+
+
+def _needs_reset_add(chat_id: int):
+    """Signal the deal bot to reset its in-memory state for this group on next join."""
+    pool = _load_pool()
+    key = str(chat_id)
+    if key not in pool["needs_reset"]:
+        pool["needs_reset"].append(key)
+    _save_pool(pool)
+
+
+async def _service_ids() -> set:
+    """User/bot ids that must NEVER be kicked from a deal group."""
+    ids = set()
+    try:
+        me = await user_client.get_me()
+        ids.add(me.id)
+    except Exception:
+        pass
+    try:
+        old_me = await old_client.get_me()
+        ids.add(old_me.id)
+    except Exception:
+        pass
+    for uname in (ADD_BOT_USERNAME, SUPPORT_USERNAME, DEAL_BOT_USERNAME):
+        try:
+            ent = await user_client.get_entity(uname)
+            ids.add(ent.id)
+        except Exception:
+            pass
+    return ids
+
+
+async def _clear_group_history(channel):
+    try:
+        batch = []
+        async for m in user_client.iter_messages(channel, limit=10000):
+            batch.append(m.id)
+            if len(batch) >= 100:
+                try:
+                    await user_client.delete_messages(channel, batch)
+                except Exception:
+                    pass
+                batch = []
+        if batch:
+            try:
+                await user_client.delete_messages(channel, batch)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"clear history failed: {e}")
+
+
+async def _kick_non_service(channel):
+    try:
+        keep = await _service_ids()
+        async for u in user_client.iter_participants(channel):
+            if u.id in keep or getattr(u, "bot", False):
+                continue
+            try:
+                await user_client(EditBannedRequest(
+                    channel, u.id,
+                    ChatBannedRights(until_date=None, view_messages=True)))
+                logger.info(f"kicked {u.id} from recycled group")
+            except Exception as e:
+                logger.warning(f"kick {u.id} failed: {e}")
+    except Exception as e:
+        logger.warning(f"kick sweep failed: {e}")
+
+
+async def _revoke_invite_links(channel):
+    try:
+        cur = await user_client(ExportChatInviteRequest(peer=channel))
+        link = getattr(cur, "link", None)
+        if link:
+            try:
+                await user_client(EditExportedChatInviteRequest(
+                    peer=channel, link=link, revoked=True))
+            except Exception as e:
+                logger.warning(f"revoke primary link failed: {e}")
+    except Exception as e:
+        logger.warning(f"export current link failed: {e}")
+    try:
+        me = await user_client.get_me()
+        invs = await user_client(GetExportedChatInvitesRequest(
+            peer=channel, admin_id=me.id, limit=50))
+        for iv in getattr(invs, "invites", []) or []:
+            try:
+                await user_client(EditExportedChatInviteRequest(
+                    peer=channel, link=iv.link, revoked=True))
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"revoke extra links failed: {e}")
+
+
+async def _prepare_spare_group(entity, new_title: str) -> bool:
+    """Rename + wipe + revoke a spare group for reuse. Returns True on success."""
+    try:
+        await user_client(EditTitleRequest(channel=entity, title=new_title))
+    except Exception as e:
+        logger.error(f"spare rename failed: {e}")
+        return False
+    await _clear_group_history(entity)
+    await _kick_non_service(entity)
+    await _revoke_invite_links(entity)
+    return True
+
+
+def _load_deal_states_file() -> dict:
+    try:
+        with open(os.path.join(BASE_DIR, "deal_states.json"), "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+async def _recycle_group_to_spare(chat_id: int, title: str) -> bool:
+    try:
+        entity = await user_client.get_entity(chat_id)
+    except Exception as e:
+        logger.error(f"recycle: get_entity {chat_id} failed: {e}")
+        return False
+    await _clear_group_history(entity)
+    await _kick_non_service(entity)
+    await _revoke_invite_links(entity)
+    try:
+        spare_title = title if title.endswith("♻️") else f"{title} ♻️"
+        await user_client(EditTitleRequest(channel=entity, title=spare_title))
+    except Exception as e:
+        logger.warning(f"recycle rename failed: {e}")
+    return True
+
+
+async def _recycle_scan():
+    """Daily: discover deal groups, move dead ones (2d+, no payment, idle 2d) to spare."""
+    if not USER_CLIENT_AVAILABLE:
+        logger.warning("recycle scan skipped: user client unavailable")
+        return
+    if not await ensure_client_connected(user_client, "NEW"):
+        logger.warning("recycle scan skipped: could not connect user client")
+        return
+    pool = _load_pool()
+    # --- discover existing deal groups not yet tracked ---
+    try:
+        async for d in user_client.iter_dialogs():
+            ent = d.entity
+            if not getattr(ent, "megagroup", False):
+                continue
+            title = getattr(ent, "title", "") or ""
+            if not title.startswith(GROUP_BASE_NAME):
+                continue
+            cid = _full_chat_id(ent.id)
+            if str(cid) not in pool["groups"]:
+                created = getattr(ent, "date", None)
+                pool["groups"][str(cid)] = {
+                    "created_at": created.timestamp() if created else time.time(),
+                    "status": "spare" if title.endswith("♻️") else "active",
+                    "deal_no": None,
+                    "title": title,
+                    "addr_gen": 0,
+                }
+                logger.info(f"recycle: discovered group {cid} '{title}'")
+    except Exception as e:
+        logger.error(f"recycle discovery failed: {e}")
+    # --- evaluate active groups ---
+    deal_states = _load_deal_states_file()
+    now = time.time()
+    for cid_str, g in list(pool["groups"].items()):
+        if g.get("status") != "active":
+            continue
+        if now - g.get("created_at", now) < RECYCLE_AFTER_DAYS * 86400:
+            continue
+        cid = int(cid_str)
+        st = deal_states.get(cid_str)
+        if st and st.get("payment_confirmed_at"):
+            continue  # payment happened — never recycle
+        try:
+            msgs = await user_client.get_messages(cid, limit=1)
+        except Exception as e:
+            logger.warning(f"recycle: history check {cid} failed: {e}")
+            continue
+        last_ts = msgs[0].date.timestamp() if msgs else g.get("created_at", 0)
+        if now - last_ts < RECYCLE_IDLE_DAYS * 86400:
+            continue
+        logger.info(f"recycle: {cid} eligible -> spare")
+        if await _recycle_group_to_spare(cid, g.get("title") or GROUP_BASE_NAME):
+            g["status"] = "spare"
+            logger.info(f"recycle: {cid} is now spare")
+    _save_pool(pool)
+
+
+async def recycle_loop():
+    """Daily maintenance: recycle dead deal groups into the spare pool."""
+    await asyncio.sleep(600)  # let startup settle
+    while True:
+        try:
+            await _recycle_scan()
+        except Exception as e:
+            logger.error(f"recycle scan error: {e}")
+        await asyncio.sleep(24 * 3600)
 
 
 # ==================== RATE LIMITING ====================
@@ -485,6 +784,8 @@ async def invite_and_promote(invite_client, channel, username_or_id, rank, label
             InviteToChannelRequest(channel=channel, users=[username_or_id])
         )
         logger.info(f"INVITED ({label}): {username_or_id}")
+    except UserAlreadyParticipantError:
+        logger.info(f"Already a member ({label}): {username_or_id} — proceeding to promote")
     except Exception as e:
         logger.error(f"FAILED to invite ({label}) {username_or_id}: {e}")
         return False
@@ -568,9 +869,9 @@ async def xxin_spam_delete_handler(event):
 
 # ==================== BOT HANDLERS ====================
 
-@bot_client.on(events.NewMessage(pattern=r"^/start$"))
+@bot_client.on(events.NewMessage(pattern=r"^/start(\s.*)?$"))
 async def start_handler(event):
-    """Handle /start command."""
+    """Handle /start command (with or without deep-link payload, e.g. ?start=1)."""
     try:
         logger.info(f"/start from user {event.sender_id}")
         try:
@@ -678,44 +979,67 @@ async def group_link_handler(event):
             )
             return
 
-        # ---------- STEP 1: create supergroup ----------
+        # ---------- STEP 1: reuse spare group or create supergroup ----------
         group_num = await peek_next_group_number()
         group_title = f"{GROUP_BASE_NAME} {group_num}"
-        logger.info(f"Creating group: {group_title}")
+        created_group = None
+        group_id = None
+        reused_spare_id = None
 
-        try:
-            ch_res = await user_client(
-                CreateChannelRequest(
-                    title=group_title,
-                    about=f"Baloch Escrow Deal #{group_num} - Secure Transaction Group",
-                    megagroup=True,
+        spare_chat_id = _get_spare_group()
+        if spare_chat_id:
+            try:
+                _ent = await user_client.get_entity(spare_chat_id)
+                logger.info(f"Trying spare group reuse: {spare_chat_id}")
+                if await _prepare_spare_group(_ent, group_title):
+                    created_group = _ent
+                    group_id = _ent.id
+                    reused_spare_id = spare_chat_id
+                    logger.info(f"REUSED spare group '{group_title}' ({spare_chat_id})")
+            except Exception as e:
+                logger.error(f"Spare reuse failed, creating new: {e}")
+                created_group = None
+
+        if created_group is None:
+            logger.info(f"Creating group: {group_title}")
+
+            try:
+                ch_res = await user_client(
+                    CreateChannelRequest(
+                        title=group_title,
+                        about=f"Baloch Escrow Deal #{group_num} - Secure Transaction Group",
+                        megagroup=True,
+                    )
                 )
-            )
-            created_group = ch_res.chats[0]
-            group_id = created_group.id
-            logger.info(f"CREATED: '{group_title}' (ID: {group_id})")
-        except FloodWaitError as e:
-            logger.error(f"FloodWait on group creation: {e.seconds}s")
-            await bot_client.send_message(
-                user_id,
-                "<b>⏳ Telegram rate limit hit</b>\n\n"
-                "Too many groups created recently. Please try again in a few minutes.",
-                parse_mode="html",
-            )
-            return
-        except Exception as e:
-            logger.error(f"FAILED to create supergroup: {e}")
-            await bot_client.send_message(
-                user_id,
-                "<b>❌ Failed to create group</b>\n\n"
-                f"<b>Error:</b> <code>{html.escape(str(e))}</code>\n\n"
-                f"Please try again later or contact {SUPPORT_CONTACT}.",
-                parse_mode="html",
-            )
-            return
+                created_group = ch_res.chats[0]
+                group_id = created_group.id
+                logger.info(f"CREATED: '{group_title}' (ID: {group_id})")
+                _register_group(_full_chat_id(group_id), group_num, group_title)
+            except FloodWaitError as e:
+                logger.error(f"FloodWait on group creation: {e.seconds}s")
+                await bot_client.send_message(
+                    user_id,
+                    "<b>⏳ Telegram rate limit hit</b>\n\n"
+                    "Too many groups created recently. Please try again in a few minutes.",
+                    parse_mode="html",
+                )
+                return
+            except Exception as e:
+                logger.error(f"FAILED to create supergroup: {e}")
+                await bot_client.send_message(
+                    user_id,
+                    "<b>❌ Failed to create group</b>\n\n"
+                    f"<b>Error:</b> <code>{html.escape(str(e))}</code>\n\n"
+                    f"Please try again later or contact {SUPPORT_CONTACT}.",
+                    parse_mode="html",
+                )
+                return
 
-        # Number is consumed only after successful creation
+        # Number is consumed only after successful creation/reuse
         await commit_group_number(group_num)
+        if reused_spare_id:
+            _mark_active(reused_spare_id, group_num, group_title)
+            _needs_reset_add(reused_spare_id)
 
         # ---------- STEP 2: invite + promote helper bot ----------
         bot_admin_ok = await invite_and_promote(
@@ -885,6 +1209,7 @@ async def group_link_handler(event):
 # ==================== REMINDER SYSTEM ====================
 
 _reminder_task = None
+_recycle_task = None
 
 
 async def reminder_loop():
@@ -965,9 +1290,10 @@ async def main():
     current = _read_counter_file()
     logger.info(f"Group counter: {current}, next: {(current or STARTING_GROUP_NUMBER) + 1}")
 
-    global _reminder_task, _broadcast_task
+    global _reminder_task, _broadcast_task, _recycle_task
     _reminder_task = asyncio.create_task(reminder_loop())
     _broadcast_task = asyncio.create_task(broadcast_watcher())
+    _recycle_task = asyncio.create_task(recycle_loop())
 
     logger.info("BOT IS NOW RUNNING AND READY")
     logger.info(f"Deal Handler Bot : @{ADD_BOT_USERNAME}")
@@ -976,7 +1302,7 @@ async def main():
     try:
         await bot_client.run_until_disconnected()
     finally:
-        for _t in (_reminder_task, globals().get("_broadcast_task")):
+        for _t in (_reminder_task, globals().get("_broadcast_task"), globals().get("_recycle_task")):
             if _t:
                 _t.cancel()
                 try:

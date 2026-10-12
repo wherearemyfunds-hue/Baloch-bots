@@ -23,6 +23,7 @@ import base64
 import logging
 import os
 import re
+import tempfile
 import time
 import uuid as uuid_lib
 from datetime import datetime, timedelta
@@ -309,6 +310,79 @@ async def cryptomus_check_payout(order_id: str) -> dict:
 
 def is_baloch_deal_group(group_name: str) -> bool:
     return bool(group_name and re.match(r"Baloch Escrow Deal \d+", group_name))
+
+
+# --- Group recycle support (shared pool file with the creator bot) ---
+# When the creator bot reuses a spare group, it flags the chat in
+# group_pool.json: "needs_reset" (deal state must restart) and bumps
+# "addr_gen" (fresh deposit addresses per reuse, so a late payment to an
+# old address can never be mistaken for the new deal's payment).
+POOL_FILE = os.path.join(BASE_DIR, "group_pool.json")
+ADDR_GEN_STEP = 100_000_000
+
+
+def _consume_recycled_reset(chat_id: int) -> bool:
+    """True if the creator bot recycled this group and its deal state must reset."""
+    try:
+        if not os.path.exists(POOL_FILE):
+            return False
+        with open(POOL_FILE, "r") as f:
+            pool = json.load(f)
+        key = str(chat_id)
+        if key in pool.get("needs_reset", []):
+            pool["needs_reset"].remove(key)
+            fd, tmp = tempfile.mkstemp(dir=BASE_DIR, prefix=".pool", suffix=".tmp")
+            with os.fdopen(fd, "w") as fo:
+                json.dump(pool, fo, indent=2)
+                fo.flush()
+                os.fsync(fo.fileno())
+            os.replace(tmp, POOL_FILE)
+            return True
+    except Exception as e:
+        logger.warning(f"recycled reset check failed: {e}")
+    return False
+
+
+def _deal_addr_gen(chat_id: int) -> int:
+    """Address generation for this group (0 for never-recycled)."""
+    try:
+        with open(POOL_FILE, "r") as f:
+            pool = json.load(f)
+        return int(pool.get("groups", {}).get(str(chat_id), {}).get("addr_gen", 0))
+    except Exception:
+        return 0
+
+
+def _maybe_reset_recycled_group(chat_id: int) -> bool:
+    """Reset in-memory deal state if this group was just recycled. Returns True if reset."""
+    if _consume_recycled_reset(chat_id):
+        deal_states[chat_id] = {"stage": "role_selection", "members": {}, "conversation_history": []}
+        try:
+            save_deal_states()
+        except Exception:
+            pass
+        logger.info(f"Recycled group {chat_id}: deal state reset for new deal")
+        return True
+    return False
+
+
+_pool_reset_cache = {"mtime": 0.0, "pending": set()}
+
+
+def _recycled_pending() -> set:
+    """Chat ids flagged for reset (mtime-guarded, cheap to call per message)."""
+    try:
+        mt = os.path.getmtime(POOL_FILE)
+    except OSError:
+        return set()
+    if mt != _pool_reset_cache["mtime"]:
+        _pool_reset_cache["mtime"] = mt
+        try:
+            with open(POOL_FILE, "r") as f:
+                _pool_reset_cache["pending"] = set(json.load(f).get("needs_reset", []))
+        except Exception:
+            _pool_reset_cache["pending"] = set()
+    return _pool_reset_cache["pending"]
 
 
 def generate_order_id(chat_id: int, prefix: str = "deal") -> str:
@@ -1266,8 +1340,10 @@ async def show_payment_info_chain(chat_id: int, chain: str = "tron"):
     seller_amount = state["seller_amount"]
     fee = state["fee"]
 
-    # Unique HD addresses per deal (same index scheme on both chains)
-    hd_index = deal_hd_index(chat_id)
+    # Unique HD addresses per deal (same index scheme on both chains).
+    # addr_gen bumps on every group recycle -> fresh addresses per reuse,
+    # so a late payment to an old address can never false-trigger the new deal.
+    hd_index = deal_hd_index(chat_id) + _deal_addr_gen(chat_id) * ADDR_GEN_STEP
     tron_address = tron_pay.get_user_deposit_address(hd_index)
     state["tron_deposit_address"] = tron_address
     state["tron_hd_index"] = hd_index
@@ -3155,6 +3231,10 @@ async def on_any_member(event: types.ChatMemberUpdated):
     if event.new_chat_member.status not in ("member", "administrator") or event.old_chat_member.status not in ("left", "kicked"):
         return
 
+    # Recycled spare group? Start the new deal with completely fresh state
+    # (fires on ANY join, including service accounts, so the flag never sticks).
+    _maybe_reset_recycled_group(chat_id)
+
     user = event.new_chat_member.user
 
     try:
@@ -3191,6 +3271,9 @@ async def on_new_chat_members_message(message: types.Message):
     group_title = message.chat.title
     if not is_baloch_deal_group(group_title):
         return
+
+    # Recycled spare group? Start the new deal with completely fresh state.
+    _maybe_reset_recycled_group(chat_id)
 
     try:
         me = await bot.get_me()
@@ -3351,6 +3434,10 @@ async def on_private_message(message: types.Message):
 @dp.message(F.text & (F.chat.type.in_(["group", "supergroup"])))
 async def universal_stage_handler(message: types.Message):
     chat_id = message.chat.id
+    # Recycled spare group safety net: if the join event was missed
+    # (e.g. bot was restarting), the first message still triggers a fresh start.
+    if str(chat_id) in _recycled_pending():
+        _maybe_reset_recycled_group(chat_id)
     # Fallback: catch /start and /deal as plain text (in case Command filter
     # doesn't match due to privacy mode or client quirks). This runs even
     # when there's no deal state yet (fresh group).
