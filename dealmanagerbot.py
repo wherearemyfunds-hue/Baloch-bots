@@ -803,10 +803,14 @@ async def ai_chat_reply(message_text: str, state: dict, user_display: str) -> st
         "payout_pending": "payout approved, admin will send it shortly",
         "refund_pending": "refund approved, admin will send it shortly",
         "disputed": "deal is frozen under dispute, admin is reviewing",
-    }.get(stage, stage)
+    }.get(stage, "general conversation")
+    if state.get("stage"):
+        context = f"Deal context: {amount} USDT on {net_name}; current status: {stage_hint}."
+    else:
+        context = "No active deal — this is a general escrow help chat."
     prompt = f"""You are the friendly AI admin assistant of "Baloch OTC", a Telegram USDT escrow service.
 A user ({user_display}) is chatting in a deal group. Reply ENTIRELY in the SAME language and script as the user's message below (auto-detect: English, Urdu, Roman Urdu, Saraiki, Hindi, Arabic, etc.).
-Deal context: {amount} USDT on {net_name}; current status: {stage_hint}.
+Deal context: {context}
 Rules:
 - Chat like a smart, warm human admin. Keep it short: 1-3 sentences, chat tone.
 - You may explain: how escrow works, fees (withdraw fee 3 USDT on TRC20, 1 USDT on BEP20; blockchain gas is covered by the admin), safety tips, what happens next at this stage, timelines.
@@ -3329,6 +3333,45 @@ async def handle_role_guess_no(callback: CallbackQuery):
 # ==============================================
 # AI-POWERED DEAL NEGOTIATION HANDLER
 # ==============================================
+
+# ==============================================
+# PRIVATE CHAT: Full-AI escrow assistant (1-on-1)
+# ==============================================
+_private_chat_at: dict[int, float] = {}
+
+
+@dp.message(F.text & (F.chat.type == "private"))
+async def on_private_message(message: types.Message):
+    """Talk with anyone in personal chat — any language, like a human admin.
+    Informational only: deal actions still happen in deal groups via buttons."""
+    if _is_service_account(message.from_user):
+        return
+    text = (message.text or "").strip()
+    if not text:
+        return
+    if text.startswith("/"):
+        # Friendly /start in private (group /start is handled elsewhere)
+        if text.split("@")[0].split(" ")[0] == "/start":
+            await message.answer(
+                "👋 <b>Salam! I'm the Baloch OTC escrow assistant.</b>\n\n"
+                "Ask me anything about escrow — how it works, fees, safety — "
+                "in any language. Deals happen in deal groups; I'm here so "
+                "everything is easy to understand. 🙂",
+                parse_mode="HTML",
+            )
+        return
+    if len(text) > 1000:
+        return
+    now = time.time()
+    if now - _private_chat_at.get(message.chat.id, 0) < 8:
+        return  # light anti-spam; 1-on-1 should still feel instant
+    user = message.from_user
+    display = f"@{user.username}" if user.username else (user.first_name or "User")
+    reply = await ai_chat_reply(text, {}, display)
+    if reply:
+        _private_chat_at[message.chat.id] = now
+        await message.answer(reply)
+
 
 @dp.message(F.text & (F.chat.type.in_(["group", "supergroup"])))
 async def universal_stage_handler(message: types.Message):
