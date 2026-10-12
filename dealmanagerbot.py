@@ -353,26 +353,32 @@ def validate_payout_address(address: str, chain: str = "tron") -> tuple[bool, st
         return False, "❌ Invalid address. Please send your <b>USDT TRC20</b> address (starts with T)."
     if v["type"] != want:
         if want == "BEP20":
-            return False, "❌ This deal is on <b>BNB Smart Chain</b>. Please send a USDT <b>BEP20</b> address (starts with 0x)."
-        return False, "❌ This deal is on <b>TRON</b>. Please send a USDT <b>TRC20</b> address (starts with T)."
+            return False, ("❌ This deal is on <b>BNB Smart Chain</b>. Please send a USDT <b>BEP20</b> address (starts with 0x). "
+                           "Cross-chain payout would need a manual bridge with extra fees.")
+        return False, ("❌ This deal is on <b>TRON</b>. Please send a USDT <b>TRC20</b> address (starts with T). "
+                       "Cross-chain payout would need a manual bridge with extra fees.")
     return True, ""
 
 
 def payout_prompt_text(chain: str = "tron") -> str:
-    """Payout address prompt — matches the deal's chain."""
+    """Payout address prompt — matches the deal's chain (no conversion, no bridge fee)."""
     if chain == "bsc":
-        return "please send your payout address (USDT <b>BEP20</b> only — starts with 0x)."
+        return ("please send your payout address (USDT <b>BEP20</b> only — starts with 0x). "
+                "The buyer paid on BNB Smart Chain, so payout stays on this network — no conversion fee.")
     if USE_TRON and TRON_AVAILABLE:
-        return "please send your payout address (USDT <b>TRC20</b> only — starts with T)."
+        return ("please send your payout address (USDT <b>TRC20</b> only — starts with T). "
+                "The buyer paid on TRON, so payout stays on this network — no conversion fee.")
     return "please send your payout address (USDT TRC20 or USDT BEP20 only)."
 
 
 def refund_prompt_text(chain: str = "tron") -> str:
-    """Refund address prompt — matches the deal's chain."""
+    """Refund address prompt — matches the deal's chain (no conversion, no bridge fee)."""
     if chain == "bsc":
-        return "please send your refund address (USDT <b>BEP20</b> only — starts with 0x)."
+        return ("please send your refund address (USDT <b>BEP20</b> only — starts with 0x). "
+                "The buyer paid on BNB Smart Chain, so refund stays on this network — no conversion fee.")
     if USE_TRON and TRON_AVAILABLE:
-        return "please send your refund address (USDT <b>TRC20</b> only — starts with T)."
+        return ("please send your refund address (USDT <b>TRC20</b> only — starts with T). "
+                "The buyer paid on TRON, so refund stays on this network — no conversion fee.")
     return "please send your refund address (USDT TRC20 or USDT BEP20 only)."
 
 
