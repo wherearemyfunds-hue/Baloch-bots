@@ -514,6 +514,34 @@ SPAM_NAME_PATTERN = re.compile(os.environ.get("SPAM_NAME_PATTERN", r"x{2,}i*n|xi
 _env_spam_groups = os.environ.get("SPAM_DELETE_GROUPS", "").strip()
 SPAM_DELETE_GROUPS = [s.strip() for s in _env_spam_groups.split(",") if s.strip()]
 
+@user_client.on(events.ChatAction)
+async def auto_promote_service_admin_on_join(event):
+    """If one of our service accounts joins a deal group via invite link
+    (e.g. after a privacy-blocked direct invite), auto-promote to admin."""
+    try:
+        if not (event.user_joined or event.user_added):
+            return
+        chat = await event.get_chat()
+        title = getattr(chat, "title", "") or ""
+        if not title.startswith(GROUP_BASE_NAME):
+            return
+        user = await event.get_user()
+        uname = (getattr(user, "username", "") or "").lower()
+        if uname not in ("balochbuyer", "balochhelpbot", "reall_baloch"):
+            return
+        await user_client(
+            EditAdminRequest(
+                channel=event.chat_id,
+                user_id=user.id,
+                admin_rights=make_admin_rights(),
+                rank="Escrow Admin",
+            )
+        )
+        logger.info(f"Auto-promoted @{uname} to admin on join in '{title}'")
+    except Exception as e:
+        logger.warning(f"auto_promote_service_admin_on_join failed: {type(e).__name__}: {e}")
+
+
 @bot_client.on(events.NewMessage(chats=SPAM_DELETE_GROUPS if SPAM_DELETE_GROUPS else None))
 async def xxin_spam_delete_handler(event):
     """Delete XXIN spam bot messages in groups."""
@@ -748,6 +776,23 @@ async def group_link_handler(event):
         buyer_admin_ok = await invite_and_promote(
             user_client, created_group, SUPPORT_USERNAME, "Escrow Admin", "support admin"
         )
+        if not buyer_admin_ok:
+            # Direct add failed (usually the account's privacy settings block
+            # group invites from non-contacts). DM the invite link instead —
+            # auto_promote_service_admin_on_join promotes them on join.
+            try:
+                _dm = (
+                    f"🔔 <b>New escrow group needs you as admin:</b> {group_title}\n\n"
+                    f"Direct add failed (privacy settings?).\n"
+                    f"Join here — you will be auto-promoted to admin:\n{invite_link}"
+                )
+                try:
+                    await bot_client.send_message(SUPPORT_USERNAME, _dm, parse_mode="html")
+                except Exception:
+                    await user_client.send_message(SUPPORT_USERNAME, _dm, parse_mode="html")
+                logger.info(f"Sent admin-join DM to @{SUPPORT_USERNAME} for {group_title}")
+            except Exception as e:
+                logger.error(f"Could not DM @{SUPPORT_USERNAME}: {e}")
 
         # ---------- STEP 6: welcome message ----------
         try:

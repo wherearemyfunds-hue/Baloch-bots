@@ -616,6 +616,11 @@ def _fallback_deal_extraction(text: str) -> dict:
     amount_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:usdt|usd|\$|dollars?)", t)
     if not amount_match:
         amount_match = re.search(r"\$\s*(\d+(?:\.\d+)?)", text)
+    if not amount_match:
+        # "150 price", "price: 150", "cost 200" (no currency marker)
+        amount_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:price|cost|amount)\b", t)
+    if not amount_match:
+        amount_match = re.search(r"(?:price|cost|amount)\s*[:\-]?\s*(\d+(?:\.\d+)?)", t)
     if amount_match:
         result["amount"] = float(amount_match.group(1))
 
@@ -633,6 +638,8 @@ def _fallback_deal_extraction(text: str) -> dict:
     # Description: strip amount/deadline/docs, remove filler verbs, keep product
     desc = text
     desc = re.sub(r"\d+(?:\.\d+)?\s*(?:usdt|usd|\$|dollars?)", " ", desc, flags=re.I)
+    desc = re.sub(r"\d+(?:\.\d+)?\s*(?:price|cost|amount)\b", " ", desc, flags=re.I)
+    desc = re.sub(r"(?:price|cost|amount)\s*[:\-]?\s*\d+(?:\.\d+)?", " ", desc, flags=re.I)
     desc = re.sub(r"\d+\s*(?:days?|dys|hours?|hrs?|minutes?|mins?)", " ", desc, flags=re.I)
     desc = re.sub(r"id\s*\+\s*ssn[^,\n]*", " ", desc, flags=re.I)
     desc = re.sub(r"\b(buying|selling|buy|sell|need|want|looking\s+for)\b", " ", desc, flags=re.I)
@@ -655,10 +662,12 @@ def _fallback_deal_extraction(text: str) -> dict:
     if any(w in t for w in counter_words):
         result["is_counter_offer"] = True
 
-    # Fee preference
-    if "i pay fee" in t or "i will pay the fee" in t or "fee on me" in t:
-        result["fee_preference"] = "detected"
-    if "half" in t and "fee" in t:
+    # Fee preference: who pays the escrow fee?
+    if "buyer" in t and "fee" in t and "pay" in t:
+        result["fee_preference"] = "buyer"
+    elif "seller" in t and "fee" in t and "pay" in t:
+        result["fee_preference"] = "seller"
+    elif "half" in t and "fee" in t:
         result["fee_preference"] = "half"
 
     # CRITICAL: mark deal-related only on real deal signals
@@ -1796,6 +1805,33 @@ QA_BATCH_MSG_2 = (
 )
 
 
+def _qa_progress_text(state: dict) -> str:
+    """What's captured vs still missing — shown after each batch Q&A reply
+    so either party always sees the bot heard them (Shawn's spec:
+    'agar koi option rehta ho to bot poochay k ye detail btao')."""
+    _fd = {"buyer": "Buyer pays", "seller": "Seller pays", "half": "Split 50-50"}
+    _fp = state.get("fee_preference")
+    checks = [
+        (state.get("amount"), f"Price: {state.get('amount')} USDT", "1. Price in USDT"),
+        (_fp, f"Fee: {_fd.get(_fp, _fp)}", "2. Who pays the escrow fee (Buyer / Seller / Split)"),
+        (state.get("description"), f"Description: {str(state.get('description'))[:50]}", "3. Description of product/service"),
+        (state.get("proof_of_completion"), f"Proof: {str(state.get('proof_of_completion'))[:50]}", "4. Proof of completion"),
+        (state.get("deadline"), f"Deadline: {state.get('deadline')}", "5. Deadline"),
+        (state.get("account_age"), f"Account: {state.get('account_age')}", "6. Account new or with transactions"),
+        (state.get("account_geo"), f"Geo: {state.get('account_geo')}", "7. Account geo + owner country"),
+        (state.get("account_documents"), "Documents: noted", "8. Documents in kit (or 'none')"),
+        (state.get("additional_info"), "Other info: noted", "9. Other info (or 'none')"),
+    ]
+    have = [h for v, h, _n in checks if v]
+    need = [n for v, _h, n in checks if not v]
+    text = ""
+    if have:
+        text += "✅ <b>Got so far:</b>\n" + "\n".join(f"• {h}" for h in have) + "\n\n"
+    if need:
+        text += "❌ <b>Still needed — please reply with:</b>\n" + "\n".join(f"• {n}" for n in need)
+    return text or "Got it. 👍"
+
+
 async def send_batch_questions(chat_id: int):
     """Send the 2 batched question messages, mentioning BOTH parties."""
     state = deal_states.get(chat_id)
@@ -1807,6 +1843,7 @@ async def send_batch_questions(chat_id: int):
     state["_batch_sent"] = True
     state["stage"] = "deal_batch_qa"
     state["qa_provider"] = None
+    state["_qa_confirm_sent"] = False
     buyer_name = await get_username(state.get("buyer"), "Buyer")
     seller_name = await get_username(state.get("seller"), "Seller")
     await bot.send_message(
@@ -1856,6 +1893,11 @@ async def present_qa_for_confirmation(chat_id: int):
     state = deal_states.get(chat_id)
     if not state:
         return
+    # Guard: never send the confirmation twice for the same terms
+    # (two rapid messages could otherwise double-present).
+    if state.get("_qa_confirm_sent"):
+        return
+    state["_qa_confirm_sent"] = True
     provider = state.get("qa_provider")
     buyer = state.get("buyer")
     seller = state.get("seller")
@@ -3357,19 +3399,28 @@ async def universal_stage_handler(message: types.Message):
         analysis = await ai_analyze_deal_message(text, sender_role, context)
 
         # "none" for optional fields
+        understood = False
         if text.lower().strip() in ("none", "no", "nope", "n/a", "-"):
             # Only meaningful if we already have core fields; otherwise ignore
             pass
         else:
             if _apply_qa_analysis(state, analysis):
+                understood = True
                 # Track who first provided substantive details
                 if not state.get("qa_provider"):
                     state["qa_provider"] = user_id
 
         # Core fields present? -> ask the OTHER party to confirm
+        # (Shawn: "agar sab mukamal hoon to dosri party sy confirmation ly")
         if state.get("amount") and state.get("description"):
             await present_qa_for_confirmation(chat_id)
-        # Otherwise stay in deal_batch_qa and keep collecting
+            return
+        # Otherwise: show what's captured + ask specifically for what's missing
+        # (Shawn: "agar koi option rehta ho to bot poochay k ye detail btao").
+        # Either party may fill — whoever writes first counts. Only reply when
+        # this message actually added something, so chit-chat doesn't spam.
+        if understood:
+            await message.answer(_qa_progress_text(state), parse_mode="HTML")
         return
 
     # ======================================================
@@ -3407,6 +3458,7 @@ async def universal_stage_handler(message: types.Message):
                 # Swap: the other party now confirms the revised terms
                 other = state.get("buyer") if confirmer == state.get("seller") else state.get("seller")
                 state["qa_provider"] = confirmer  # they provided the revision
+                state["_qa_confirm_sent"] = False  # allow re-presenting revised terms
                 await present_qa_for_confirmation(chat_id)
                 # present_qa_for_confirmation sets confirmer to the other party
                 return
@@ -3448,6 +3500,7 @@ async def universal_stage_handler(message: types.Message):
         if _apply_qa_analysis(state, analysis):
             # Changes applied -> the OTHER party now confirms
             state["qa_provider"] = confirmer
+            state["_qa_confirm_sent"] = False  # allow re-presenting revised terms
             await present_qa_for_confirmation(chat_id)
             return
 
