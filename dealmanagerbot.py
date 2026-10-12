@@ -777,12 +777,13 @@ async def _bot_identity() -> tuple:
     return _bot_identity_cache.get("id", 0), _bot_identity_cache.get("username", "")
 
 
-async def ai_chat_reply(message_text: str, state: dict, user_display: str) -> str | None:
+async def ai_chat_reply(message_text: str, state: dict, user_display: str, first_contact: bool = True) -> str | None:
     """
     Full-AI conversational escrow admin assistant (Shawn's spec:
     "Full AI jaisa bna do, just actions k ilawa").
     Detects the user's language and replies ENTIRELY in that same language —
     like a smart human admin. Friendly to everyone: admin, buyers, sellers.
+    Greets ONLY on the very first message (first_contact) — never on later ones.
     Informational + guidance ONLY: NEVER takes deal actions or moves money.
     Returns the reply text, or None on failure.
     """
@@ -808,13 +809,19 @@ async def ai_chat_reply(message_text: str, state: dict, user_display: str) -> st
         context = f"Deal context: {amount} USDT on {net_name}; current status: {stage_hint}."
     else:
         context = "No active deal — this is a general escrow help chat."
+    greet_rule = (
+        "Greet warmly (salam/hello) at the start of this first message."
+        if first_contact else
+        "Do NOT greet again — this is NOT the first message. Go straight to the answer with no salam/hello opener."
+    )
     prompt = f"""You are the friendly AI admin assistant of "Baloch OTC", a Telegram USDT escrow service.
 A user ({user_display}) is chatting in a deal group. Reply ENTIRELY in the SAME language and script as the user's message below (auto-detect: English, Urdu, Roman Urdu, Saraiki, Hindi, Arabic, etc.).
 Deal context: {context}
 Rules:
 - Chat like a smart, warm human admin. Keep it short: 1-3 sentences, chat tone.
-- You may explain: how escrow works, fees (withdraw fee 3 USDT on TRC20, 1 USDT on BEP20; blockchain gas is covered by the admin), safety tips, what happens next at this stage, timelines.
-- Greetings (salam/hello/hi): greet back warmly and offer help with the deal.
+- {greet_rule}
+- You may explain: how escrow works; fees — escrow fee is 3% of the deal amount (minimum 3 USDT), paid by buyer / seller / split as agreed; withdraw fee 3 USDT on TRC20, 1 USDT on BEP20; blockchain gas is covered by the admin; safety tips; what happens next at this stage; timelines.
+- Greetings (salam/hello/hi): only on the first message, per the rule above.
 - You NEVER take deal actions yourself: never release, refund, confirm a payment, file a dispute, or change addresses. If the user asks for an action, guide them to the right button in the group (Release To Seller / Refund to Buyer / Dispute).
 - NEVER claim money was sent, released, refunded, or confirmed.
 - NEVER ask for private keys, seed phrases, or passwords.
@@ -871,9 +878,13 @@ async def maybe_chat_reply(message: types.Message, state: dict, stage: str, forc
         return False
     user = message.from_user
     display = f"@{user.username}" if user.username else (user.first_name or "User")
-    reply = await ai_chat_reply(text, state, display)
+    greeted = state.setdefault("_greeted_users", [])
+    first_contact = user.id not in greeted
+    reply = await ai_chat_reply(text, state, display, first_contact=first_contact)
     if not reply:
         return False
+    if user.id not in greeted:
+        greeted.append(user.id)
     state["_chat_reply_at"] = now
     save_deal_states()
     await message.answer(reply)
@@ -3338,6 +3349,7 @@ async def handle_role_guess_no(callback: CallbackQuery):
 # PRIVATE CHAT: Full-AI escrow assistant (1-on-1)
 # ==============================================
 _private_chat_at: dict[int, float] = {}
+_private_greeted: set[int] = set()
 
 
 @dp.message(F.text & (F.chat.type == "private"))
@@ -3367,8 +3379,10 @@ async def on_private_message(message: types.Message):
         return  # light anti-spam; 1-on-1 should still feel instant
     user = message.from_user
     display = f"@{user.username}" if user.username else (user.first_name or "User")
-    reply = await ai_chat_reply(text, {}, display)
+    first_contact = message.chat.id not in _private_greeted
+    reply = await ai_chat_reply(text, {}, display, first_contact=first_contact)
     if reply:
+        _private_greeted.add(message.chat.id)
         _private_chat_at[message.chat.id] = now
         await message.answer(reply)
 
