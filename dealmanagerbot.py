@@ -361,24 +361,30 @@ def validate_payout_address(address: str, chain: str = "tron") -> tuple[bool, st
 
 
 def payout_prompt_text(chain: str = "tron") -> str:
-    """Payout address prompt — matches the deal's chain (no conversion, no bridge fee)."""
+    """Payout address prompt — same chain as the deposit, with the fee stated."""
+    fee = WITHDRAW_FEE.get(chain, 3.0)
     if chain == "bsc":
-        return ("please send your payout address (USDT <b>BEP20</b> only — starts with 0x). "
-                "The buyer paid on BNB Smart Chain, so payout stays on this network — no conversion fee.")
+        return (f"please send your payout address (USDT <b>BEP20</b> only — starts with 0x). "
+                f"The buyer paid on BNB Smart Chain, so payout stays on this network — no conversion fee. "
+                f"Deduction fee: <b>{fee:.0f} USDT</b>.")
     if USE_TRON and TRON_AVAILABLE:
-        return ("please send your payout address (USDT <b>TRC20</b> only — starts with T). "
-                "The buyer paid on TRON, so payout stays on this network — no conversion fee.")
+        return (f"please send your payout address (USDT <b>TRC20</b> only — starts with T). "
+                f"The buyer paid on TRON, so payout stays on this network — no conversion fee. "
+                f"Deduction fee: <b>{fee:.0f} USDT</b>.")
     return "please send your payout address (USDT TRC20 or USDT BEP20 only)."
 
 
 def refund_prompt_text(chain: str = "tron") -> str:
-    """Refund address prompt — matches the deal's chain (no conversion, no bridge fee)."""
+    """Refund address prompt — same chain as the deposit, with the fee stated."""
+    fee = WITHDRAW_FEE.get(chain, 3.0)
     if chain == "bsc":
-        return ("please send your refund address (USDT <b>BEP20</b> only — starts with 0x). "
-                "The buyer paid on BNB Smart Chain, so refund stays on this network — no conversion fee.")
+        return (f"please send your refund address (USDT <b>BEP20</b> only — starts with 0x). "
+                f"The buyer paid on BNB Smart Chain, so refund stays on this network — no conversion fee. "
+                f"Deduction fee: <b>{fee:.0f} USDT</b>.")
     if USE_TRON and TRON_AVAILABLE:
-        return ("please send your refund address (USDT <b>TRC20</b> only — starts with T). "
-                "The buyer paid on TRON, so refund stays on this network — no conversion fee.")
+        return (f"please send your refund address (USDT <b>TRC20</b> only — starts with T). "
+                f"The buyer paid on TRON, so refund stays on this network — no conversion fee. "
+                f"Deduction fee: <b>{fee:.0f} USDT</b>.")
     return "please send your refund address (USDT TRC20 or USDT BEP20 only)."
 
 
@@ -2302,6 +2308,27 @@ async def do_admin_confirm(chat_id: int, user: types.User):
     state = deal_states.get(chat_id, {})
     state["stage"] = "work"
     state["payment_confirmed_at"] = time.time()
+    # Detect which chain the buyer actually paid on (manual confirm has no
+    # chain monitor, so check both deposit addresses for funds).
+    loop = asyncio.get_event_loop()
+    def _detect_chain():
+        try:
+            import tron_pay
+            ta = state.get("tron_deposit_address", "")
+            if ta and tron_pay.get_usdt_balance(ta) >= 0.01:
+                return "tron"
+        except Exception:
+            pass
+        try:
+            if BSC_ENABLED:
+                import bsc_pay
+                ba = state.get("bsc_deposit_address", "")
+                if ba and bsc_pay.get_usdt_balance(ba) >= 0.01:
+                    return "bsc"
+        except Exception:
+            pass
+        return state.get("chain", "tron")
+    state["chain"] = await loop.run_in_executor(None, _detect_chain)
     seller_name = await get_username(state["seller"], "Seller")
     await pin_deal_details(chat_id)
     await bot.send_message(
