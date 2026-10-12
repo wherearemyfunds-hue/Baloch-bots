@@ -36,6 +36,8 @@ if [ "$LOCAL" != "$REMOTE" ]; then
   # Ensure tronpy and bip-utils are installed (for Direct TRON USDT)
   pip3 show tronpy >/dev/null 2>&1 || pip3 install --break-system-packages tronpy 2>&1 | tail -1
   pip3 show bip-utils >/dev/null 2>&1 || pip3 install --break-system-packages bip-utils 2>&1 | tail -1
+  # web3 for BNB Smart Chain USDT (BEP20) in the wallet bot
+  pip3 show web3 >/dev/null 2>&1 || pip3 install --break-system-packages web3 2>&1 | tail -1
 
   # Deal Manager Bot
   cp dealmanagerbot.py /root/dealmanagerbot.py
@@ -53,10 +55,14 @@ if [ "$LOCAL" != "$REMOTE" ]; then
   set -a; source /root/.secrets/escrow_bot.env; set +a
   nohup python3 /root/dealcreaterbot.py > /root/escrowbot.log 2>&1 &
 
-  # Wallet Bot (BTCPay)
+  # Wallet Bot (Direct TRON USDT + BNB Smart Chain USDT)
   if [ -f walletbot.py ]; then
     cp walletbot.py /root/walletbot.py
+    # Chain helper modules the wallet bot imports
+    [ -f tron_pay.py ] && cp tron_pay.py /root/tron_pay.py
+    [ -f bsc_pay.py ] && cp bsc_pay.py /root/bsc_pay.py
     python3 -m py_compile /root/walletbot.py || { echo "Wallet syntax failed!"; exit 1; }
+    python3 -m py_compile /root/bsc_pay.py || { echo "BSC module syntax failed!"; exit 1; }
     pkill -f walletbot.py
     sleep 2
     if [ -f /root/.secrets/wallet_bot.env ]; then
