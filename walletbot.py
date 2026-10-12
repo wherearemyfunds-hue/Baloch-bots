@@ -54,7 +54,7 @@ WITHDRAW_FEE = {"tron": 3.0, "bsc": 1.0}
 
 def _fee_notice(chain: str) -> str:
     return (f"⛽ Deduction fee: <b>{WITHDRAW_FEE[chain]:.0f} USDT</b> "
-            f"({CHAIN_LABEL[chain]}) — recipient ko itna kam milega.")
+            f"({CHAIN_LABEL[chain]}) — the recipient gets that much less.")
 EXPLORER_TX = {
     "tron": "https://tronscan.org/#/transaction/",
     "bsc": "https://bscscan.com/tx/",
@@ -714,8 +714,8 @@ async def cb_a_withdraw_all(callback: types.CallbackQuery):
         (f"<code>{hot_bsc}</code>\n\n" if hot_bsc else "\n") +
         f"⛽ <b>Bot ki koi fee nahi.</b> Sirf network gas lagegi — "
         f"TRON pe har address ~13 TRX, BSC pe ~$0.20. "
-        f"Gas hot wallet se auto-fund hogi, bachi hui wapas aa jayegi.\n\n"
-        f"⏳ Ye kuch minute le sakta hai. Confirm karoon?",
+        f"Gas will be auto-funded from the hot wallet; leftover will be swept back.\n\n"
+        f"⏳ This may take a few minutes. Confirm?",
         parse_mode="HTML", reply_markup=kb)
 
 
@@ -736,7 +736,7 @@ async def cb_withdraw_all_confirm(callback: types.CallbackQuery):
         await callback.message.answer("Nothing to withdraw.")
         return
     prog = await callback.message.answer(
-        f"⏳ <b>Withdrawing from {len(items)} addresses...</b>\nIs me kuch minute lag sakte hain.",
+        f"⏳ <b>Withdrawing from {len(items)} addresses...</b>\nThis may take a few minutes.",
         parse_mode="HTML")
     loop = asyncio.get_event_loop()
 
@@ -785,7 +785,7 @@ async def cb_withdraw_all_confirm(callback: types.CallbackQuery):
     for label, chain, amt, err in failed:
         lines.append(f"❌ {label} ({CHAIN_LABEL[chain]}): {amt:.2f} — {err}")
     if failed:
-        lines.append("\n<i>Failed wale dobara try karo ya alag se withdraw karo.</i>")
+        lines.append("\n<i>Retry the failed ones or withdraw them individually.</i>")
     try:
         await prog.delete()
     except Exception:
@@ -850,7 +850,7 @@ async def cb_a_backup(callback: types.CallbackQuery):
     try:
         await callback.message.answer_document(
             FSInputFile(path, filename=f"deal_backup_{callback.message.date.strftime('%Y%m%d')}.json"),
-            caption="📦 <b>Deal Backup</b>\n\nIs file ko <b>save</b> kar lo!\nVPS kharab ho jaye to isi se paisa wapas milega.",
+            caption="📦 <b>Deal Backup</b>\n\n<b>Save</b> this file!\nIf the VPS fails, this is how funds are recovered.",
             parse_mode="HTML",
         )
     except Exception as e:
@@ -971,8 +971,8 @@ async def handle_text(message: types.Message):
         fee = WITHDRAW_FEE[chain]
         if amt <= fee:
             await message.answer(
-                f"❌ Amount fee se zyada hona chahiye.\n"
-                f"Deduction fee: <b>{fee:.0f} USDT</b> — kam se kam <b>{fee + 0.01:.2f} USDT</b> likho.",
+                f"❌ Amount must be greater than the fee.\n"
+                f"Deduction fee: <b>{fee:.0f} USDT</b> — enter at least <b>{fee + 0.01:.2f} USDT</b>.",
                 parse_mode="HTML")
             return
         net = round(amt - fee, 2)
@@ -1040,8 +1040,8 @@ async def handle_text(message: types.Message):
         fee = WITHDRAW_FEE[chain]
         if amt <= fee:
             await message.answer(
-                f"❌ Amount fee se zyada hona chahiye.\n"
-                f"Deduction fee: <b>{fee:.0f} USDT</b> — kam se kam <b>{fee + 0.01:.2f} USDT</b> likho.",
+                f"❌ Amount must be greater than the fee.\n"
+                f"Deduction fee: <b>{fee:.0f} USDT</b> — enter at least <b>{fee + 0.01:.2f} USDT</b>.",
                 parse_mode="HTML")
             return
         net = round(amt - fee, 2)

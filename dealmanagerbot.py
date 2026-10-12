@@ -2364,8 +2364,8 @@ async def do_dispute(chat_id: int, user: types.User):
         f"Admin: @{ADMIN_USERNAME}\n"
         f"Buyer: {buyer_name}\n"
         f"Seller: {seller_name}\n\n"
-        f"📝 <b>Apna proof sambhal ke rakhen</b> — screenshots, payment receipts, chat history.\n"
-        f"Admin review kar raha hai.\n\n"
+        f"📝 <b>Keep your proof safe</b> — screenshots, payment receipts, chat history.\n"
+        f"Admin is reviewing.\n\n"
         f"@{ADMIN_USERNAME} please review this deal.",
         parse_mode="HTML",
     )
@@ -2518,7 +2518,7 @@ async def do_address_confirm(chat_id: int, user: types.User):
         f"Pay: <b>{amount} USDT</b> ({chain_label})\n"
         f"To: <code>{address}</code>\n\n"
         f"Via wallet bot → 💸 Send (Admin), amount: <b>{net} USDT</b>\n"
-        f"(fee {wfee:.0f} USDT tumhare paas rahegi)."
+        f"(fee {wfee:.0f} USDT stays with you)."
     )
 
 
@@ -2666,7 +2666,7 @@ async def do_refund_address_confirm(chat_id: int, user: types.User):
         f"Refund: <b>{amount} USDT</b> ({chain_label})\n"
         f"To: <code>{address}</code>\n\n"
         f"Via wallet bot → 💸 Send (Admin), amount: <b>{net} USDT</b>\n"
-        f"(fee {wfee:.0f} USDT tumhare paas rahegi)."
+        f"(fee {wfee:.0f} USDT stays with you)."
     )
 
 
