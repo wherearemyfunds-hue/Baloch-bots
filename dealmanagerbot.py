@@ -1846,7 +1846,7 @@ async def bsc_payment_monitoring(chat_id: int, address: str, expected: float,
         # Timeout — single reminder + scheduled cleanup (never repeats)
         state = deal_states.get(chat_id)
         if state and state.get("stage") in ("payment", "payment_monitoring"):
-            await _handle_payment_timeout(chat_id, final_bal, expected)
+            await _handle_payment_timeout(chat_id, total_received, expected)
     except asyncio.CancelledError:
         logger.info(f"[BSC Monitor] Chat {chat_id} - cancelled")
     except Exception as e:
@@ -2750,6 +2750,11 @@ async def do_admin_confirm(chat_id: int, user: types.User):
         await bot.send_message(chat_id, "Only admin can confirm.")
         return
     state = deal_states.get(chat_id, {})
+    # Stage gate: only confirm while the deal is actually awaiting payment.
+    # (Stale "Money Received" buttons persist after auto-detect/expiry.)
+    if state.get("stage") not in ("payment", "payment_monitoring"):
+        logger.info(f"[Payment] Chat {chat_id} - manual confirm ignored (stage={state.get('stage')})")
+        return
     # Idempotency: ignore if payment was already confirmed (auto-detect or earlier manual).
     if state.get("payment_confirmed_at"):
         logger.info(f"[Payment] Chat {chat_id} - duplicate manual confirm ignored (already confirmed)")

@@ -45,6 +45,15 @@ if [ "$LOCAL" != "$REMOTE" ]; then
   python3 -c "import pydantic" 2>/dev/null || \
     pip3 install --break-system-packages --force-reinstall --no-deps "pydantic-core==2.50.0" 2>&1 | tail -1
 
+  # Shared chain helper modules FIRST — both bots import these, so they must
+  # be fresh on disk before any bot restarts (stale modules caused a
+  # production "No module named 'tx_log'" crash before).
+  [ -f tron_pay.py ] && cp tron_pay.py /root/tron_pay.py
+  [ -f bsc_pay.py ] && cp bsc_pay.py /root/bsc_pay.py
+  [ -f tx_log.py ] && cp tx_log.py /root/tx_log.py
+  python3 -m py_compile /root/tron_pay.py || { echo "TRON module syntax failed!"; exit 1; }
+  python3 -m py_compile /root/bsc_pay.py || { echo "BSC module syntax failed!"; exit 1; }
+
   # Deal Manager Bot
   cp dealmanagerbot.py /root/dealmanagerbot.py
   python3 -m py_compile /root/dealmanagerbot.py || { echo "Syntax failed!"; exit 1; }
@@ -64,12 +73,7 @@ if [ "$LOCAL" != "$REMOTE" ]; then
   # Wallet Bot (Direct TRON USDT + BNB Smart Chain USDT)
   if [ -f walletbot.py ]; then
     cp walletbot.py /root/walletbot.py
-    # Chain helper modules the wallet bot imports
-    [ -f tron_pay.py ] && cp tron_pay.py /root/tron_pay.py
-    [ -f bsc_pay.py ] && cp bsc_pay.py /root/bsc_pay.py
-    [ -f tx_log.py ] && cp tx_log.py /root/tx_log.py
     python3 -m py_compile /root/walletbot.py || { echo "Wallet syntax failed!"; exit 1; }
-    python3 -m py_compile /root/bsc_pay.py || { echo "BSC module syntax failed!"; exit 1; }
     pkill -f walletbot.py
     sleep 2
     if [ -f /root/.secrets/wallet_bot.env ]; then

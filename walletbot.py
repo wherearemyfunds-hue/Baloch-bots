@@ -122,7 +122,9 @@ user_state: dict[int, dict] = {}
 
 
 def _is_admin(user_id: int) -> bool:
-    return not ADMIN_IDS or user_id in ADMIN_IDS
+    # Fail CLOSED: if WALLET_ADMIN_IDS is unset/empty, nobody is admin
+    # (never grant admin to everyone by default).
+    return bool(ADMIN_IDS) and user_id in ADMIN_IDS
 
 
 def _ensure_bsc_address(rec: dict) -> str:
