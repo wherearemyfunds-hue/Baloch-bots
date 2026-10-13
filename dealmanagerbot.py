@@ -3129,6 +3129,126 @@ async def auto_payout(chat_id: int):
         await _fail(str(e)[:200])
 
 
+async def auto_refund(chat_id: int):
+    """
+    Automatically send the buyer refund from the deal escrow address.
+    Triggered when the buyer confirms a valid refund address — no manual step.
+    Gas is auto-funded from the hot wallet; leftover is swept back.
+    On any failure, falls back to manual admin refund (admin is notified).
+    """
+    state = deal_states.get(chat_id, {})
+    if not state:
+        return
+    # Guards: never double-refund, never refund a paid/disputed deal.
+    if state.get("refund_done") or state.get("refund_in_progress"):
+        return
+    if state.get("payout_done"):
+        return
+    if state.get("disputed"):
+        await safe_notify_admin(
+            f"⚠️ Auto-refund BLOCKED (dispute open)\nDeal: {chat_id}\n"
+            f"Resolve the dispute first, then refund manually.")
+        return
+
+    # Claim the refund slot BEFORE any await — no two paths can pass here.
+    state["refund_in_progress"] = True
+    save_deal_states()
+
+    chain = state.get("chain", "tron")
+    to_address = state.get("refund_address", "")
+    fee_separate = state.get("fee_separate", False)
+    deduct = state["fee"] if not fee_separate else (0 if state.get("fee_payer") == "seller" else state["fee"] / 2)
+    amount = round(state.get("buyer_amount", 0) - deduct, 2)
+    wfee = withdraw_fee(chain)
+    net = round(amount - wfee, 2)
+    chain_label = "BNB Smart Chain (BEP20)" if chain == "bsc" else "TRON (TRC20)"
+    hd_index = state.get("hd_index", state.get("tron_hd_index"))
+
+    async def _fail(reason: str):
+        logger.error(f"[AutoRefund] Chat {chat_id} failed: {reason}")
+        state.pop("refund_in_progress", None)
+        state["stage"] = "refund_pending"  # manual fallback
+        save_deal_states()
+        await bot.send_message(
+            chat_id,
+            f"⚠️ Automatic refund failed ({reason}). "
+            f"Admin will send <b>{net} USDT</b> manually shortly.",
+            parse_mode="HTML",
+        )
+        await safe_notify_admin(
+            f"💸 MANUAL REFUND NEEDED (auto failed)\nDeal: {chat_id}\n"
+            f"Reason: {reason}\nRefund: <b>{amount} USDT</b> ({chain_label})\n"
+            f"To: <code>{to_address}</code>\n"
+            f"Via wallet bot → 🤝 Deal Funds → 💸 Withdraw.")
+
+    if not to_address or hd_index is None or net <= 0:
+        await _fail("missing refund data")
+        return
+
+    loop = asyncio.get_event_loop()
+    try:
+        if chain == "bsc":
+            import bsc_pay
+            from_addr = state.get("bsc_deposit_address", "")
+            priv_hex = await loop.run_in_executor(
+                None, bsc_pay.get_user_private_key_hex, hd_index)
+            result = await loop.run_in_executor(
+                None, bsc_pay.send_usdt_from_with_gas,
+                priv_hex, from_addr, to_address, net)
+        else:
+            import tron_pay
+            from_addr = state.get("tron_deposit_address", "")
+            priv = await loop.run_in_executor(
+                None, tron_pay.get_user_private_key, hd_index)
+            result = await loop.run_in_executor(
+                None, tron_pay.send_usdt_from_with_gas,
+                priv, to_address, net)
+
+        if not result.get("ok"):
+            await _fail(result.get("error", "send failed"))
+            return
+
+        txid = result.get("txid", "")
+        try:
+            import tx_log
+            _chain = "bsc" if chain_label.startswith("BNB") else "tron"
+            tx_log.log_tx(_chain, "refund", net, "USDT",
+                          from_addr, to_address, txid,
+                          note=f"deal {state.get('deal_no', chat_id)}")
+        except Exception:
+            pass
+        state["refund_done"] = True
+        state["refund_txid"] = txid
+        state["refund_net"] = net
+        state["refund_auto"] = True
+        state["stage"] = "refunded"
+        state.pop("refund_in_progress", None)
+        save_deal_states()
+
+        buyer_name = await get_username(state.get("buyer", 0), "Buyer")
+        await bot.send_message(
+            chat_id,
+            f"<b>Refund sent!</b> ✅\n\n"
+            f"{buyer_name} has been refunded: <b>{net} USDT</b> ({chain_label})\n"
+            f"Address: <code>{to_address}</code>\n"
+            f"TxID: <code>{txid}</code>\n\n"
+            f"Unfortunately, the deal has been cancelled.\n"
+            f"We understand things don't always go as planned.\n"
+            f"If you ever wish to try again, Baloch OTC Escrow will always be here.\n\n"
+            f"<b>Thanks for choosing and trusting Baloch OTC</b>\n"
+            f"<b>You can use Baloch OTC any time 24/7.</b>\n"
+            f"<b>Website: https://balochotc.com/</b>",
+            parse_mode="HTML",
+        )
+        await _send_deal_sticker(chat_id, "sad")
+        await safe_notify_admin(
+            f"✅ Auto-refund SENT\nDeal: {chat_id}\n"
+            f"Amount: <b>{net} USDT</b> ({chain_label})\n"
+            f"To: <code>{to_address}</code>\nTxID: <code>{txid}</code>")
+    except Exception as e:
+        await _fail(str(e)[:200])
+
+
 async def do_address_confirm(chat_id: int, user: types.User):
     """
     Legacy 'yes' path — payouts are now fully automatic (auto_payout sends
@@ -3251,9 +3371,7 @@ async def do_refund_cancel(chat_id: int, user: types.User):
 async def do_refund_address_confirm(chat_id: int, user: types.User):
     """
     Buyer types 'yes' - confirm refund address.
-    Funds stay on the deal address (no auto-sweep — single gas hop).
-    The admin refunds MANUALLY from the deal address via the wallet bot's
-    Deal Funds section (withdraw fee applies there).
+    Fully automatic: auto_refund sends from the deal escrow address directly.
     """
     state = deal_states.get(chat_id, {})
     if state.get("stage") != "refund_confirmation":
@@ -3267,58 +3385,10 @@ async def do_refund_address_confirm(chat_id: int, user: types.User):
     if state.get("payout_done"):
         await bot.send_message(chat_id, "Payout has already been sent for this deal. Refund is not possible.")
         return
-
-    # Check duplicate refund. The in-progress flag is set BEFORE any await,
-    # which closes the double-refund race (concurrent messages).
     if state.get("refund_done") or state.get("refund_in_progress"):
         await bot.send_message(chat_id, "Refund is already being processed for this deal.")
         return
-
-    # Claim the refund slot BEFORE any await -> no two messages can pass this point.
-    state["refund_in_progress"] = True
-    save_deal_states()
-
-    fee_separate = state.get("fee_separate", False)
-    deduct = state["fee"] if not fee_separate else (0 if state["fee_payer"] == "seller" else state["fee"] / 2)
-    amount = round(state["buyer_amount"] - deduct, 2)
-    address = state["refund_address"]
-    chain = state.get("chain", "tron")
-    chain_label = "BNB Smart Chain (BEP20)" if chain == "bsc" else "TRON (TRC20)"
-    wfee = withdraw_fee(chain)
-    net = round(amount - wfee, 2)
-
-    state["refund_done"] = True
-    state["refund_manual"] = True
-    state["refund_net"] = net
-    state["stage"] = "refund_pending"
-    state.pop("refund_in_progress", None)
-    save_deal_states()
-
-    buyer_name = await get_username(state.get("buyer", 0), "Buyer")
-    await bot.send_message(
-        chat_id,
-        f"<b>Refund approved!</b>\n\n"
-        f"{buyer_name} will receive: <b>{net} USDT</b> ({chain_label})\n"
-        f"Address: <code>{address}</code>\n\n"
-        f"💸 <b>Admin will send the refund shortly from the main wallet.</b>\n\n"
-        f"Unfortunately, the deal has been cancelled.\n"
-        f"We understand things don't always go as planned.\n"
-        f"If you ever wish to try again, Baloch OTC Escrow will always be here.\n\n"
-        f"<b>Thanks for choosing and trusting Baloch OTC</b>\n"
-        f"<b>You can use Baloch OTC any time 24/7.</b>\n"
-        f"<b>Website: https://balochotc.com/</b>",
-        parse_mode="HTML",
-    )
-    await _send_deal_sticker(chat_id, "sad")
-    await safe_notify_admin(
-        f"💸 MANUAL REFUND NEEDED\n"
-        f"Deal: {chat_id}\n"
-        f"Refund: <b>{amount} USDT</b> ({chain_label})\n"
-        f"To: <code>{address}</code>\n\n"
-        f"Via wallet bot → 🤝 Deal Funds → 💸 Withdraw (Deal {chat_id}),\n"
-        f"enter <b>{amount} USDT</b> — buyer gets <b>{net} USDT</b>\n"
-        f"(fee {wfee:g} USDT stays on the deal address; sweep later via Withdraw ALL)."
-    )
+    await auto_refund(chat_id)
 
 
 async def do_refund_address_reject(chat_id: int, user: types.User):
