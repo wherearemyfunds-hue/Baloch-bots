@@ -213,6 +213,13 @@ def send_usdt_from(priv_key: PrivateKey, to_address: str, amount_usdt: float) ->
         result = txn.broadcast()
         txid = result.get("txid", "")
         logger.info(f"USDT sent: {amount_usdt} -> {to_address}, txid={txid}")
+        try:
+            import tx_log
+            tx_log.log_tx("tron", "usdt_send", amount_usdt, "USDT",
+                          priv_key.public_key.to_base58check_address(),
+                          to_address, txid)
+        except Exception:
+            pass
         return {"ok": True, "txid": txid}
     except Exception as e:
         logger.error(f"USDT send failed: {e}")
@@ -231,7 +238,14 @@ def send_trx(to_address: str, amount_trx: float) -> dict:
             .sign(priv_key)
         )
         result = txn.broadcast()
-        return {"ok": True, "txid": result.get("txid", "")}
+        txid = result.get("txid", "")
+        try:
+            import tx_log
+            tx_log.log_tx("tron", "gas", amount_trx, "TRX",
+                          from_addr, to_address, txid, note="gas funding")
+        except Exception:
+            pass
+        return {"ok": True, "txid": txid}
     except Exception as e:
         logger.error(f"TRX send failed: {e}")
         return {"ok": False, "error": str(e)}
@@ -289,8 +303,16 @@ def send_usdt_from_with_gas(priv_key: PrivateKey, to_address: str, amount_usdt: 
                     .build()
                     .sign(priv_key)
                 )
-                txn.broadcast()
+                sw_result = txn.broadcast()
+                sw_txid = sw_result.get("txid", "")
                 logger.info(f"Swept {sweep_amt} TRX back from {from_addr}")
+                try:
+                    import tx_log
+                    tx_log.log_tx("tron", "gas", sweep_amt, "TRX",
+                                  from_addr, hot_addr, sw_txid,
+                                  note="leftover sweep-back")
+                except Exception:
+                    pass
         except Exception as e:
             logger.warning(f"TRX sweep-back failed (non-critical): {e}")
     return result
@@ -344,6 +366,14 @@ def swap_usdt_to_trx(amount_usdt: float, slippage_pct: float = 1.0) -> dict:
 
         # Wait and check TRX received
         time.sleep(10)
+        try:
+            import tx_log
+            tx_log.log_tx("tron", "swap", amount_usdt, "USDT",
+                          _get_master_key().public_key.to_base58check_address(),
+                          "sunswap", txid,
+                          note=f"USDT->TRX ~{expected_trx:.2f} TRX")
+        except Exception:
+            pass
         return {"ok": True, "trx_received": expected_trx, "txid": txid}
     except Exception as e:
         logger.error(f"Swap failed: {e}")

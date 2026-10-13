@@ -161,7 +161,14 @@ def send_bnb(to_address: str, amount_bnb: float, retries: int = 3) -> dict:
             }
             signed = acct.sign_transaction(tx)
             tx_hash = w3.eth.send_raw_transaction(_signed_raw_bytes(signed))
-            return {"ok": True, "txid": w3.to_hex(tx_hash)}
+            txid = w3.to_hex(tx_hash)
+            try:
+                import tx_log
+                tx_log.log_tx("bsc", "gas", amount_bnb, "BNB",
+                              acct.address, to_address, txid, note="gas funding")
+            except Exception:
+                pass
+            return {"ok": True, "txid": txid}
         except Exception as e:
             last_err = str(e)
             logger.warning(f"BNB send attempt {attempt + 1}/{retries} failed: {e}")
@@ -220,6 +227,12 @@ def send_usdt_from(priv_key_hex: str, to_address: str, amount_usdt: float) -> di
         tx_hash = w3.eth.send_raw_transaction(_signed_raw_bytes(signed))
         txid = w3.to_hex(tx_hash)
         logger.info(f"BSC USDT sent: {amount_usdt} -> {to_address}, txid={txid}")
+        try:
+            import tx_log
+            tx_log.log_tx("bsc", "usdt_send", amount_usdt, "USDT",
+                          acct.address, to_address, txid)
+        except Exception:
+            pass
         return {"ok": True, "txid": txid}
     except Exception as e:
         logger.error(f"BSC USDT send failed: {e}")
@@ -262,8 +275,16 @@ def send_usdt_from_with_gas(priv_key_hex: str, from_address: str,
                     "chainId": BSC_CHAIN_ID,
                 }
                 signed = acct.sign_transaction(tx)
-                w3.eth.send_raw_transaction(_signed_raw_bytes(signed))
+                sw_hash = w3.eth.send_raw_transaction(_signed_raw_bytes(signed))
+                sw_txid = w3.to_hex(sw_hash)
                 logger.info(f"Swept {sweep_amt:.5f} BNB back from {from_address}")
+                try:
+                    import tx_log
+                    tx_log.log_tx("bsc", "gas", sweep_amt, "BNB",
+                                  from_address, hot, sw_txid,
+                                  note="leftover sweep-back")
+                except Exception:
+                    pass
         except Exception as e:
             logger.warning(f"BNB sweep-back failed (non-critical): {e}")
     return result

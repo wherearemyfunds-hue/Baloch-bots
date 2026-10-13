@@ -2957,6 +2957,14 @@ async def auto_payout(chat_id: int):
             return
 
         txid = result.get("txid", "")
+        try:
+            import tx_log
+            _chain = "bsc" if chain_label.startswith("BNB") else "tron"
+            tx_log.log_tx(_chain, "payout", net, "USDT",
+                          from_addr, to_address, txid,
+                          note=f"deal {state.get('deal_no', chat_id)}")
+        except Exception:
+            pass
         state["payout_done"] = True
         state["payout_txid"] = txid
         state["payout_net"] = net

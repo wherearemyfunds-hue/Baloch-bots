@@ -230,6 +230,18 @@ def user_menu() -> InlineKeyboardMarkup:
     ])
 
 
+async def _clear(callback):
+    """Hide buttons after a press: delete the button message so dead buttons
+    don't pile up. Falls back to just removing the keyboard."""
+    try:
+        await callback.message.delete()
+    except Exception:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+
 def admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📥 My Deposit Address", callback_data="u_address")],
@@ -241,6 +253,8 @@ def admin_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="💰 Withdraw ALL → My Wallet", callback_data="a_withdraw_all")],
         [InlineKeyboardButton(text="📦 Backup Deals", callback_data="a_backup")],
         [InlineKeyboardButton(text="🧹 Recover TRX", callback_data="a_sweep")],
+        [InlineKeyboardButton(text="🧹 Recover BNB", callback_data="a_sweep_bnb")],
+        [InlineKeyboardButton(text="📜 Transaction History", callback_data="a_history")],
     ])
 
 
@@ -278,6 +292,7 @@ async def cmd_start(message: types.Message):
 @dp.callback_query(F.data == "u_address")
 async def cb_u_address(callback: types.CallbackQuery):
     await callback.answer()
+    await _clear(callback)
     u = callback.from_user
     loop = asyncio.get_event_loop()
     rec = await loop.run_in_executor(
@@ -292,6 +307,7 @@ async def cb_u_address(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "u_balance")
 async def cb_u_balance(callback: types.CallbackQuery):
+    await _clear(callback)
     await callback.answer("Checking...")
     u = callback.from_user
     loop = asyncio.get_event_loop()
@@ -394,6 +410,7 @@ async def cb_a_users(callback: types.CallbackQuery):
     await callback.answer()
     if not _is_admin(callback.from_user.id):
         return
+    await _clear(callback)
     users = load_users()
     if not users:
         await callback.message.answer("👥 No users yet.")
@@ -433,6 +450,7 @@ async def cb_user_withdraw(callback: types.CallbackQuery):
     await callback.answer()
     if not _is_admin(callback.from_user.id):
         return
+    await _clear(callback)
     uid = callback.data[len("user_wd_"):]
     rest = uid  # "{chain}_{uid}"
     chain, _, uid = rest.partition("_")
@@ -458,6 +476,7 @@ async def cb_user_wd_confirm(callback: types.CallbackQuery):
     await callback.answer()
     if not _is_admin(callback.from_user.id):
         return
+    await _clear(callback)
     uid = callback.from_user.id
     st = user_state.get(uid, {})
     chain = st.get("chain", "tron")
@@ -496,6 +515,7 @@ async def cb_a_deals(callback: types.CallbackQuery):
     await callback.answer("Loading...")
     if not _is_admin(callback.from_user.id):
         return
+    await _clear(callback)
     import json
     loop = asyncio.get_event_loop()
     def _load():
@@ -552,6 +572,7 @@ async def cb_deal_withdraw(callback: types.CallbackQuery):
     await callback.answer()
     if not _is_admin(callback.from_user.id):
         return
+    await _clear(callback)
     rest = callback.data[len("deal_wd_"):]  # "{chain}_{chat_id}"
     chain, _, chat_id = rest.partition("_")
     if chain not in ("tron", "bsc"):
@@ -567,6 +588,7 @@ async def cb_deal_wd_confirm(callback: types.CallbackQuery):
     await callback.answer()
     if not _is_admin(callback.from_user.id):
         return
+    await _clear(callback)
     uid = callback.from_user.id
     st = user_state.get(uid, {})
     chain = st.get("chain", "tron")
@@ -611,6 +633,7 @@ async def cb_a_sweep(callback: types.CallbackQuery):
     await callback.answer("Sweeping...")
     if not _is_admin(callback.from_user.id):
         return
+    await _clear(callback)
     import json
     await callback.message.answer("🧹 <b>Sweeping leftover TRX...</b>", parse_mode="HTML")
     loop = asyncio.get_event_loop()
@@ -653,6 +676,73 @@ async def cb_a_sweep(callback: types.CallbackQuery):
             lines.append(f"✅ {addr[:10]}...: {amt:.2f} TRX")
     await callback.message.answer("\n".join(lines), parse_mode="HTML",
                                       reply_markup=admin_menu())
+
+
+@dp.callback_query(F.data == "a_sweep_bnb")
+async def cb_a_sweep_bnb(callback: types.CallbackQuery):
+    """Sweep leftover BNB from all deal addresses back to hot wallet."""
+    await callback.answer("Sweeping BNB...")
+    if not _is_admin(callback.from_user.id):
+        return
+    await _clear(callback)
+    import json
+    await callback.message.answer("🧹 <b>Sweeping leftover BNB...</b>", parse_mode="HTML")
+    loop = asyncio.get_event_loop()
+    def _sweep_all():
+        results = []
+        try:
+            with open(_deal_states_path()) as f:
+                states = json.load(f)
+        except Exception:
+            return [("error", "No deal data")]
+        from web3 import Web3
+        w3 = bsc_pay._get_w3()
+        hot = bsc_pay.get_hot_wallet_address()
+        for cid, s in states.items():
+            addr = s.get("bsc_deposit_address")
+            idx = s.get("hd_index", s.get("tron_hd_index"))
+            if not addr or idx is None:
+                continue
+            try:
+                bal = bsc_pay.get_bnb_balance(addr)
+                if bal > 0.002:
+                    # Keep 0.001 BNB reserve, sweep the rest
+                    sweep_amt = bal - 0.001
+                    priv_hex = bsc_pay.get_user_private_key_hex(idx)
+                    acct = w3.eth.account.from_key(priv_hex)
+                    tx = {
+                        "from": acct.address,
+                        "to": Web3.to_checksum_address(hot),
+                        "value": int(sweep_amt * 1e18),
+                        "gas": 21000,
+                        "gasPrice": w3.eth.gas_price,
+                        "nonce": w3.eth.get_transaction_count(acct.address),
+                        "chainId": bsc_pay.BSC_CHAIN_ID,
+                    }
+                    signed = acct.sign_transaction(tx)
+                    tx_hash = w3.eth.send_raw_transaction(
+                        bsc_pay._signed_raw_bytes(signed))
+                    txid = w3.to_hex(tx_hash)
+                    try:
+                        import tx_log
+                        tx_log.log_tx("bsc", "gas", sweep_amt, "BNB",
+                                      addr, hot, txid, note="recover BNB")
+                    except Exception:
+                        pass
+                    results.append((addr, sweep_amt, "ok"))
+                else:
+                    results.append((addr, bal, "skip"))
+            except Exception as e:
+                results.append((addr, 0, f"fail: {e}"))
+        return results
+    results = await loop.run_in_executor(None, _sweep_all)
+    total = sum(r[1] for r in results if r[2] == "ok")
+    lines = [f"🧹 <b>BNB Sweep Complete!</b>\n", f"Recovered: <b>{total:.5f} BNB</b>\n"]
+    for addr, amt, st in results:
+        if st == "ok":
+            lines.append(f"✅ {addr[:10]}...: {amt:.5f} BNB")
+    await callback.message.answer("\n".join(lines), parse_mode="HTML",
+                                  reply_markup=admin_menu())
 
 
 # ============================================================
@@ -726,6 +816,7 @@ async def cb_a_withdraw_all(callback: types.CallbackQuery):
     await callback.answer("Scanning all funds...")
     if not _is_admin(callback.from_user.id):
         return
+    await _clear(callback)
     uid = callback.from_user.id
     await callback.message.answer("🔍 <b>Scanning all addresses (TRON + BSC)...</b>", parse_mode="HTML")
     loop = asyncio.get_event_loop()
@@ -832,6 +923,7 @@ async def cb_withdraw_all_confirm(callback: types.CallbackQuery):
     await callback.answer()
     if not _is_admin(callback.from_user.id):
         return
+    await _clear(callback)
     uid = callback.from_user.id
     st = user_state.get(uid, {})
     if callback.data == "withdraw_all_confirm_no" or st.get("step") != "withdraw_all":
@@ -860,6 +952,7 @@ async def cb_a_swap(callback: types.CallbackQuery):
     await callback.answer()
     if not _is_admin(callback.from_user.id):
         return
+    await _clear(callback)
     user_state[callback.from_user.id] = {"step": "swap_amount"}
     await callback.message.answer(
         "🔄 <b>Swap USDT → TRX</b>\n\n"
@@ -873,6 +966,7 @@ async def cb_swap_confirm(callback: types.CallbackQuery):
     await callback.answer()
     if not _is_admin(callback.from_user.id):
         return
+    await _clear(callback)
     uid = callback.from_user.id
     st = user_state.get(uid, {})
     if callback.data == "swap_confirm_no":
@@ -894,12 +988,52 @@ async def cb_swap_confirm(callback: types.CallbackQuery):
             parse_mode="HTML", reply_markup=admin_menu())
 
 
+@dp.callback_query(F.data == "a_history")
+async def cb_a_history(callback: types.CallbackQuery):
+    """Show recent transaction history (deposits, withdraws, payouts, swaps, gas)."""
+    await callback.answer()
+    if not _is_admin(callback.from_user.id):
+        return
+    await _clear(callback)
+    try:
+        import tx_log
+        import time as _time
+        txs = tx_log.get_history(15)
+        if not txs:
+            await callback.message.answer("📜 No transactions recorded yet.")
+            return
+        _chain_lbl = {"bsc": "BEP20", "tron": "TRC20"}
+        lines = ["📜 <b>Transaction History</b> (latest first)\n"]
+        for t in txs:
+            dt = _time.strftime("%m-%d %H:%M", _time.localtime(t.get("ts", 0)))
+            ch = _chain_lbl.get(t.get("chain", ""), t.get("chain", ""))
+            typ = str(t.get("type", "")).upper().replace("USDT_SEND", "SEND")
+            amt = t.get("amount", 0)
+            asset = t.get("asset", "")
+            frm = t.get("from", "")
+            to = t.get("to", "")
+            frm_s = frm[:8] + "…" if len(frm) > 10 else frm
+            to_s = to[:8] + "…" if len(to) > 10 else to
+            txid = t.get("txid", "")
+            txid_s = f"<code>{txid[:14]}…</code>" if txid else "—"
+            note = f" ({t['note']})" if t.get("note") else ""
+            lines.append(
+                f"• {dt} | {typ}{note}\n"
+                f"  {amt} {asset} ({ch})  {frm_s} → {to_s}\n"
+                f"  {txid_s}"
+            )
+        await callback.message.answer("\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        await callback.message.answer(f"⚠️ History error: {e}")
+
+
 @dp.callback_query(F.data == "a_backup")
 async def cb_a_backup(callback: types.CallbackQuery):
     """Send deal_states.json backup to admin via Telegram."""
     await callback.answer("Preparing...")
     if not _is_admin(callback.from_user.id):
         return
+    await _clear(callback)
     import os
     from aiogram.types import FSInputFile
     path = _deal_states_path()
@@ -922,6 +1056,7 @@ async def cb_send(callback: types.CallbackQuery):
     if not _is_admin(callback.from_user.id):
         await callback.message.answer("⛔ Admin only.")
         return
+    await _clear(callback)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔴 TRON (TRC20)", callback_data="send_net_tron")],
         [InlineKeyboardButton(text="💛 BNB Smart Chain (BEP20)", callback_data="send_net_bsc")],
@@ -938,6 +1073,7 @@ async def cb_send_network(callback: types.CallbackQuery):
     if not _is_admin(callback.from_user.id):
         await callback.message.answer("⛔ Admin only.")
         return
+    await _clear(callback)
     chain = callback.data[len("send_net_"):]
     if chain not in ("tron", "bsc"):
         return
@@ -956,6 +1092,7 @@ async def cb_send_confirm(callback: types.CallbackQuery):
     await callback.answer()
     if not _is_admin(callback.from_user.id):
         return
+    await _clear(callback)
     uid = callback.from_user.id
     st = user_state.get(uid, {})
     chain = st.get("chain", "tron")
@@ -1200,6 +1337,13 @@ async def deposit_monitor():
                             continue
                         amt = int(t.get("value", 0)) / 1_000_000
                         seen.add(txid)
+                        try:
+                            import tx_log
+                            tx_log.log_tx("tron", "deposit", amt, "USDT",
+                                          t.get("from", ""), addr, txid,
+                                          note=f"user deposit {uid}")
+                        except Exception:
+                            pass
                         # Notify admin
                         un = f"@{rec['username']}" if rec.get("username") else ""
                         name = rec.get("first_name", "")
@@ -1248,6 +1392,13 @@ async def deposit_monitor():
                                     if txid in seen_bsc:
                                         continue
                                     seen_bsc.add(txid)
+                                    try:
+                                        import tx_log
+                                        tx_log.log_tx("bsc", "deposit", amt, "USDT",
+                                                      "", bsc_addr, txid,
+                                                      note=f"user deposit {uid}")
+                                    except Exception:
+                                        pass
                                     un = f"@{rec['username']}" if rec.get("username") else ""
                                     name = rec.get("first_name", "")
                                     for aid in ADMIN_IDS:
