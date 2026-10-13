@@ -67,6 +67,7 @@ if [ "$LOCAL" != "$REMOTE" ]; then
     # Chain helper modules the wallet bot imports
     [ -f tron_pay.py ] && cp tron_pay.py /root/tron_pay.py
     [ -f bsc_pay.py ] && cp bsc_pay.py /root/bsc_pay.py
+    [ -f tx_log.py ] && cp tx_log.py /root/tx_log.py
     python3 -m py_compile /root/walletbot.py || { echo "Wallet syntax failed!"; exit 1; }
     python3 -m py_compile /root/bsc_pay.py || { echo "BSC module syntax failed!"; exit 1; }
     pkill -f walletbot.py
