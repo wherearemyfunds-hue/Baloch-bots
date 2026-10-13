@@ -102,6 +102,8 @@ DEFAULT_SETTINGS = {
     "bep20_only_threshold": 500.0,  # deals BELOW this (USDT) -> BEP20 only
     "deal_question_enabled": True,
     "paused": False,              # pause NEW deals (ongoing deals continue)
+    "happy_sticker": "",          # file_id: sent when a deal completes
+    "sad_sticker": "",            # file_id: sent on refund/cancel
 }
 bot_settings: dict = {}
 
@@ -3074,6 +3076,7 @@ async def auto_payout(chat_id: int):
             f"<b>Website: https://balochotc.com/</b>",
             parse_mode="HTML",
         )
+        await _send_deal_sticker(chat_id, "happy")
         await safe_notify_admin(
             f"✅ Auto-payout SENT\nDeal: {chat_id}\n"
             f"Amount: <b>{net} USDT</b> ({chain_label})\n"
@@ -3262,6 +3265,7 @@ async def do_refund_address_confirm(chat_id: int, user: types.User):
         f"<b>Website: https://balochotc.com/</b>",
         parse_mode="HTML",
     )
+    await _send_deal_sticker(chat_id, "sad")
     await safe_notify_admin(
         f"💸 MANUAL REFUND NEEDED\n"
         f"Deal: {chat_id}\n"
@@ -3722,6 +3726,18 @@ _private_greeted: set[int] = set()
 # Shawn (2026-10-13): admin starts the bot in DM and gets buttons to modify
 # fees, limits, and bot behavior. Changes apply instantly, no restart needed.
 _admin_pending: dict[int, str] = {}  # admin user_id -> setting key awaiting a value
+_admin_sticker_pending: dict[int, str] = {}  # admin user_id -> "happy"|"sad" awaiting a sticker
+
+
+async def _send_deal_sticker(chat_id: int, kind: str) -> None:
+    """Send the configured happy/sad sticker to a deal group. Never raises."""
+    try:
+        file_id = (get_setting("happy_sticker" if kind == "happy" else "sad_sticker") or "").strip()
+        if not file_id:
+            return
+        await bot.send_sticker(chat_id, file_id)
+    except Exception as e:
+        logger.warning(f"Deal sticker send failed ({kind}) for {chat_id}: {e}")
 
 # pending key -> (settings key, label, min, max)
 _ADMIN_SETTINGS_META = {
@@ -3755,9 +3771,30 @@ def _admin_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⛓ BEP20-only limit", callback_data="adm_set_chain")],
         [InlineKeyboardButton(text="❓ Question ON/OFF", callback_data="adm_toggle_q"),
          InlineKeyboardButton(text="⏸ Pause/Resume", callback_data="adm_toggle_pause")],
+        [InlineKeyboardButton(text="🎭 Stickers", callback_data="adm_stickers")],
         [InlineKeyboardButton(text="📊 Stats", callback_data="adm_stats"),
          InlineKeyboardButton(text="📋 Active deals", callback_data="adm_deals")],
     ])
+
+
+def _admin_stickers_kb() -> InlineKeyboardMarkup:
+    s = bot_settings or DEFAULT_SETTINGS
+    happy = "✅" if (s.get("happy_sticker") or "").strip() else "❌"
+    sad = "✅" if (s.get("sad_sticker") or "").strip() else "❌"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"😊 Happy sticker {happy}", callback_data="adm_sticker_happy"),
+         InlineKeyboardButton(text=f"😢 Sad sticker {sad}", callback_data="adm_sticker_sad")],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="adm_menu")],
+    ])
+
+
+def _admin_stickers_text() -> str:
+    return (
+        "🎭 <b>Deal Stickers</b>\n\n"
+        "😊 Happy sticker — sent when a deal <b>completes</b>\n"
+        "😢 Sad sticker — sent on <b>refund/cancel</b>\n\n"
+        "Tap a button, then send the sticker here in DM."
+    )
 
 
 def _admin_stats_text() -> str:
@@ -3923,6 +3960,53 @@ async def handle_admin_panel(callback: CallbackQuery):
             await callback.message.edit_text(_admin_deals_text(), parse_mode="HTML", reply_markup=back_kb)
         except Exception:
             await bot.send_message(chat_id, _admin_deals_text(), parse_mode="HTML", reply_markup=back_kb)
+    elif data == "adm_stickers":
+        _admin_pending.pop(uid, None)
+        try:
+            await callback.message.edit_text(_admin_stickers_text(), parse_mode="HTML", reply_markup=_admin_stickers_kb())
+        except Exception:
+            await bot.send_message(chat_id, _admin_stickers_text(), parse_mode="HTML", reply_markup=_admin_stickers_kb())
+    elif data in ("adm_sticker_happy", "adm_sticker_sad"):
+        kind = "happy" if data.endswith("happy") else "sad"
+        _admin_sticker_pending[uid] = kind
+        label = "😊 Happy" if kind == "happy" else "😢 Sad"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Cancel", callback_data="adm_stickers")]])
+        try:
+            await callback.message.edit_text(
+                f"{label} sticker — <b>send the sticker now</b> in this DM.\n\n"
+                f"It will be sent to the deal group on "
+                f"{'completion' if kind == 'happy' else 'refund/cancel'}.",
+                parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            await bot.send_message(
+                chat_id,
+                f"{label} sticker — <b>send the sticker now</b> in this DM.",
+                parse_mode="HTML", reply_markup=kb)
+
+
+@dp.message(F.sticker & (F.chat.type == "private"))
+async def on_private_sticker(message: types.Message):
+    """Capture a sticker the admin sends to configure happy/sad deal stickers."""
+    user = message.from_user
+    if not _is_admin_user(user):
+        return
+    kind = _admin_sticker_pending.get(user.id)
+    if not kind:
+        return
+    file_id = (message.sticker.file_id or "").strip()
+    if not file_id:
+        await message.answer("⚠️ Could not read that sticker, try another one.")
+        return
+    if not bot_settings:
+        load_settings()
+    bot_settings["happy_sticker" if kind == "happy" else "sad_sticker"] = file_id
+    save_settings()
+    _admin_sticker_pending.pop(user.id, None)
+    label = "😊 Happy" if kind == "happy" else "😢 Sad"
+    await message.answer(
+        f"✅ {label} sticker saved!\n\n" + _admin_stickers_text(),
+        parse_mode="HTML", reply_markup=_admin_stickers_kb())
 
 
 @dp.message(F.text & (F.chat.type == "private"))
