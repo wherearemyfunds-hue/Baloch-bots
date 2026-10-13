@@ -18,7 +18,9 @@ logger = logging.getLogger("bsc_pay")
 
 # USDT BEP20 on BSC mainnet
 USDT_CONTRACT = "0x55d398326f99059fF775485246999027B3197955"
-USDT_DECIMALS = 6
+# BEP20 USDT uses 18 decimals (unlike TRC20 USDT's 6). Was wrongly 6, which
+# made balances show 1e12x too large and sends transfer dust.
+USDT_DECIMALS = 18
 # Chain ID for BSC mainnet
 BSC_CHAIN_ID = 56
 # Transfer(address,address,uint256) event topic (well-known constant)
