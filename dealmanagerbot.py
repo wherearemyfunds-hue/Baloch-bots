@@ -1082,6 +1082,17 @@ async def maybe_chat_reply(message: types.Message, state: dict, stage: str) -> b
     display = f"@{user.username}" if user.username else (user.first_name or "User")
     greeted = state.setdefault("_greeted_users", [])
     first_contact = user.id not in greeted
+    # No AI greeting while roles aren't chosen yet — the role buttons sent on
+    # join are enough (Shawn: "just Role bhjay jab koi user join kry").
+    # The user can still get answers by mentioning the bot after picking a role.
+    if first_contact and state.get("stage") == "role_selection":
+        if user.id not in greeted:
+            greeted.append(user.id)
+        try:
+            save_deal_states()
+        except Exception:
+            pass
+        return False
     # Show a reading indicator while the AI thinks; replaced by the real answer.
     indicator = None
     try:
@@ -1686,6 +1697,36 @@ def _request_group_cleanup(chat_id: int):
             f"(no payment in 5h + 12h reminder window)."))
     except Exception:
         pass
+
+
+def _request_fresh_invite_link(chat_id: int, admin_id: int) -> bool:
+    """Ask the creator bot for a fresh invite link via the shared pool file.
+
+    Used when the current link shows "expired" (e.g. revoked during recycling).
+    The creator bot exports a new link and DMs it to the admin.
+    Returns True if the request was queued.
+    """
+    try:
+        pool = {}
+        if os.path.exists(POOL_FILE):
+            with open(POOL_FILE, "r") as f:
+                pool = json.load(f)
+        reqs = pool.setdefault("link_requests", [])
+        # Replace any pending request for the same chat
+        reqs[:] = [r for r in reqs if str(r.get("chat_id")) != str(chat_id)]
+        reqs.append({"chat_id": str(chat_id), "admin_id": admin_id,
+                     "at": time.time()})
+        fd, tmp = tempfile.mkstemp(dir=BASE_DIR, prefix=".pool", suffix=".tmp")
+        with os.fdopen(fd, "w") as fo:
+            json.dump(pool, fo, indent=2)
+            fo.flush()
+            os.fsync(fo.fileno())
+        os.replace(tmp, POOL_FILE)
+        logger.info(f"Fresh invite link requested for group {chat_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to request invite link for {chat_id}: {e}")
+        return False
 
 
 async def tron_payment_monitoring(chat_id: int, address: str, expected: float,
@@ -4062,6 +4103,16 @@ async def universal_stage_handler(message: types.Message):
     _cmd = _text.split("@")[0]
     if _cmd in ("/start", "/deal") and message.chat.type in ("group", "supergroup"):
         await _do_start_command(message)
+        return
+    # Admin-only: /link — request a fresh invite link (when the old one expired).
+    if _cmd == "/link" and message.chat.type in ("group", "supergroup"):
+        if not _is_admin_user(message.from_user):
+            return
+        if _request_fresh_invite_link(chat_id, message.from_user.id):
+            await message.answer(
+                "🔗 Fresh invite link requested — I'll DM it to you in a moment.")
+        else:
+            await message.answer("⚠️ Could not request a fresh link, try again.")
         return
     if chat_id not in deal_states:
         # No deal in this chat — still answer direct mentions (@Balochhelpbot /

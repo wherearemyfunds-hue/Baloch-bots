@@ -234,10 +234,11 @@ def _load_pool() -> dict:
                 d.setdefault("groups", {})
                 d.setdefault("needs_reset", [])
                 d.setdefault("pending_cleanup", [])
+                d.setdefault("link_requests", [])
                 return d
     except Exception as e:
         logger.error(f"pool load failed: {e}")
-    return {"groups": {}, "needs_reset": [], "pending_cleanup": []}
+    return {"groups": {}, "needs_reset": [], "pending_cleanup": [], "link_requests": []}
 
 
 def _save_pool(pool: dict):
@@ -511,13 +512,17 @@ async def cleanup_loop():
     The manager flags group chat ids in pool['pending_cleanup'] after the
     5h payment window + 12h reminder expire with no payment. We clear the
     chat, kick non-service members, revoke links, and mark spare for reuse.
+
+    Also handles pool['link_requests']: export a fresh invite link for a
+    deal group (when the old one expired) and DM it to the requesting admin.
     """
     await asyncio.sleep(300)  # let startup settle
     while True:
         try:
             pool = _load_pool()
             pending = pool.get("pending_cleanup", [])
-            if not pending:
+            link_reqs = pool.get("link_requests", [])
+            if not pending and not link_reqs:
                 await asyncio.sleep(600)
                 continue
             for cid_str in list(pending):
@@ -538,6 +543,30 @@ async def cleanup_loop():
                     logger.info(f"cleanup: group {cid} is now spare")
                 else:
                     logger.warning(f"cleanup: group {cid} failed, will retry")
+            for req in list(link_reqs):
+                try:
+                    cid = int(req.get("chat_id", 0))
+                    admin_id = int(req.get("admin_id", 0))
+                except (ValueError, TypeError, AttributeError):
+                    link_reqs.remove(req)
+                    continue
+                try:
+                    entity = await user_client.get_entity(cid)
+                    inv = await user_client(ExportChatInviteRequest(peer=entity))
+                    link = getattr(inv, "link", None)
+                    if link and admin_id:
+                        await bot_client.send_message(
+                            admin_id,
+                            f"🔗 <b>Fresh invite link</b>\n\n{link}\n\n"
+                            f"(Group ID: <code>{cid}</code>)",
+                            parse_mode="html",
+                        )
+                        logger.info(f"link: fresh invite sent for group {cid}")
+                    else:
+                        logger.warning(f"link: export failed for group {cid}")
+                except Exception as e:
+                    logger.warning(f"link: request for {cid} failed: {e}")
+                link_reqs.remove(req)
             _save_pool(pool)
         except Exception as e:
             logger.error(f"cleanup loop error: {e}")
