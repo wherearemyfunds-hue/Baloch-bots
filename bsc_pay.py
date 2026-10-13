@@ -174,16 +174,19 @@ def ensure_gas(address: str, min_bnb: float = 0.004) -> bool:
         bal = get_bnb_balance(address)
         if bal >= min_bnb:
             return True
-        # Sanity check: is the hot wallet actually funded?
-        hot_bal = get_bnb_balance(_get_hot_acct().address)
-        if hot_bal < min_bnb:
-            logger.error(f"BSC ensure_gas: hot wallet has {hot_bal} BNB, need {min_bnb} — truly empty")
-            return False
-        logger.info(f"Funding BSC gas: {address} has {bal} BNB, sending {min_bnb} (hot wallet: {hot_bal})")
+        # NOTE: get_bnb_balance returns 0.0 on RPC errors too, so a 0 reading
+        # does NOT prove the hot wallet is empty — just try the funding send
+        # (with retries) and inspect the error.
+        logger.info(f"Funding BSC gas: {address} has {bal} BNB, sending {min_bnb}")
         result = send_bnb(address, min_bnb)
         if result.get("ok"):
             time.sleep(8)  # let it confirm (~3s blocks)
             return True
+        err = result.get("error", "").lower()
+        if "insufficient funds" in err or "insufficient balance" in err:
+            logger.error("BSC ensure_gas: hot wallet truly empty (insufficient funds)")
+        else:
+            logger.error(f"BSC ensure_gas: send_bnb failed (likely RPC/throttle): {result.get('error')}")
         return False
     except Exception as e:
         logger.error(f"BSC ensure_gas failed: {e}")
