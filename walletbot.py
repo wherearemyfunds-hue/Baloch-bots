@@ -55,6 +55,27 @@ GAS_LABEL = {"tron": "TRX", "bsc": "BNB"}
 # (same folder as the running script, e.g. /root/bot_settings.json on the VPS)
 # and this bot re-reads it whenever the file changes — no restart needed.
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_settings.json")
+
+
+def _deal_states_path() -> str:
+    """Locate the deal bot's deal_states.json across VPS layouts.
+
+    dealmanagerbot.py writes it next to itself (its BASE_DIR); on the VPS
+    that may be /root/ or /root/baloch-bots/. Check candidates in order so
+    deal-escrow balances/withdrawals keep working wherever it lives.
+    """
+    candidates = [
+        "/root/deal_states.json",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "deal_states.json"),
+        "/root/baloch-bots/deal_states.json",
+    ]
+    for p in candidates:
+        try:
+            if os.path.exists(p):
+                return p
+        except Exception:
+            pass
+    return candidates[0]
 _settings_cache = {"mtime": 0, "data": {}}
 
 
@@ -319,7 +340,7 @@ async def cb_u_balance(callback: types.CallbackQuery):
         except Exception:
             pass
         try:
-            with open("/root/deal_states.json") as f:
+            with open(_deal_states_path()) as f:
                 states = json.load(f)
             for s in states.values():
                 da = s.get("tron_deposit_address")
@@ -477,7 +498,7 @@ async def cb_a_deals(callback: types.CallbackQuery):
     loop = asyncio.get_event_loop()
     def _load():
         try:
-            with open("/root/deal_states.json") as f:
+            with open(_deal_states_path()) as f:
                 return json.load(f)
         except Exception:
             return {}
@@ -588,7 +609,7 @@ async def cb_a_sweep(callback: types.CallbackQuery):
     def _sweep_all():
         results = []
         try:
-            with open("/root/deal_states.json") as f:
+            with open(_deal_states_path()) as f:
                 states = json.load(f)
         except Exception:
             return [("error", "No deal data")]
@@ -643,7 +664,7 @@ def _scan_all_funds():
     except Exception:
         users = {}
     try:
-        with open("/root/deal_states.json") as f:
+        with open(_deal_states_path()) as f:
             states = json.load(f)
     except Exception:
         states = {}
@@ -873,7 +894,7 @@ async def cb_a_backup(callback: types.CallbackQuery):
         return
     import os
     from aiogram.types import FSInputFile
-    path = "/root/deal_states.json"
+    path = _deal_states_path()
     if not os.path.exists(path):
         await callback.message.answer("❌ No deal data yet.")
         return
@@ -1062,7 +1083,7 @@ async def handle_text(message: types.Message):
         loop = asyncio.get_event_loop()
         def _load():
             try:
-                with open("/root/deal_states.json") as f:
+                with open(_deal_states_path()) as f:
                     return json.load(f)
             except Exception:
                 return {}

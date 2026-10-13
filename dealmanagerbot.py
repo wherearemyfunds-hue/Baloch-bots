@@ -1031,6 +1031,8 @@ async def maybe_chat_reply(message: types.Message, state: dict, stage: str) -> b
     The bot replies ONLY when someone mentions @Balochhelpbot or @Balochbuyer,
     or replies to the bot's own message. It never answers ordinary messages
     on its own — no triggers on plain questions, greetings, or the word "bot".
+    While a deal is ACTIVE in the chat, it stays completely silent EXCEPT when
+    @Balochbuyer (admin) is mentioned (Shawn's spec 2026-10-13).
     Shows "Reading your question..." while the AI thinks, then replaces it
     with the real answer. Stays silent if the AI call fails.
     Returns True if a reply was sent.
@@ -1048,12 +1050,21 @@ async def maybe_chat_reply(message: types.Message, state: dict, stage: str) -> b
     except Exception:
         pass
     mentioned = False
+    admin_mentioned = False
     if bot_username and re.search(rf"@{re.escape(bot_username)}\b", text, re.IGNORECASE):
         mentioned = True
-    elif re.search(r"@balochbuyer\b", low):
+    if re.search(r"@balochbuyer\b", low):
         mentioned = True
+        admin_mentioned = True
     if not (mentioned or replied_to_bot):
         return False
+    # Deal-time silence: while a deal is active here, answer ONLY an
+    # @Balochbuyer (admin) mention. Chats with no active deal keep the
+    # normal mentions-only behavior.
+    if not admin_mentioned:
+        _ds = deal_states.get(message.chat.id)
+        if _ds and not (_ds.get("payout_done") or _ds.get("refund_done")):
+            return False
     # Identical-repeat guard: same mention twice in a row -> answer once.
     if text == state.get("_chat_last_text") and now - state.get("_chat_reply_at", 0) < 120:
         return False
@@ -1565,7 +1576,8 @@ async def show_payment_info_tron(chat_id: int):
     await show_payment_info_chain(chat_id, "tron")
 
 
-async def tron_payment_monitoring(chat_id: int, address: str, expected: float, duration_minutes: int = 120):
+async def tron_payment_monitoring(chat_id: int, address: str, expected: float,
+                                  duration_minutes: int = 120, resumed: bool = False):
     """
     Monitor TRON blockchain for USDT deposits.
     Handles partial payments like Cryptomus:
@@ -1583,7 +1595,9 @@ async def tron_payment_monitoring(chat_id: int, address: str, expected: float, d
     total_received = 0.0
     underpay_notified = False
 
-    # Baseline: ignore txs that existed before monitoring started
+    # Baseline: ignore txs that existed before monitoring started.
+    # On resume (bot restart), only baseline txs from BEFORE the payment
+    # window started — a payment made while we were down must be caught.
     try:
         r = tron_pay._get_with_retry(
             f"https://api.trongrid.io/v1/accounts/{address}/transactions/trc20",
@@ -1591,7 +1605,10 @@ async def tron_payment_monitoring(chat_id: int, address: str, expected: float, d
                     "contract_address": tron_pay.USDT_CONTRACT},
         )
         if r.status_code == 200:
+            cutoff_ms = int(state.get("payment_start_time", 0) * 1000) if resumed else 0
             for t in r.json().get("data", []):
+                if cutoff_ms and t.get("block_timestamp", 0) >= cutoff_ms:
+                    continue  # may have arrived during downtime — check it
                 seen_txids.add(t.get("transaction_id", ""))
     except Exception as e:
         logger.warning(f"[TRON Monitor] Baseline fetch failed: {e}")
@@ -1667,26 +1684,32 @@ async def tron_payment_monitoring(chat_id: int, address: str, expected: float, d
         logger.error(f"[TRON Monitor] Chat {chat_id} - error: {e}")
 
 
-async def bsc_payment_monitoring(chat_id: int, address: str, expected: float, duration_minutes: int = 120):
+async def bsc_payment_monitoring(chat_id: int, address: str, expected: float,
+                                 duration_minutes: int = 120, resumed: bool = False):
     """
     Monitor BNB Smart Chain for USDT (BEP20) deposits.
     Mirrors tron_payment_monitoring: cumulative >= expected - $3 accepts.
+    resumed=True (after bot restart): look back so a payment made while the
+    bot was down is still caught instead of missed.
     """
     import bsc_pay
     state = deal_states.get(chat_id)
     if not state:
         return
-    logger.info(f"[BSC Monitor] Started for chat {chat_id}, address {address}")
+    logger.info(f"[BSC Monitor] Started for chat {chat_id}, address {address} (resumed={resumed})")
     end_time = time.time() + (duration_minutes * 60)
     total_received = 0.0
     underpay_notified = False
 
-    # Start from the current block — ignore anything before monitoring started
+    # Start from the current block — ignore anything before monitoring started.
+    # On resume, look back (get_new_deposits caps the window at 5000 blocks)
+    # so a payment made before the restart is not missed.
     try:
-        last_block = bsc_pay.get_latest_block() or 0
+        latest = bsc_pay.get_latest_block() or 0
     except Exception as e:
         logger.warning(f"[BSC Monitor] Could not get latest block: {e}")
-        last_block = 0
+        latest = 0
+    last_block = max(0, latest - 5000) if (resumed and latest) else latest
     state["bsc_last_block"] = last_block
 
     try:
@@ -1697,12 +1720,13 @@ async def bsc_payment_monitoring(chat_id: int, address: str, expected: float, du
             if stage not in ("payment", "payment_monitoring"):
                 break
             try:
-                deposits = bsc_pay.get_new_deposits(address, last_block)
-                for d in deposits:
-                    last_block = max(last_block, d["block"])
-                    amt = d["amount"]
+                # get_new_deposits -> (deposits, latest_block);
+                # deposits = [(amount, txid), ...]
+                deposits, latest = bsc_pay.get_new_deposits(address, last_block)
+                last_block = latest
+                for amt, txid in deposits:
                     total_received = round(total_received + amt, 2)
-                    logger.info(f"[BSC Monitor] Chat {chat_id}: +{amt} USDT (total {total_received}/{expected})")
+                    logger.info(f"[BSC Monitor] Chat {chat_id}: +{amt} USDT (total {total_received}/{expected}) tx={txid[:12]}...")
                 state["bsc_last_block"] = last_block
                 shortfall = round(expected - total_received, 2)
                 if total_received > 0 and shortfall <= 3.0:
@@ -4800,13 +4824,15 @@ async def main():
                     taddr = r_state.get("tron_deposit_address")
                     if taddr:
                         tasks.append(asyncio.create_task(tron_payment_monitoring(
-                            r_chat_id, taddr, r_state.get("buyer_amount", 0), duration_minutes=120)))
+                            r_chat_id, taddr, r_state.get("buyer_amount", 0), duration_minutes=120,
+                            resumed=True)))
                     if BSC_ENABLED:
                         import bsc_pay as _bp
                         baddr = r_state.get("bsc_deposit_address")
                         if baddr:
                             tasks.append(asyncio.create_task(bsc_payment_monitoring(
-                                r_chat_id, baddr, r_state.get("buyer_amount", 0), duration_minutes=120)))
+                                r_chat_id, baddr, r_state.get("buyer_amount", 0), duration_minutes=120,
+                                resumed=True)))
                     if tasks:
                         payment_monitoring_tasks[r_chat_id] = tasks
                         logger.info(f"Resumed chain payment monitoring for chat {r_chat_id}")

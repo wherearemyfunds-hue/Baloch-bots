@@ -247,6 +247,15 @@ def send_usdt_from_with_gas(priv_key_hex: str, from_address: str,
     return result
 
 
+def get_latest_block() -> int:
+    """Current BSC block number (0 on error)."""
+    try:
+        return int(_get_w3().eth.block_number)
+    except Exception as e:
+        logger.warning(f"BSC get_latest_block failed: {e}")
+        return 0
+
+
 def get_new_deposits(address: str, from_block: int) -> tuple:
     """
     Fetch incoming USDT Transfer events to address since from_block.
