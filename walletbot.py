@@ -1264,7 +1264,9 @@ async def deposit_monitor():
             save_users(users)
         except Exception as e:
             logger.error(f"Deposit monitor error: {e}")
-        await asyncio.sleep(30)
+        # 120s: the public BSC RPC rate-limits getLogs aggressively (-32005);
+        # a slower scan keeps deposit notices working without throttling.
+        await asyncio.sleep(120)
 
 
 async def main():

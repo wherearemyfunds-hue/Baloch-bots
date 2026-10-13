@@ -1684,10 +1684,11 @@ async def tron_payment_monitoring(chat_id: int, address: str, expected: float,
 async def bsc_payment_monitoring(chat_id: int, address: str, expected: float,
                                  duration_minutes: int = 120, resumed: bool = False):
     """
-    Monitor BNB Smart Chain for USDT (BEP20) deposits.
-    Mirrors tron_payment_monitoring: cumulative >= expected - $3 accepts.
-    resumed=True (after bot restart): look back so a payment made while the
-    bot was down is still caught instead of missed.
+    Monitor BNB Smart Chain for USDT (BEP20) deposits via balance polling.
+    Every deal uses a fresh unique address, so the on-chain balance IS the
+    payment signal: balance >= expected - $3 accepts.
+    Balance polling (single eth_call) is far less throttled than getLogs
+    scans, which the public BSC RPC rate-limits aggressively (-32005).
     """
     import bsc_pay
     state = deal_states.get(chat_id)
@@ -1695,19 +1696,7 @@ async def bsc_payment_monitoring(chat_id: int, address: str, expected: float,
         return
     logger.info(f"[BSC Monitor] Started for chat {chat_id}, address {address} (resumed={resumed})")
     end_time = time.time() + (duration_minutes * 60)
-    total_received = 0.0
     underpay_notified = False
-
-    # Start from the current block — ignore anything before monitoring started.
-    # On resume, look back (get_new_deposits caps the window at 5000 blocks)
-    # so a payment made before the restart is not missed.
-    try:
-        latest = bsc_pay.get_latest_block() or 0
-    except Exception as e:
-        logger.warning(f"[BSC Monitor] Could not get latest block: {e}")
-        latest = 0
-    last_block = max(0, latest - 5000) if (resumed and latest) else latest
-    state["bsc_last_block"] = last_block
 
     try:
         while time.time() < end_time:
@@ -1717,14 +1706,12 @@ async def bsc_payment_monitoring(chat_id: int, address: str, expected: float,
             if stage not in ("payment", "payment_monitoring"):
                 break
             try:
-                # get_new_deposits -> (deposits, latest_block);
-                # deposits = [(amount, txid), ...]
-                deposits, latest = bsc_pay.get_new_deposits(address, last_block)
-                last_block = latest
-                for amt, txid in deposits:
-                    total_received = round(total_received + amt, 2)
-                    logger.info(f"[BSC Monitor] Chat {chat_id}: +{amt} USDT (total {total_received}/{expected}) tx={txid[:12]}...")
-                state["bsc_last_block"] = last_block
+                loop = asyncio.get_event_loop()
+                total_received = await loop.run_in_executor(
+                    None, bsc_pay.get_usdt_balance, address)
+                total_received = round(total_received or 0.0, 2)
+                if total_received > 0:
+                    logger.info(f"[BSC Monitor] Chat {chat_id}: balance {total_received}/{expected}")
                 shortfall = round(expected - total_received, 2)
                 if total_received > 0 and shortfall <= 3.0:
                     # Accept: exact, overpaid, or within $3 tolerance
@@ -1751,14 +1738,20 @@ async def bsc_payment_monitoring(chat_id: int, address: str, expected: float,
                     )
             except Exception as e:
                 logger.warning(f"[BSC Monitor] Poll error: {e}")
-            await asyncio.sleep(15)
-        # Timeout
+            await asyncio.sleep(20)
+        # Timeout — re-check final balance for an accurate message
         state = deal_states.get(chat_id)
         if state and state.get("stage") in ("payment", "payment_monitoring"):
-            if total_received > 0:
+            try:
+                loop = asyncio.get_event_loop()
+                final_bal = round(await loop.run_in_executor(
+                    None, bsc_pay.get_usdt_balance, address) or 0.0, 2)
+            except Exception:
+                final_bal = 0.0
+            if final_bal > 0:
                 await bot.send_message(
                     chat_id,
-                    f"⏰ Payment timeout. Received <b>{total_received} USDT</b> of <b>{expected} USDT</b>.\n"
+                    f"⏰ Payment timeout. Received <b>{final_bal} USDT</b> of <b>{expected} USDT</b>.\n"
                     f"Contact admin @{ADMIN_USERNAME}.",
                     parse_mode="HTML",
                 )
