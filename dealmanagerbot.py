@@ -538,7 +538,7 @@ def validate_payout_address(address: str, chain: str = "tron") -> tuple[bool, st
 
 def payout_prompt_text(chain: str = "tron") -> str:
     """Payout address prompt — same chain as the deposit, with the fee stated."""
-    fee = WITHDRAW_FEE.get(chain, 3.0)
+    fee = withdraw_fee(chain)
     if chain == "bsc":
         return (f"please send your payout address (USDT <b>BEP20</b> only — starts with 0x). "
                 f"The buyer paid on BNB Smart Chain, so payout stays on this network — no conversion fee. "
@@ -552,7 +552,7 @@ def payout_prompt_text(chain: str = "tron") -> str:
 
 def refund_prompt_text(chain: str = "tron") -> str:
     """Refund address prompt — same chain as the deposit, with the fee stated."""
-    fee = WITHDRAW_FEE.get(chain, 3.0)
+    fee = withdraw_fee(chain)
     if chain == "bsc":
         return (f"please send your refund address (USDT <b>BEP20</b> only — starts with 0x). "
                 f"The buyer paid on BNB Smart Chain, so refund stays on this network — no conversion fee. "
@@ -2899,7 +2899,7 @@ async def do_address_confirm(chat_id: int, user: types.User):
     address = state["payout_address"]
     chain = state.get("chain", "tron")
     chain_label = "BNB Smart Chain (BEP20)" if chain == "bsc" else "TRON (TRC20)"
-    wfee = WITHDRAW_FEE.get(chain, 3.0)
+    wfee = withdraw_fee(chain)
     net = round(amount - wfee, 2)
 
     state["payout_done"] = True
@@ -3065,7 +3065,7 @@ async def do_refund_address_confirm(chat_id: int, user: types.User):
     address = state["refund_address"]
     chain = state.get("chain", "tron")
     chain_label = "BNB Smart Chain (BEP20)" if chain == "bsc" else "TRON (TRC20)"
-    wfee = WITHDRAW_FEE.get(chain, 3.0)
+    wfee = withdraw_fee(chain)
     net = round(amount - wfee, 2)
 
     state["refund_done"] = True
@@ -3454,6 +3454,19 @@ async def _do_start_command(message: types.Message):
     """Shared logic for /start — called by Command filter and text fallback."""
     chat_id = message.chat.id
     if message.chat.type == "private":
+        # NOTE (aiogram 3): event propagation STOPS at the first matching
+        # handler, so the Command("start") handler above consumes DM /start
+        # and on_private_message never sees it — handle private /start HERE.
+        if _is_admin_user(message.from_user):
+            await _admin_show_menu(chat_id)
+        else:
+            await message.answer(
+                "👋 <b>Salam! I'm the Baloch OTC escrow assistant.</b>\n\n"
+                "Ask me anything about escrow — how it works, fees, safety — "
+                "in any language. Deals happen in deal groups; I'm here so "
+                "everything is easy to understand. 🙂",
+                parse_mode="HTML",
+            )
         return
     group_title = message.chat.title
     if not is_baloch_deal_group(group_title):
@@ -3525,6 +3538,9 @@ async def handle_role_guess_no(callback: CallbackQuery):
 # PRIVATE CHAT: Full-AI escrow assistant (1-on-1)
 # ==============================================
 _private_chat_at: dict[int, float] = {}
+# Mention-reply state for chats with no deal (group mentions of @Balochhelpbot /
+# @Balochbuyer) — separate from deal_states so random groups never pollute it.
+_mention_states: dict[int, dict] = {}
 _private_greeted: set[int] = set()
 
 
@@ -3750,18 +3766,8 @@ async def on_private_message(message: types.Message):
     user = message.from_user
     is_admin = _is_admin_user(user)
     if text.startswith("/"):
-        # Friendly /start in private (group /start is handled elsewhere)
-        if text.split("@")[0].split(" ")[0] == "/start":
-            if is_admin:
-                await _admin_show_menu(message.chat.id)
-            else:
-                await message.answer(
-                    "👋 <b>Salam! I'm the Baloch OTC escrow assistant.</b>\n\n"
-                    "Ask me anything about escrow — how it works, fees, safety — "
-                    "in any language. Deals happen in deal groups; I'm here so "
-                    "everything is easy to understand. 🙂",
-                    parse_mode="HTML",
-                )
+        # NOTE: DM /start is consumed by the Command("start") handler above
+        # (aiogram 3 stops at first match) and handled in _do_start_command.
         return
     if is_admin and user.id in _admin_pending:
         await _admin_setting_input(message, text)
@@ -3797,9 +3803,20 @@ async def universal_stage_handler(message: types.Message):
         await _do_start_command(message)
         return
     if chat_id not in deal_states:
+        # No deal in this chat — still answer direct mentions (@Balochhelpbot /
+        # @Balochbuyer) like a human admin; stay silent otherwise.
+        if len(_mention_states) > 1000:
+            _mention_states.clear()
+        await maybe_chat_reply(message, _mention_states.setdefault(chat_id, {}), "?")
         return
-    # Service/admin accounts never participate in deal flow — ignore completely.
+    # Service/admin accounts never participate in deal flow — ignore completely,
+    # except an explicit mention of the bot (or a reply to it) still gets a
+    # chat reply (e.g. @Balochbuyer asking the bot something). Bot accounts
+    # themselves are always ignored so the bot never answers its own messages.
     if _is_service_account(message.from_user):
+        if not getattr(message.from_user, "is_bot", False):
+            _svc_state = deal_states[chat_id]
+            await maybe_chat_reply(message, _svc_state, _svc_state.get("stage", "?"))
         return
     # Text commands (typed replies replacing buttons) are checked FIRST.
     # If the message was a command for the current stage, it is consumed here.
