@@ -135,6 +135,12 @@ def get_bnb_balance(address: str) -> float:
         return 0.0
 
 
+def _signed_raw_bytes(signed):
+    """Raw tx bytes from a SignedTransaction — web3 v6 uses .rawTransaction,
+    v7+ renamed it to .raw_transaction. Supports both."""
+    return getattr(signed, "raw_transaction", None) or signed.rawTransaction
+
+
 def send_bnb(to_address: str, amount_bnb: float, retries: int = 3) -> dict:
     """Send BNB from hot wallet (for gas funding). Retries on RPC hiccups
     (the public BSC endpoint throttles aggressively)."""
@@ -154,7 +160,7 @@ def send_bnb(to_address: str, amount_bnb: float, retries: int = 3) -> dict:
                 "chainId": BSC_CHAIN_ID,
             }
             signed = acct.sign_transaction(tx)
-            tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+            tx_hash = w3.eth.send_raw_transaction(_signed_raw_bytes(signed))
             return {"ok": True, "txid": w3.to_hex(tx_hash)}
         except Exception as e:
             last_err = str(e)
@@ -211,7 +217,7 @@ def send_usdt_from(priv_key_hex: str, to_address: str, amount_usdt: float) -> di
             "chainId": BSC_CHAIN_ID,
         })
         signed = acct.sign_transaction(tx)
-        tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+        tx_hash = w3.eth.send_raw_transaction(_signed_raw_bytes(signed))
         txid = w3.to_hex(tx_hash)
         logger.info(f"BSC USDT sent: {amount_usdt} -> {to_address}, txid={txid}")
         return {"ok": True, "txid": txid}
@@ -256,7 +262,7 @@ def send_usdt_from_with_gas(priv_key_hex: str, from_address: str,
                     "chainId": BSC_CHAIN_ID,
                 }
                 signed = acct.sign_transaction(tx)
-                w3.eth.send_raw_transaction(signed.rawTransaction)
+                w3.eth.send_raw_transaction(_signed_raw_bytes(signed))
                 logger.info(f"Swept {sweep_amt:.5f} BNB back from {from_address}")
         except Exception as e:
             logger.warning(f"BNB sweep-back failed (non-critical): {e}")
