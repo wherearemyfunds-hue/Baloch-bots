@@ -257,6 +257,7 @@ def _deposit_addresses_block(rec: dict) -> str:
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
+    logger.info(f"DBG /start reached cmd_start from user {message.from_user.id} text={message.text!r}")
     if not (USE_TRON and TRON_AVAILABLE):
         await message.answer("⛔ Wallet not configured.")
         return
@@ -981,6 +982,8 @@ async def handle_text(message: types.Message):
     uid = message.from_user.id
     st = user_state.get(uid)
     if not st:
+        if message.text and message.text.startswith("/"):
+            logger.info(f"DBG command-like text fell through to handle_text: {message.text!r} from {uid}")
         return
     if not _is_admin(uid):
         user_state.pop(uid, None)
