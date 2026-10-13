@@ -135,27 +135,33 @@ def get_bnb_balance(address: str) -> float:
         return 0.0
 
 
-def send_bnb(to_address: str, amount_bnb: float) -> dict:
-    """Send BNB from hot wallet (for gas funding)."""
-    try:
-        from web3 import Web3
-        w3 = _get_w3()
-        acct = _get_hot_acct()
-        tx = {
-            "from": acct.address,
-            "to": Web3.to_checksum_address(to_address),
-            "value": int(amount_bnb * 1e18),
-            "gas": 21000,
-            "gasPrice": w3.eth.gas_price,
-            "nonce": w3.eth.get_transaction_count(acct.address),
-            "chainId": BSC_CHAIN_ID,
-        }
-        signed = acct.sign_transaction(tx)
-        tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
-        return {"ok": True, "txid": w3.to_hex(tx_hash)}
-    except Exception as e:
-        logger.error(f"BNB send failed: {e}")
-        return {"ok": False, "error": str(e)}
+def send_bnb(to_address: str, amount_bnb: float, retries: int = 3) -> dict:
+    """Send BNB from hot wallet (for gas funding). Retries on RPC hiccups
+    (the public BSC endpoint throttles aggressively)."""
+    from web3 import Web3
+    last_err = ""
+    for attempt in range(retries):
+        try:
+            w3 = _get_w3()
+            acct = _get_hot_acct()
+            tx = {
+                "from": acct.address,
+                "to": Web3.to_checksum_address(to_address),
+                "value": int(amount_bnb * 1e18),
+                "gas": 21000,
+                "gasPrice": w3.eth.gas_price,
+                "nonce": w3.eth.get_transaction_count(acct.address),
+                "chainId": BSC_CHAIN_ID,
+            }
+            signed = acct.sign_transaction(tx)
+            tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+            return {"ok": True, "txid": w3.to_hex(tx_hash)}
+        except Exception as e:
+            last_err = str(e)
+            logger.warning(f"BNB send attempt {attempt + 1}/{retries} failed: {e}")
+            time.sleep(2 * (attempt + 1))
+    logger.error(f"BNB send failed after {retries} tries: {last_err}")
+    return {"ok": False, "error": last_err}
 
 
 def ensure_gas(address: str, min_bnb: float = 0.004) -> bool:
@@ -168,7 +174,12 @@ def ensure_gas(address: str, min_bnb: float = 0.004) -> bool:
         bal = get_bnb_balance(address)
         if bal >= min_bnb:
             return True
-        logger.info(f"Funding BSC gas: {address} has {bal} BNB, sending {min_bnb}")
+        # Sanity check: is the hot wallet actually funded?
+        hot_bal = get_bnb_balance(_get_hot_acct().address)
+        if hot_bal < min_bnb:
+            logger.error(f"BSC ensure_gas: hot wallet has {hot_bal} BNB, need {min_bnb} — truly empty")
+            return False
+        logger.info(f"Funding BSC gas: {address} has {bal} BNB, sending {min_bnb} (hot wallet: {hot_bal})")
         result = send_bnb(address, min_bnb)
         if result.get("ok"):
             time.sleep(8)  # let it confirm (~3s blocks)
