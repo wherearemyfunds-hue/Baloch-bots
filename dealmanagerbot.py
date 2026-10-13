@@ -3782,6 +3782,11 @@ async def on_private_message(message: types.Message):
     if text.startswith("/"):
         # NOTE: DM /start is consumed by the Command("start") handler above
         # (aiogram 3 stops at first match) and handled in _do_start_command.
+        # Case-insensitive fallback: a typed "/Start" doesn't match the
+        # case-sensitive Command filter, so route it here.
+        _t = text.lower()
+        if _t.split()[0].split("@")[0] in ("/start", "/deal"):
+            await _do_start_command(message)
         return
     if is_admin and user.id in _admin_pending:
         await _admin_setting_input(message, text)
