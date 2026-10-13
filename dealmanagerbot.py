@@ -2879,12 +2879,118 @@ async def do_release_cancel(chat_id: int, user: types.User):
 # *** MONEY LOGIC - payout_in_progress flag set BEFORE any await ***
 # ----------------------------------------------
 
+async def auto_payout(chat_id: int):
+    """
+    Automatically send the seller payout from the deal escrow address.
+    Triggered when the seller provides a valid payout address — no manual step.
+    Gas is auto-funded from the hot wallet; leftover is swept back.
+    On any failure, falls back to manual admin payout (admin is notified).
+    """
+    state = deal_states.get(chat_id, {})
+    if not state:
+        return
+    # Guards: never double-pay, never pay a refunded/disputed deal.
+    if state.get("payout_done") or state.get("payout_in_progress"):
+        return
+    if state.get("refund_done"):
+        return
+    if state.get("disputed"):
+        await safe_notify_admin(
+            f"⚠️ Auto-payout BLOCKED (dispute open)\nDeal: {chat_id}\n"
+            f"Resolve the dispute first, then payout manually.")
+        return
+
+    # Claim the payout slot BEFORE any await — no two paths can pass here.
+    state["payout_in_progress"] = True
+    save_deal_states()
+
+    chain = state.get("chain", "tron")
+    to_address = state.get("payout_address", "")
+    amount = state.get("seller_amount", 0)
+    wfee = withdraw_fee(chain)
+    net = round(amount - wfee, 2)
+    chain_label = "BNB Smart Chain (BEP20)" if chain == "bsc" else "TRON (TRC20)"
+    hd_index = state.get("hd_index", state.get("tron_hd_index"))
+
+    async def _fail(reason: str):
+        logger.error(f"[AutoPayout] Chat {chat_id} failed: {reason}")
+        state.pop("payout_in_progress", None)
+        state["stage"] = "payout_pending"  # manual fallback
+        save_deal_states()
+        await bot.send_message(
+            chat_id,
+            f"⚠️ Automatic payout failed ({reason}). "
+            f"Admin will send <b>{net} USDT</b> manually shortly.",
+            parse_mode="HTML",
+        )
+        await safe_notify_admin(
+            f"💸 MANUAL PAYOUT NEEDED (auto failed)\nDeal: {chat_id}\n"
+            f"Reason: {reason}\nPay: <b>{amount} USDT</b> ({chain_label})\n"
+            f"To: <code>{to_address}</code>\n"
+            f"Via wallet bot → 🤝 Deal Funds → 💸 Withdraw.")
+
+    if not to_address or hd_index is None or net <= 0:
+        await _fail("missing payout data")
+        return
+
+    loop = asyncio.get_event_loop()
+    try:
+        if chain == "bsc":
+            import bsc_pay
+            from_addr = state.get("bsc_deposit_address", "")
+            priv_hex = await loop.run_in_executor(
+                None, bsc_pay.get_user_private_key_hex, hd_index)
+            result = await loop.run_in_executor(
+                None, bsc_pay.send_usdt_from_with_gas,
+                priv_hex, from_addr, to_address, net)
+        else:
+            import tron_pay
+            from_addr = state.get("tron_deposit_address", "")
+            priv = await loop.run_in_executor(
+                None, tron_pay.get_user_private_key, hd_index)
+            result = await loop.run_in_executor(
+                None, tron_pay.send_usdt_from_with_gas,
+                priv, to_address, net)
+
+        if not result.get("ok"):
+            await _fail(result.get("error", "send failed"))
+            return
+
+        txid = result.get("txid", "")
+        state["payout_done"] = True
+        state["payout_txid"] = txid
+        state["payout_net"] = net
+        state["payout_auto"] = True
+        state["stage"] = "completed"
+        state.pop("payout_in_progress", None)
+        save_deal_states()
+
+        seller_name = await get_username(state.get("seller", 0), "Seller")
+        await bot.send_message(
+            chat_id,
+            f"<b>Deal Completed!</b> ✅\n\n"
+            f"{seller_name} has been paid: <b>{net} USDT</b> ({chain_label})\n"
+            f"Address: <code>{to_address}</code>\n"
+            f"TxID: <code>{txid}</code>\n\n"
+            f"<b>Thanks for choosing and trusting Baloch OTC</b>\n"
+            f"<b>You can use Baloch OTC any time 24/7.</b>\n"
+            f"<b>Website: https://balochotc.com/</b>",
+            parse_mode="HTML",
+        )
+        await safe_notify_admin(
+            f"✅ Auto-payout SENT\nDeal: {chat_id}\n"
+            f"Amount: <b>{net} USDT</b> ({chain_label})\n"
+            f"To: <code>{to_address}</code>\nTxID: <code>{txid}</code>")
+    except Exception as e:
+        await _fail(str(e)[:200])
+
+
 async def do_address_confirm(chat_id: int, user: types.User):
     """
-    Seller types 'yes' - confirm payout address.
-    Funds stay on the deal address (no auto-sweep — single gas hop).
-    The admin pays the seller MANUALLY from the deal address via the wallet
-    bot's Deal Funds section (withdraw fee applies there).
+    Legacy 'yes' path — payouts are now fully automatic (auto_payout sends
+    as soon as the seller provides a valid address). This is kept as a
+    fallback: if a deal is somehow still in address_confirmation, 'yes'
+    triggers the automatic payout.
     """
     state = deal_states.get(chat_id, {})
     if state.get("stage") != "address_confirmation":
@@ -2898,52 +3004,7 @@ async def do_address_confirm(chat_id: int, user: types.User):
     if state.get("refund_done"):
         await bot.send_message(chat_id, "This deal was already refunded. Payout is not possible.")
         return
-
-    # Check duplicate payout. The in-progress flag is set BEFORE any await,
-    # which closes the double-payout race (concurrent messages).
-    if state.get("payout_done") or state.get("payout_in_progress"):
-        await bot.send_message(chat_id, "Payout is already being processed for this deal.")
-        return
-
-    # Claim the payout slot BEFORE any await -> no two messages can pass this point.
-    state["payout_in_progress"] = True
-    save_deal_states()
-
-    amount = state["seller_amount"]
-    address = state["payout_address"]
-    chain = state.get("chain", "tron")
-    chain_label = "BNB Smart Chain (BEP20)" if chain == "bsc" else "TRON (TRC20)"
-    wfee = withdraw_fee(chain)
-    net = round(amount - wfee, 2)
-
-    state["payout_done"] = True
-    state["payout_manual"] = True
-    state["payout_net"] = net
-    state["stage"] = "payout_pending"
-    state.pop("payout_in_progress", None)
-    save_deal_states()
-
-    seller_name = await get_username(state.get("seller", 0), "Seller")
-    await bot.send_message(
-        chat_id,
-        f"<b>Deal Completed!</b>\n\n"
-        f"{seller_name} will receive: <b>{net} USDT</b> ({chain_label})\n"
-        f"Address: <code>{address}</code>\n\n"
-        f"💸 <b>Admin will send the payment shortly from the deal escrow.</b>\n\n"
-        f"<b>Thanks for choosing and trusting Baloch OTC</b>\n"
-        f"<b>You can use Baloch OTC any time 24/7.</b>\n"
-        f"<b>Website: https://balochotc.com/</b>",
-        parse_mode="HTML",
-    )
-    await safe_notify_admin(
-        f"💸 MANUAL PAYOUT NEEDED\n"
-        f"Deal: {chat_id}\n"
-        f"Pay: <b>{amount} USDT</b> ({chain_label})\n"
-        f"To: <code>{address}</code>\n\n"
-        f"Via wallet bot → 🤝 Deal Funds → 💸 Withdraw (Deal {chat_id}),\n"
-        f"enter <b>{amount} USDT</b> — seller gets <b>{net} USDT</b>\n"
-        f"(fee {wfee:g} USDT stays on the deal address; sweep later via Withdraw ALL)."
-    )
+    await auto_payout(chat_id)
 
 
 async def do_address_reject(chat_id: int, user: types.User):
@@ -4214,21 +4275,19 @@ async def universal_stage_handler(message: types.Message):
         state["payout_address"] = address
         state["address_type"] = verification["type"]
         state["address_network"] = verification["network"]
-        state["stage"] = "address_confirmation"
 
+        # Fully automatic: validated address -> send payout immediately.
         pchain = state.get("chain", "tron")
         pwfee = withdraw_fee(pchain)
         pnet = round(state["seller_amount"] - pwfee, 2)
         await message.answer(
-            f"Buyer paid: <b>{state['buyer_amount']}</b> USDT\n"
-            f"Seller will receive: <b>{pnet}</b> USDT\n"
-            f"(<b>{state['seller_amount']}</b> USDT minus <b>{pwfee:g}</b> USDT withdraw fee)\n"
-            f"Escrow Fee: <b>{state['fee']}</b> USDT\n\n"
-            f"Is this the correct address?\n<code>{address}</code>\n"
-            f"Network: <b>{verification['type']}</b>\n\n"
-            f"Reply: <b>yes</b> / <b>no</b>",
+            f"✅ Address received: <code>{address}</code>\n"
+            f"Network: <b>{verification['type']}</b>\n"
+            f"You will receive: <b>{pnet}</b> USDT\n\n"
+            f"⏳ Sending your payout now...",
             parse_mode="HTML",
         )
+        await auto_payout(chat_id)
         return
 
     # ======================================================
