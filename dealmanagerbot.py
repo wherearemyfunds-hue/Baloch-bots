@@ -926,17 +926,12 @@ Reply:"""
         return None
 
 
-async def maybe_chat_reply(message: types.Message, state: dict, stage: str, force: bool = False) -> bool:
+async def maybe_chat_reply(message: types.Message, state: dict, stage: str) -> bool:
     """
-    Decide whether a free-text message deserves a conversational AI-admin reply.
-    Triggers when the user talks TO the bot: reply to the bot, @mention,
-    the word "bot", "Baloch OTC" / "balochotc", a question mark, or a greeting.
-    QUESTIONS AND DIRECT MENTIONS ARE ALWAYS ANSWERED — no cooldown blocks
-    them, even if asked seconds apart (Shawn's spec: perfect answer every time,
-    never deflect with "select your role" / "use the buttons").
-    The 60s cooldown only throttles casual chit-chat to avoid spam loops.
-    With force=True the trigger check is skipped — used where ANY free text
-    means confusion (e.g. role selection).
+    Conversational AI-admin reply — MENTIONS ONLY (Shawn's spec 2026-10-13).
+    The bot replies ONLY when someone mentions @Balochhelpbot or @Balochbuyer,
+    or replies to the bot's own message. It never answers ordinary messages
+    on its own — no triggers on plain questions, greetings, or the word "bot".
     Shows "Reading your question..." while the AI thinks, then replaces it
     with the real answer. Stays silent if the AI call fails.
     Returns True if a reply was sent.
@@ -953,34 +948,26 @@ async def maybe_chat_reply(message: types.Message, state: dict, stage: str, forc
         replied_to_bot = bool(rtm and rtm.from_user and rtm.from_user.id == bot_id)
     except Exception:
         pass
-    mentioned = bool(bot_username) and f"@{bot_username}" in low
-    says_bot = bool(re.search(r"\bbot\b", low))
-    says_baloch = "baloch otc" in low or "balochotc" in low
-    is_question = text.rstrip().endswith(("?", "؟"))
-    first_word = low.split(" ", 1)[0].strip("!.,")
-    is_greeting = first_word in ("salam", "salaam", "assalam", "aoa", "hello", "hi", "hey", "adaab", "yo")
-    if not force and not (replied_to_bot or mentioned or says_bot or says_baloch or is_question or is_greeting):
+    mentioned = False
+    if bot_username and re.search(rf"@{re.escape(bot_username)}\b", text, re.IGNORECASE):
+        mentioned = True
+    elif re.search(r"@balochbuyer\b", low):
+        mentioned = True
+    if not (mentioned or replied_to_bot):
         return False
-    # Direct questions/mentions bypass the cooldown entirely — always answered.
-    direct = is_question or replied_to_bot or mentioned or says_bot or says_baloch
-    if not direct and not force:
-        if now - state.get("_chat_reply_at", 0) < 60:
-            return False
-    # Identical-repeat guard: same message twice in a row -> answer once.
+    # Identical-repeat guard: same mention twice in a row -> answer once.
     if text == state.get("_chat_last_text") and now - state.get("_chat_reply_at", 0) < 120:
         return False
     user = message.from_user
     display = f"@{user.username}" if user.username else (user.first_name or "User")
     greeted = state.setdefault("_greeted_users", [])
     first_contact = user.id not in greeted
-    # Show a reading indicator for questions/mentions (AI may take a few
-    # seconds); it gets replaced by the real answer below.
+    # Show a reading indicator while the AI thinks; replaced by the real answer.
     indicator = None
-    if direct and not (is_greeting and not is_question):
-        try:
-            indicator = await message.answer("Reading your question...")
-        except Exception:
-            indicator = None
+    try:
+        indicator = await message.answer("Reading your question...")
+    except Exception:
+        indicator = None
     reply = await ai_chat_reply(text, state, display, first_contact=first_contact)
     if not reply:
         # One quick retry before giving up.
@@ -3532,12 +3519,11 @@ async def universal_stage_handler(message: types.Message):
                     reply_markup=kb,
                 )
                 return
-        # Could not infer a role. If they're asking something, answer like an AI
-        # admin (forced — any free text here means confusion). Never deflect to
-        # role buttons when a question was asked — stay silent instead.
-        if await maybe_chat_reply(message, state, stage, force=True):
+        # Could not infer a role. The AI admin only replies on mention
+        # (@Balochhelpbot / @Balochbuyer) — otherwise stay silent.
+        if await maybe_chat_reply(message, state, stage):
             return
-        logger.info(f"role_selection: AI reply failed for chat {chat_id}, staying silent")
+        logger.info(f"role_selection: no mention, staying silent for chat {chat_id}")
         return
 
     # ======================================================
