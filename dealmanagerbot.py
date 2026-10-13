@@ -1702,6 +1702,20 @@ def _request_group_cleanup(chat_id: int):
         pass
 
 
+def _get_active_link(chat_id: int) -> str:
+    """Get the stored active invite link for this deal group (never revoked)."""
+    try:
+        if os.path.exists(POOL_FILE):
+            with open(POOL_FILE, "r") as f:
+                pool = json.load(f)
+            g = pool.get("groups", {}).get(str(chat_id), {})
+            if isinstance(g, dict):
+                return (g.get("active_link") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
 def _request_fresh_invite_link(chat_id: int, admin_id: int) -> bool:
     """Ask the creator bot for a fresh invite link via the shared pool file.
 
@@ -4186,6 +4200,24 @@ async def universal_stage_handler(message: types.Message):
                 "🔗 Fresh invite link requested — I'll DM it to you in a moment.")
         else:
             await message.answer("⚠️ Could not request a fresh link, try again.")
+        return
+    # Auto-fix: if anyone reports "link expired", send the stored active link
+    # (which is never revoked during the deal). Users never see a dead link.
+    _low = _text
+    if any(p in _low for p in ("link expired", "link expire", "link not work",
+                               "link isn't work", "link is not work", "link dead",
+                               "invalid link", "link invalid", "can't join",
+                               "cant join", "unable to join")):
+        _alink = _get_active_link(chat_id)
+        if _alink:
+            await message.answer(
+                f"🔗 <b>Here's the working invite link:</b>\n\n{_alink}",
+                parse_mode="HTML")
+        else:
+            # No stored link — request a fresh one from the creator bot.
+            if _request_fresh_invite_link(chat_id, message.from_user.id):
+                await message.answer(
+                    "🔗 Getting you a fresh invite link — I'll send it here in a moment.")
         return
     if chat_id not in deal_states:
         # No deal in this chat — still answer direct mentions (@Balochhelpbot /

@@ -373,11 +373,16 @@ async def _kick_non_service(channel):
         logger.warning(f"kick sweep failed: {e}")
 
 
-async def _revoke_invite_links(channel):
+async def _revoke_invite_links(channel, keep_link: str = None):
+    """Revoke all invite links EXCEPT keep_link (the active deal's link).
+
+    The active deal's link is never revoked, so users never see
+    "this link expired" while the deal is running.
+    """
     try:
         cur = await user_client(ExportChatInviteRequest(peer=channel))
         link = getattr(cur, "link", None)
-        if link:
+        if link and link != keep_link:
             try:
                 await user_client(EditExportedChatInviteRequest(
                     peer=channel, link=link, revoked=True))
@@ -391,6 +396,8 @@ async def _revoke_invite_links(channel):
             peer=channel, admin_id=me.id, limit=50))
         for iv in getattr(invs, "invites", []) or []:
             try:
+                if getattr(iv, "link", None) == keep_link:
+                    continue  # never revoke the active deal's link
                 await user_client(EditExportedChatInviteRequest(
                     peer=channel, link=iv.link, revoked=True))
             except Exception:
@@ -408,7 +415,16 @@ async def _prepare_spare_group(entity, new_title: str) -> bool:
         return False
     await _clear_group_history(entity)
     await _kick_non_service(entity)
-    await _revoke_invite_links(entity)
+    # Preserve the active deal's link (if any) — users never see "expired".
+    _keep = None
+    try:
+        _pool = _load_pool()
+        _g = _pool.get("groups", {}).get(str(_full_chat_id(entity.id)), {})
+        if isinstance(_g, dict):
+            _keep = _g.get("active_link")
+    except Exception:
+        pass
+    await _revoke_invite_links(entity, keep_link=_keep)
     return True
 
 
@@ -428,7 +444,16 @@ async def _recycle_group_to_spare(chat_id: int, title: str) -> bool:
         return False
     await _clear_group_history(entity)
     await _kick_non_service(entity)
+    # Deal is over — revoke all links and clear the stored active link.
     await _revoke_invite_links(entity)
+    try:
+        _pool = _load_pool()
+        _g = _pool.get("groups", {}).get(str(chat_id), {})
+        if isinstance(_g, dict) and "active_link" in _g:
+            _g.pop("active_link", None)
+            _save_pool(_pool)
+    except Exception:
+        pass
     try:
         spare_title = title if title.endswith("♻️") else f"{title} ♻️"
         await user_client(EditTitleRequest(channel=entity, title=spare_title))
@@ -1203,6 +1228,19 @@ async def group_link_handler(event):
             )
         except Exception as e:
             logger.error(f"Failed to send welcome message: {e}")
+
+        # Store the active invite link in the pool — this link is NEVER revoked
+        # while the deal is active, so users never see "this link expired".
+        try:
+            _pool = _load_pool()
+            _gkey = str(_full_chat_id(group_id))
+            _g = _pool.get("groups", {}).get(_gkey)
+            if isinstance(_g, dict):
+                _g["active_link"] = invite_link
+                _save_pool(_pool)
+                logger.info(f"Stored active_link for group {_gkey}")
+        except Exception as e:
+            logger.warning(f"Could not store active_link: {e}")
 
         # ---------- STEP 7: honest result to user ----------
         try:
