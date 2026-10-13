@@ -17,7 +17,7 @@ logger = logging.getLogger("tron_pay")
 # USDT TRC20 contract (mainnet)
 USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 # SunSwap V2 Router (mainnet) - for USDT<->TRX swaps
-SUNSWAP_V2_ROUTER = "TKzxdSv2FZKQrEqkKVgp5DcwEXBEKMg2Ax"
+SUNSWAP_V2_ROUTER = "TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjLS5"  # SunSwap V2 Router (mainnet)
 # Wrapped TRX (for swap paths)
 WTRX_CONTRACT = "TNUC9Qb1rRpS5CbWLmNMxXBjyFoydXjWFR"
 TRONGRID_API = "https://api.trongrid.io"
