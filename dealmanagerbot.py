@@ -1605,18 +1605,16 @@ async def _handle_payment_timeout(chat_id: int, total_received: float, expected:
             f"⏰ <b>Payment Reminder</b>\n\n"
             f"5 hours have passed — received <b>{total_received} USDT</b> "
             f"of <b>{expected} USDT</b>.\n\n"
-            f"⚠️ Agar aap ye deal nahi karna chahte, to ye group 12 ghante "
-            f"baad automatically delete ho jayega.\n\n"
+            f"⚠️ If you don't want to proceed with this deal, this group "
+            f"will be automatically deleted after 12 hours.\n\n"
             f"If you already sent USDT, contact admin @{ADMIN_USERNAME}."
         )
     else:
         msg = (
             f"⏰ <b>Payment Reminder</b>\n\n"
             f"5 hours have passed — no payment received for this deal.\n\n"
-            f"⚠️ Agar aap ye deal nahi karna chahte, to ye group 12 ghante "
-            f"baad automatically delete ho jayega.\n"
-            f"(Chat clear hogi, members remove honge, group nayi deal ke "
-            f"liye available ho jayega.)\n\n"
+            f"⚠️ If you don't want to proceed with this deal, this group "
+            f"will be automatically deleted after 12 hours.\n\n"
             f"If you already sent USDT, contact admin @{ADMIN_USERNAME}."
         )
     try:
