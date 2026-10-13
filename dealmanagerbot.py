@@ -1537,22 +1537,19 @@ async def show_payment_info_chain(chat_id: int, chain: str = "tron"):
             f"<code>{bsc_address}</code>\n"
         ) if bsc_address else ""
 
+        # Shawn 2026-10-13: minimal — amounts + both addresses + the three
+        # key lines only. No fee breakdown, no admin hint text.
         payment_msg = (
-            f"<b>PAYMENT INFORMATION</b>\n"
-            f"{'=' * 30}\n\n"
+            f"<b>PAYMENT INFORMATION</b>\n\n"
             f"Buyer needs to pay: <b>{buyer_amount} USDT</b>\n"
-            f"Seller will receive: <b>{seller_amount} USDT</b>\n"
-            f"Escrow Fee: <b>{fee} USDT</b>\n\n"
-            f"<b>Baloch Escrow fee: {fee_text_short()}</b>\n\n"
-            f"Send <b>exactly {buyer_amount} USDT</b> to <b>ONE</b> of these addresses:\n\n"
+            f"Seller will receive: <b>{seller_amount} USDT</b>\n\n"
             f"<b>USDT TRC20</b>\n"
             f"<code>{tron_address}</code>\n"
             f"{bsc_block}\n"
+            f"Send <b>exactly {buyer_amount} USDT</b> to <b>ONE</b> of these addresses.\n\n"
             f"⚡ <b>Zero platform fee</b> — only network fee!\n"
-            f"🔒 <b>Unique addresses</b> for this deal only!\n\n"
-            f"Payment will be <b>automatically detected</b> once confirmed.\n\n"
-            f"{'=' * 30}\n\n"
-            f"<i>Admin: tap the button or reply <b>received</b> to confirm manually if needed.</i>"
+            f"🔒 <b>Unique addresses</b> for this deal only!\n"
+            f"Payment will be <b>automatically detected</b> once confirmed."
         )
     await bot.send_message(chat_id, payment_msg, parse_mode="HTML", reply_markup=kb)
 
