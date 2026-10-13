@@ -233,10 +233,11 @@ def _load_pool() -> dict:
                 d = json.load(f)
                 d.setdefault("groups", {})
                 d.setdefault("needs_reset", [])
+                d.setdefault("pending_cleanup", [])
                 return d
     except Exception as e:
         logger.error(f"pool load failed: {e}")
-    return {"groups": {}, "needs_reset": []}
+    return {"groups": {}, "needs_reset": [], "pending_cleanup": []}
 
 
 def _save_pool(pool: dict):
@@ -502,6 +503,45 @@ async def recycle_loop():
         except Exception as e:
             logger.error(f"recycle scan error: {e}")
         await asyncio.sleep(24 * 3600)
+
+
+async def cleanup_loop():
+    """Process unpaid-deal cleanup requests from the manager bot.
+
+    The manager flags group chat ids in pool['pending_cleanup'] after the
+    5h payment window + 12h reminder expire with no payment. We clear the
+    chat, kick non-service members, revoke links, and mark spare for reuse.
+    """
+    await asyncio.sleep(300)  # let startup settle
+    while True:
+        try:
+            pool = _load_pool()
+            pending = pool.get("pending_cleanup", [])
+            if not pending:
+                await asyncio.sleep(600)
+                continue
+            for cid_str in list(pending):
+                try:
+                    cid = int(cid_str)
+                except (ValueError, TypeError):
+                    pending.remove(cid_str)
+                    continue
+                title = pool.get("groups", {}).get(cid_str, {}).get(
+                    "title", GROUP_BASE_NAME)
+                logger.info(f"cleanup: processing unpaid deal group {cid}")
+                ok = await _recycle_group_to_spare(cid, title)
+                if ok:
+                    g = pool.get("groups", {}).get(cid_str)
+                    if isinstance(g, dict):
+                        g["status"] = "spare"
+                    pending.remove(cid_str)
+                    logger.info(f"cleanup: group {cid} is now spare")
+                else:
+                    logger.warning(f"cleanup: group {cid} failed, will retry")
+            _save_pool(pool)
+        except Exception as e:
+            logger.error(f"cleanup loop error: {e}")
+        await asyncio.sleep(600)  # check every 10 min
 
 
 # ==================== RATE LIMITING ====================
@@ -1210,6 +1250,7 @@ async def group_link_handler(event):
 
 _reminder_task = None
 _recycle_task = None
+_cleanup_task = None
 
 
 async def reminder_loop():
@@ -1290,10 +1331,11 @@ async def main():
     current = _read_counter_file()
     logger.info(f"Group counter: {current}, next: {(current or STARTING_GROUP_NUMBER) + 1}")
 
-    global _reminder_task, _broadcast_task, _recycle_task
+    global _reminder_task, _broadcast_task, _recycle_task, _cleanup_task
     _reminder_task = asyncio.create_task(reminder_loop())
     _broadcast_task = asyncio.create_task(broadcast_watcher())
     _recycle_task = asyncio.create_task(recycle_loop())
+    _cleanup_task = asyncio.create_task(cleanup_loop())
 
     logger.info("BOT IS NOW RUNNING AND READY")
     logger.info(f"Deal Handler Bot : @{ADD_BOT_USERNAME}")
@@ -1302,7 +1344,8 @@ async def main():
     try:
         await bot_client.run_until_disconnected()
     finally:
-        for _t in (_reminder_task, globals().get("_broadcast_task"), globals().get("_recycle_task")):
+        for _t in (_reminder_task, globals().get("_broadcast_task"), globals().get("_recycle_task"),
+                   globals().get("_cleanup_task")):
             if _t:
                 _t.cancel()
                 try:

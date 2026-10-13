@@ -236,6 +236,14 @@ openai_client = ai_client
 deal_states: dict[int, dict] = {}
 payment_monitoring_tasks: dict[int, object] = {}  # chat_id -> task or list[task]
 
+# --- Unpaid-deal lifecycle ---
+# Payment is monitored for max 5 hours. Then ONE reminder is sent.
+# 12 hours after the reminder, if still unpaid, the group is cleaned
+# (chat cleared, members kicked, links revoked) and returned to the
+# spare pool for reuse by the creator bot.
+PAYMENT_WINDOW_MIN = 300
+UNPAID_REMINDER_HOURS = 12
+
 
 def _cancel_payment_monitors(chat_id: int):
     """Cancel payment monitor task(s) for a chat — handles a single task or a list."""
@@ -1558,19 +1566,126 @@ async def show_payment_info_chain(chat_id: int, chain: str = "tron"):
     _cancel_payment_monitors(chat_id)
     if bep20_only:
         payment_monitoring_tasks[chat_id] = [asyncio.create_task(
-            bsc_payment_monitoring(chat_id, bsc_address, buyer_amount, duration_minutes=120))]
+            bsc_payment_monitoring(chat_id, bsc_address, buyer_amount, duration_minutes=PAYMENT_WINDOW_MIN))]
     else:
         tasks = [asyncio.create_task(
-            tron_payment_monitoring(chat_id, tron_address, buyer_amount, duration_minutes=120))]
+            tron_payment_monitoring(chat_id, tron_address, buyer_amount, duration_minutes=PAYMENT_WINDOW_MIN))]
         if bsc_address:
             tasks.append(asyncio.create_task(
-                bsc_payment_monitoring(chat_id, bsc_address, buyer_amount, duration_minutes=120)))
+                bsc_payment_monitoring(chat_id, bsc_address, buyer_amount, duration_minutes=PAYMENT_WINDOW_MIN)))
         payment_monitoring_tasks[chat_id] = tasks
 
 
 # Back-compat alias (single caller updated below, kept for safety)
 async def show_payment_info_tron(chat_id: int):
     await show_payment_info_chain(chat_id, "tron")
+
+
+async def _handle_payment_timeout(chat_id: int, total_received: float, expected: float):
+    """Payment window (5h) expired without full payment.
+
+    Sends exactly ONE reminder (guarded by state flag, so dual-chain
+    monitors and restarts can never repeat it), then schedules the
+    group cleanup 12 hours later.
+    """
+    state = deal_states.get(chat_id)
+    if not state or state.get("stage") not in ("payment", "payment_monitoring"):
+        return
+    if state.get("timeout_reminder_sent"):
+        return
+    state["timeout_reminder_sent"] = True
+    state["reminder_sent_time"] = time.time()
+    try:
+        save_deal_states()
+    except Exception:
+        pass
+
+    if total_received > 0:
+        msg = (
+            f"⏰ <b>Payment Reminder</b>\n\n"
+            f"5 hours have passed — received <b>{total_received} USDT</b> "
+            f"of <b>{expected} USDT</b>.\n\n"
+            f"⚠️ Agar aap ye deal nahi karna chahte, to ye group 12 ghante "
+            f"baad automatically delete ho jayega.\n\n"
+            f"If you already sent USDT, contact admin @{ADMIN_USERNAME}."
+        )
+    else:
+        msg = (
+            f"⏰ <b>Payment Reminder</b>\n\n"
+            f"5 hours have passed — no payment received for this deal.\n\n"
+            f"⚠️ Agar aap ye deal nahi karna chahte, to ye group 12 ghante "
+            f"baad automatically delete ho jayega.\n"
+            f"(Chat clear hogi, members remove honge, group nayi deal ke "
+            f"liye available ho jayega.)\n\n"
+            f"If you already sent USDT, contact admin @{ADMIN_USERNAME}."
+        )
+    try:
+        await bot.send_message(chat_id, msg, parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"Timeout reminder send failed for {chat_id}: {e}")
+
+    asyncio.create_task(
+        schedule_unpaid_cleanup(chat_id, UNPAID_REMINDER_HOURS * 3600))
+
+
+async def schedule_unpaid_cleanup(chat_id: int, delay: float):
+    """Wait `delay` seconds; if the deal is still unpaid, request group cleanup."""
+    try:
+        await asyncio.sleep(delay)
+        state = deal_states.get(chat_id)
+        if not state:
+            return
+        if state.get("stage") not in ("payment", "payment_monitoring"):
+            return  # payment arrived or deal moved on — nothing to do
+        if state.get("cleanup_requested"):
+            return
+        _request_group_cleanup(chat_id)
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.error(f"Unpaid cleanup scheduler error for {chat_id}: {e}")
+
+
+def _request_group_cleanup(chat_id: int):
+    """Flag this group for cleanup in the shared pool file.
+
+    The creator bot picks it up: clears chat history, kicks non-service
+    members, revokes invite links, and marks the group spare for reuse.
+    """
+    state = deal_states.get(chat_id)
+    if state:
+        # Any partial payment stays safe on-chain; admin can move it manually.
+        state["cleanup_requested"] = True
+        state["stage"] = "expired"  # stops monitor resumes on restart
+        try:
+            save_deal_states()
+        except Exception:
+            pass
+    try:
+        pool = {}
+        if os.path.exists(POOL_FILE):
+            with open(POOL_FILE, "r") as f:
+                pool = json.load(f)
+        pending = pool.setdefault("pending_cleanup", [])
+        key = str(chat_id)
+        if key not in pending:
+            pending.append(key)
+        fd, tmp = tempfile.mkstemp(dir=BASE_DIR, prefix=".pool", suffix=".tmp")
+        with os.fdopen(fd, "w") as fo:
+            json.dump(pool, fo, indent=2)
+            fo.flush()
+            os.fsync(fo.fileno())
+        os.replace(tmp, POOL_FILE)
+        logger.info(f"Cleanup requested for unpaid deal group {chat_id}")
+    except Exception as e:
+        logger.error(f"Failed to request cleanup for {chat_id}: {e}")
+    # Notify admin (fire-and-forget)
+    try:
+        asyncio.create_task(safe_notify_admin(
+            f"🧹 Unpaid deal group {chat_id} sent for cleanup "
+            f"(no payment in 5h + 12h reminder window)."))
+    except Exception:
+        pass
 
 
 async def tron_payment_monitoring(chat_id: int, address: str, expected: float,
@@ -1659,22 +1774,10 @@ async def tron_payment_monitoring(chat_id: int, address: str, expected: float,
             except Exception as e:
                 logger.warning(f"[TRON Monitor] Poll error: {e}")
             await asyncio.sleep(15)
-        # Timeout
+        # Timeout — single reminder + scheduled cleanup (never repeats)
         state = deal_states.get(chat_id)
         if state and state.get("stage") in ("payment", "payment_monitoring"):
-            if total_received > 0:
-                await bot.send_message(
-                    chat_id,
-                    f"⏰ Payment timeout. Received <b>{total_received} USDT</b> of <b>{expected} USDT</b>.\n"
-                    f"Contact admin @{ADMIN_USERNAME}.",
-                    parse_mode="HTML",
-                )
-            else:
-                await bot.send_message(
-                    chat_id,
-                    "⏰ Payment timeout (120 min). If you already sent USDT, contact admin.",
-                    parse_mode="HTML",
-                )
+            await _handle_payment_timeout(chat_id, total_received, expected)
     except asyncio.CancelledError:
         logger.info(f"[TRON Monitor] Chat {chat_id} - cancelled")
     except Exception as e:
@@ -1697,6 +1800,7 @@ async def bsc_payment_monitoring(chat_id: int, address: str, expected: float,
     logger.info(f"[BSC Monitor] Started for chat {chat_id}, address {address} (resumed={resumed})")
     end_time = time.time() + (duration_minutes * 60)
     underpay_notified = False
+    total_received = 0.0
 
     try:
         while time.time() < end_time:
@@ -1739,28 +1843,10 @@ async def bsc_payment_monitoring(chat_id: int, address: str, expected: float,
             except Exception as e:
                 logger.warning(f"[BSC Monitor] Poll error: {e}")
             await asyncio.sleep(20)
-        # Timeout — re-check final balance for an accurate message
+        # Timeout — single reminder + scheduled cleanup (never repeats)
         state = deal_states.get(chat_id)
         if state and state.get("stage") in ("payment", "payment_monitoring"):
-            try:
-                loop = asyncio.get_event_loop()
-                final_bal = round(await loop.run_in_executor(
-                    None, bsc_pay.get_usdt_balance, address) or 0.0, 2)
-            except Exception:
-                final_bal = 0.0
-            if final_bal > 0:
-                await bot.send_message(
-                    chat_id,
-                    f"⏰ Payment timeout. Received <b>{final_bal} USDT</b> of <b>{expected} USDT</b>.\n"
-                    f"Contact admin @{ADMIN_USERNAME}.",
-                    parse_mode="HTML",
-                )
-            else:
-                await bot.send_message(
-                    chat_id,
-                    "⏰ Payment timeout (120 min). If you already sent USDT, contact admin.",
-                    parse_mode="HTML",
-                )
+            await _handle_payment_timeout(chat_id, final_bal, expected)
     except asyncio.CancelledError:
         logger.info(f"[BSC Monitor] Chat {chat_id} - cancelled")
     except Exception as e:
@@ -1829,7 +1915,7 @@ async def show_payment_info_cryptomus(chat_id: int):
 
     _cancel_payment_monitors(chat_id)
 
-    task = asyncio.create_task(continuous_payment_monitoring(chat_id, order_id, duration_minutes=120))
+    task = asyncio.create_task(continuous_payment_monitoring(chat_id, order_id, duration_minutes=PAYMENT_WINDOW_MIN))
     payment_monitoring_tasks[chat_id] = task
 
 
@@ -4878,6 +4964,17 @@ async def main():
                     f"Status unknown - verify on Cryptomus before re-attempting."
                 )
             elif r_state.get("stage") == "payment_monitoring" and r_state.get("payment_order_id"):
+                # If the 5h reminder was already sent before restart, don't
+                # re-monitor — just schedule the 12h cleanup for remaining time.
+                if r_state.get("timeout_reminder_sent") and not r_state.get("cleanup_requested"):
+                    sent_at = r_state.get("reminder_sent_time", 0)
+                    remaining = max(0, UNPAID_REMINDER_HOURS * 3600 - (time.time() - sent_at))
+                    asyncio.create_task(schedule_unpaid_cleanup(r_chat_id, remaining))
+                    logger.info(f"Resumed unpaid-cleanup timer for chat {r_chat_id} ({remaining/3600:.1f}h left)")
+                    continue
+                # Remaining payment window (wall-clock from payment_start_time)
+                elapsed = time.time() - r_state.get("payment_start_time", 0)
+                remaining_min = max(1, int((PAYMENT_WINDOW_MIN * 60 - elapsed) / 60))
                 order_id = r_state.get("payment_order_id", "")
                 if order_id.startswith("deal-"):
                     # Direct-chain deal: resume BOTH chain monitors
@@ -4886,22 +4983,22 @@ async def main():
                     taddr = r_state.get("tron_deposit_address")
                     if taddr:
                         tasks.append(asyncio.create_task(tron_payment_monitoring(
-                            r_chat_id, taddr, r_state.get("buyer_amount", 0), duration_minutes=120,
+                            r_chat_id, taddr, r_state.get("buyer_amount", 0), duration_minutes=remaining_min,
                             resumed=True)))
                     if BSC_ENABLED:
                         import bsc_pay as _bp
                         baddr = r_state.get("bsc_deposit_address")
                         if baddr:
                             tasks.append(asyncio.create_task(bsc_payment_monitoring(
-                                r_chat_id, baddr, r_state.get("buyer_amount", 0), duration_minutes=120,
+                                r_chat_id, baddr, r_state.get("buyer_amount", 0), duration_minutes=remaining_min,
                                 resumed=True)))
                     if tasks:
                         payment_monitoring_tasks[r_chat_id] = tasks
-                        logger.info(f"Resumed chain payment monitoring for chat {r_chat_id}")
+                        logger.info(f"Resumed chain payment monitoring for chat {r_chat_id} ({remaining_min} min left)")
                     continue
                 task = asyncio.create_task(
                     continuous_payment_monitoring(
-                        r_chat_id, r_state["payment_order_id"], duration_minutes=120
+                        r_chat_id, r_state["payment_order_id"], duration_minutes=remaining_min
                     )
                 )
                 payment_monitoring_tasks[r_chat_id] = task
