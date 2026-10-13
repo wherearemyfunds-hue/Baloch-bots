@@ -528,6 +528,7 @@ def detect_address_type(address: str) -> dict:
 def validate_payout_address(address: str, chain: str = "tron") -> tuple[bool, str]:
     """
     Validate payout/refund address — must match the DEAL's chain.
+    The message must contain ONLY the address, nothing else.
     chain="tron": only TRC20. chain="bsc": only BEP20.
     Returns (valid, error_message).
     """
@@ -535,13 +536,15 @@ def validate_payout_address(address: str, chain: str = "tron") -> tuple[bool, st
     v = detect_address_type(address)
     if not v["valid"]:
         if want == "BEP20":
-            return False, "❌ Invalid address. Please send your <b>USDT BEP20</b> address (starts with 0x)."
-        return False, "❌ Invalid address. Please send your <b>USDT TRC20</b> address (starts with T)."
+            return False, ("❌ <b>Sirf address bhejo</b> — kuch aur nahi likho.\n"
+                           "Please send ONLY your <b>USDT BEP20</b> address (starts with 0x).")
+        return False, ("❌ <b>Sirf address bhejo</b> — kuch aur nahi likho.\n"
+                       "Please send ONLY your <b>USDT TRC20</b> address (starts with T).")
     if v["type"] != want:
         if want == "BEP20":
-            return False, ("❌ This deal is on <b>BNB Smart Chain</b>. Please send a USDT <b>BEP20</b> address (starts with 0x). "
+            return False, ("❌ This deal is on <b>BNB Smart Chain</b>. Please send ONLY a USDT <b>BEP20</b> address (starts with 0x). "
                            "Cross-chain payout would need a manual bridge with extra fees.")
-        return False, ("❌ This deal is on <b>TRON</b>. Please send a USDT <b>TRC20</b> address (starts with T). "
+        return False, ("❌ This deal is on <b>TRON</b>. Please send ONLY a USDT <b>TRC20</b> address (starts with T). "
                        "Cross-chain payout would need a manual bridge with extra fees.")
     return True, ""
 
