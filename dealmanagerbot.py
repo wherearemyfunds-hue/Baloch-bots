@@ -895,7 +895,10 @@ async def ai_chat_reply(message_text: str, state: dict, user_display: str, first
 A user ({user_display}) is chatting in a deal group. Reply ENTIRELY in the SAME language and script as the user's message below (auto-detect: English, Urdu, Roman Urdu, Saraiki, Hindi, Arabic, etc.).
 Deal context: {context}
 Rules:
-- Chat like a smart, warm human admin. Keep it short: 1-3 sentences, chat tone.
+- Answer like a REAL, knowledgeable human admin — warm, natural, confident.
+- If the user asked a question, ANSWER it fully and accurately. Read their message carefully and address EVERY part of it — miss nothing, leave no part unanswered.
+- NEVER deflect a question with "select your role", "tap Buyer/Seller", "use the buttons", "type /start", or "start the deal". Answer the question first; mention next steps only if genuinely relevant.
+- Give complete answers: short for simple questions, thorough when the question needs detail. Never cut an answer short.
 - {greet_rule}
 - You may explain: how escrow works; fees — escrow fee is 3% of the deal amount (minimum 3 USDT), paid by buyer / seller / split as agreed; withdraw fee 3.5 USDT on TRC20, 1 USDT on BEP20; deals under 500 USDT go BEP20 only (cheap gas); blockchain gas is covered by the admin; safety tips; what happens next at this stage; timelines.
 - Greetings (salam/hello/hi): only on the first message, per the rule above.
@@ -912,9 +915,9 @@ Reply:"""
                 model=AI_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.7,
-                max_tokens=300,
+                max_tokens=800,
             ),
-            timeout=25,
+            timeout=30,
         )
         reply = (response.choices[0].message.content or "").strip()
         return reply or None
@@ -926,18 +929,22 @@ Reply:"""
 async def maybe_chat_reply(message: types.Message, state: dict, stage: str, force: bool = False) -> bool:
     """
     Decide whether a free-text message deserves a conversational AI-admin reply.
-    Triggers when the user talks TO the bot (reply / mention / "bot" /
-    question mark / greeting), with a 60s per-deal cooldown to avoid spam loops.
-    With force=True the trigger check is skipped (still rate-limited) — used
-    where ANY free text means confusion (e.g. role selection).
+    Triggers when the user talks TO the bot: reply to the bot, @mention,
+    the word "bot", "Baloch OTC" / "balochotc", a question mark, or a greeting.
+    QUESTIONS AND DIRECT MENTIONS ARE ALWAYS ANSWERED — no cooldown blocks
+    them, even if asked seconds apart (Shawn's spec: perfect answer every time,
+    never deflect with "select your role" / "use the buttons").
+    The 60s cooldown only throttles casual chit-chat to avoid spam loops.
+    With force=True the trigger check is skipped — used where ANY free text
+    means confusion (e.g. role selection).
+    Shows "Reading your question..." while the AI thinks, then replaces it
+    with the real answer. Stays silent if the AI call fails.
     Returns True if a reply was sent.
     """
     text = (message.text or "").strip()
     if len(text) < 2 or len(text) > 1000:
         return False
     now = time.time()
-    if now - state.get("_chat_reply_at", 0) < 60:
-        return False
     bot_id, bot_username = await _bot_identity()
     low = text.lower()
     replied_to_bot = False
@@ -947,24 +954,62 @@ async def maybe_chat_reply(message: types.Message, state: dict, stage: str, forc
     except Exception:
         pass
     mentioned = bool(bot_username) and f"@{bot_username}" in low
-    says_bot = "bot" in low
+    says_bot = bool(re.search(r"\bbot\b", low))
+    says_baloch = "baloch otc" in low or "balochotc" in low
     is_question = text.rstrip().endswith(("?", "؟"))
     first_word = low.split(" ", 1)[0].strip("!.,")
     is_greeting = first_word in ("salam", "salaam", "assalam", "aoa", "hello", "hi", "hey", "adaab", "yo")
-    if not force and not (replied_to_bot or mentioned or says_bot or is_question or is_greeting):
+    if not force and not (replied_to_bot or mentioned or says_bot or says_baloch or is_question or is_greeting):
+        return False
+    # Direct questions/mentions bypass the cooldown entirely — always answered.
+    direct = is_question or replied_to_bot or mentioned or says_bot or says_baloch
+    if not direct and not force:
+        if now - state.get("_chat_reply_at", 0) < 60:
+            return False
+    # Identical-repeat guard: same message twice in a row -> answer once.
+    if text == state.get("_chat_last_text") and now - state.get("_chat_reply_at", 0) < 120:
         return False
     user = message.from_user
     display = f"@{user.username}" if user.username else (user.first_name or "User")
     greeted = state.setdefault("_greeted_users", [])
     first_contact = user.id not in greeted
+    # Show a reading indicator for questions/mentions (AI may take a few
+    # seconds); it gets replaced by the real answer below.
+    indicator = None
+    if direct and not (is_greeting and not is_question):
+        try:
+            indicator = await message.answer("Reading your question...")
+        except Exception:
+            indicator = None
     reply = await ai_chat_reply(text, state, display, first_contact=first_contact)
     if not reply:
+        # One quick retry before giving up.
+        await asyncio.sleep(2)
+        reply = await ai_chat_reply(text, state, display, first_contact=False)
+    if not reply:
+        if indicator is not None:
+            try:
+                await indicator.delete()
+            except Exception:
+                pass
+        logger.warning(f"AI chat reply failed twice for chat {message.chat.id}; staying silent")
         return False
     if user.id not in greeted:
         greeted.append(user.id)
     state["_chat_reply_at"] = now
+    state["_chat_last_text"] = text
     save_deal_states()
-    await message.answer(reply)
+    try:
+        if indicator is not None:
+            await indicator.edit_text(reply)
+        else:
+            await message.answer(reply)
+    except Exception:
+        # Edit failed — send fresh.
+        try:
+            await message.answer(reply)
+        except Exception:
+            return False
     return True
 
 
@@ -1822,7 +1867,7 @@ NO_WORDS = {
 
 # Deal-question typed answers: question index -> {typed text: canonical answer id}
 DQ_TEXT_MAP = {
-    1: {  # "If an account gets blocked..." -> Refund to Buyer / Release to Seller
+    0: {  # "If an account gets blocked..." -> Refund to Buyer / Release to Seller
         "1": "dq_blocked_refund", "one": "dq_blocked_refund",
         "refund": "dq_blocked_refund", "refund to buyer": "dq_blocked_refund",
         "buyer": "dq_blocked_refund",
@@ -2117,7 +2162,7 @@ async def do_deal_confirm(chat_id: int, user: types.User, action: str):
         await bot.send_message(
             chat_id,
             f"<b>Deal Confirmed by both parties!</b>\n\n"
-            f"Before we proceed, both parties need to answer a few important questions:",
+            f"Before we proceed, both parties need to answer one important question:",
             parse_mode="HTML",
         )
         await ask_deal_question(chat_id, 0)
@@ -2129,7 +2174,7 @@ async def do_deal_confirm(chat_id: int, user: types.User, action: str):
 
 async def do_deal_question_answer(chat_id: int, user: types.User, answer_data: str):
     """Record a typed answer to the current deal question.
-    answer_data is the canonical id (e.g. 'dq_dispute_yes', 'dq_deadline_ask')."""
+    answer_data is the canonical id (e.g. 'dq_blocked_refund')."""
     state = deal_states.get(chat_id, {})
     if state.get("stage") != "deal_questions":
         return
@@ -3060,23 +3105,16 @@ async def route_text_command(message: types.Message) -> bool:
             return True
         return False
 
-    # --- deal_questions: yes/no or numbered options ---
+    # --- deal_questions: numbered options (multi-choice) ---
     if stage == "deal_questions":
         q_index = state.get("current_question_index", 0)
         if q_index >= len(DEAL_QUESTIONS):
             return False
-        answer_data = None
-        if q_index == 0:
-            if cmd in YES_WORDS:
-                answer_data = "dq_dispute_yes"
-            elif cmd in NO_WORDS:
-                answer_data = "dq_dispute_no"
-        else:
-            answer_data = DQ_TEXT_MAP.get(q_index, {}).get(cmd)
-            # AI fallback: if the fixed map doesn't match, let AI interpret
-            # the answer (handles any phrasing, e.g. "refund to the buyer please")
-            if not answer_data:
-                answer_data = await ai_interpret_deal_question(message.text, q_index)
+        answer_data = DQ_TEXT_MAP.get(q_index, {}).get(cmd)
+        # AI fallback: if the fixed map doesn't match, let AI interpret
+        # the answer (handles any phrasing, e.g. "refund to the buyer please")
+        if not answer_data:
+            answer_data = await ai_interpret_deal_question(message.text, q_index)
         if answer_data:
             await do_deal_question_answer(chat_id, user, answer_data)
             return True
@@ -3495,15 +3533,11 @@ async def universal_stage_handler(message: types.Message):
                 )
                 return
         # Could not infer a role. If they're asking something, answer like an AI
-        # admin (forced — any free text here means confusion); otherwise nudge
-        # back to the buttons.
+        # admin (forced — any free text here means confusion). Never deflect to
+        # role buttons when a question was asked — stay silent instead.
         if await maybe_chat_reply(message, state, stage, force=True):
             return
-        await bot.send_message(
-            chat_id,
-            f"{display}, please tap <b>Buyer</b> or <b>Seller</b> above to choose your role.",
-            parse_mode="HTML",
-        )
+        logger.info(f"role_selection: AI reply failed for chat {chat_id}, staying silent")
         return
 
     # ======================================================
@@ -3886,14 +3920,10 @@ async def universal_stage_handler(message: types.Message):
     # ---- Fallback: message didn't match any stage ----
     # Full-AI admin (Shawn's spec): chat with anyone about the deal, in their
     # own language, at ANY stage. Informational only — never takes deal actions.
+    # If the AI reply failed, stay silent (no deflection to buttons).
     if await maybe_chat_reply(message, state, stage or "?"):
         return
     logger.info(f"No stage matched for message in chat {chat_id}, stage={stage}")
-    await message.answer(
-        "I didn't quite catch that. 🤔\n"
-        "Please use the buttons above, or type <b>/start</b> to restart the deal setup.",
-        parse_mode="HTML",
-    )
     return
 
 
@@ -3949,18 +3979,9 @@ async def _present_deal_for_confirmation(chat_id: int, message: types.Message):
 
 DEAL_QUESTIONS = [
     {
-        "key": "dispute_resolution",
-        "text": (
-            "<b>Deal Question 1 of 2:</b>\n\n"
-            "If a dispute arises and cannot be resolved between buyer and seller, "
-            "do both parties agree that the admin's decision will be final?"
-        ),
-        "prefix": "dq_dispute",
-    },
-    {
         "key": "account_blocked",
         "text": (
-            "<b>Deal Question 2 of 2:</b>\n\n"
+            "<b>Deal Question 1 of 1:</b>\n\n"
             "If an account gets blocked during an active deal, "
             "what action should be taken?"
         ),
