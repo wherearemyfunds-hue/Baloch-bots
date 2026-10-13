@@ -411,13 +411,15 @@ async def cb_a_users(callback: types.CallbackQuery):
         if not taddr and not baddr:
             continue
         t_bal, b_bal = await loop.run_in_executor(None, _bals, taddr, baddr)
+        if t_bal < 1.0 and b_bal < 1.0:
+            continue  # hide empty/dust users (< 1 USDT on both chains)
         un = f"@{rec['username']}" if rec.get("username") else rec.get("first_name", uid)
         lines.append(f"• {un} — TRC20: <b>{t_bal:.2f}</b> | BEP20: <b>{b_bal:.2f}</b> USDT")
-        if t_bal > 0.01:
+        if t_bal >= 1.0:
             kb_rows.append([InlineKeyboardButton(
                 text=f"💸 Withdraw {t_bal:.2f} TRC20 ({un})",
                 callback_data=f"user_wd_tron_{uid}")])
-        if b_bal > 0.01:
+        if b_bal >= 1.0:
             kb_rows.append([InlineKeyboardButton(
                 text=f"💸 Withdraw {b_bal:.2f} BEP20 ({un})",
                 callback_data=f"user_wd_bsc_{uid}")])
@@ -517,6 +519,7 @@ async def cb_a_deals(callback: types.CallbackQuery):
         return
     lines = ["🤝 <b>Deal Escrow Funds</b>\n"]
     kb_rows = []
+    shown = 0
     for cid, chain, addr, hd_index, stage in deals[-12:]:  # last 12
         if chain == "bsc":
             bal = await loop.run_in_executor(None, bsc_pay.get_usdt_balance, addr)
@@ -528,12 +531,17 @@ async def cb_a_deals(callback: types.CallbackQuery):
             gas = await loop.run_in_executor(None, tron_pay.get_trx_balance, addr)
             gas_warn = " ⚠️" if gas < 5 else ""
             gas_txt = f"{gas:.1f} TRX{gas_warn}"
+        if bal < 1.0:
+            continue  # hide empty/dust addresses (< 1 USDT)
+        shown += 1
         no_key = " 🔑❌" if hd_index is None else ""
         lines.append(f"• {CHAIN_LABEL[chain]} Chat {cid} — <b>{bal:.2f}</b> USDT | <b>{gas_txt}</b> ({stage}){no_key}\n  <code>{addr}</code>")
-        if bal > 0.01:
-            kb_rows.append([InlineKeyboardButton(
-                text=f"💸 Withdraw {bal:.2f} ({CHAIN_LABEL[chain]}) {cid}",
-                callback_data=f"deal_wd_{chain}_{cid}")])
+        kb_rows.append([InlineKeyboardButton(
+            text=f"💸 Withdraw {bal:.2f} ({CHAIN_LABEL[chain]}) {cid}",
+            callback_data=f"deal_wd_{chain}_{cid}")])
+    if not shown:
+        await callback.message.answer("🤝 No deal addresses with ≥ 1 USDT balance.")
+        return
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
     await callback.message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb)
 
