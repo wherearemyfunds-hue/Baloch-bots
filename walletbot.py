@@ -51,11 +51,38 @@ CHAIN_LABEL = {"tron": "TRON (TRC20)", "bsc": "BNB Smart Chain (BEP20)"}
 GAS_LABEL = {"tron": "TRX", "bsc": "BNB"}
 # Flat withdraw fee (deducted from the amount; recipient gets amount - fee).
 # Gas is separate: always auto-funded from the hot wallet, never from the user.
-WITHDRAW_FEE = {"tron": 3.5, "bsc": 1.0}
+# Admin-configurable: the deal bot's DM admin panel writes bot_settings.json
+# (same folder as the running script, e.g. /root/bot_settings.json on the VPS)
+# and this bot re-reads it whenever the file changes — no restart needed.
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_settings.json")
+_settings_cache = {"mtime": 0, "data": {}}
+
+
+def _load_shared_settings() -> dict:
+    try:
+        mtime = os.path.getmtime(SETTINGS_FILE)
+    except OSError:
+        return {}
+    if mtime != _settings_cache["mtime"]:
+        try:
+            with open(SETTINGS_FILE) as f:
+                _settings_cache["data"] = json.load(f)
+            _settings_cache["mtime"] = mtime
+        except Exception:
+            pass
+    return _settings_cache["data"]
+
+
+def withdraw_fee(chain: str) -> float:
+    """Withdraw fee for a chain, honoring the admin panel settings."""
+    data = _load_shared_settings()
+    if chain == "bsc":
+        return float(data.get("withdraw_fee_bep20", 1.0))
+    return float(data.get("withdraw_fee_trc20", 3.5))
 
 
 def _fee_notice(chain: str) -> str:
-    return (f"⛽ Deduction fee: <b>{WITHDRAW_FEE[chain]:.0f} USDT</b> "
+    return (f"⛽ Deduction fee: <b>{withdraw_fee(chain):g} USDT</b> "
             f"({CHAIN_LABEL[chain]}) — the recipient gets that much less.")
 EXPLORER_TX = {
     "tron": "https://tronscan.org/#/transaction/",
@@ -992,7 +1019,7 @@ async def handle_text(message: types.Message):
             except ValueError:
                 await message.answer("❌ Invalid amount. Try again (or 'max'):")
                 return
-        fee = WITHDRAW_FEE[chain]
+        fee = withdraw_fee(chain)
         if amt <= fee:
             await message.answer(
                 f"❌ Amount must be greater than the fee.\n"
@@ -1061,7 +1088,7 @@ async def handle_text(message: types.Message):
             except ValueError:
                 await message.answer("❌ Invalid amount. Try again (or 'max'):")
                 return
-        fee = WITHDRAW_FEE[chain]
+        fee = withdraw_fee(chain)
         if amt <= fee:
             await message.answer(
                 f"❌ Amount must be greater than the fee.\n"

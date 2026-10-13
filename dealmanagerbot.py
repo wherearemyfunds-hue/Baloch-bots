@@ -81,11 +81,109 @@ except Exception as e:  # broken chain deps must never kill the bot (chains are 
 BSC_ENABLED = USE_BSC and BSC_AVAILABLE
 
 # Flat manual-withdraw fee (wallet bot) — shown in deal bot messages so the
-# seller/buyer knows the net they will receive. KEEP IN SYNC with walletbot.py.
-WITHDRAW_FEE = {"tron": 3.5, "bsc": 1.0}
+# seller/buyer knows the net they will receive. Now admin-configurable via
+# get_setting()/withdraw_fee() (was WITHDRAW_FEE = {"tron": 3.5, "bsc": 1.0}).
+# KEEP IN SYNC with walletbot.py.
 # Shawn (2026-10-12): deals under 500 USDT -> BEP20 ONLY (gas ~$0.15 vs ~$2+);
 # 500 USDT and above -> both chains shown, buyer picks.
-BEP20_ONLY_BELOW = 500
+# (BEP20_ONLY_BELOW removed 2026-10-13: now admin setting "bep20_only_threshold".)
+
+# ---- Admin-configurable settings (DM admin panel, @Balochbuyer only) ----
+# Shawn (2026-10-13): admin can change fees/limits from the bot's DM.
+# Stored in bot_settings.json next to the running script (/root/bot_settings.json
+# on the VPS) so values survive code deploys. All hardcoded fee/limit values
+# below read through get_setting().
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_settings.json")
+DEFAULT_SETTINGS = {
+    "escrow_fee_pct": 3.0,        # % of deal amount
+    "escrow_fee_min": 3.0,        # minimum escrow fee, USDT
+    "withdraw_fee_trc20": 3.5,    # USDT (TRC20)
+    "withdraw_fee_bep20": 1.0,    # USDT (BEP20)
+    "bep20_only_threshold": 500.0,  # deals BELOW this (USDT) -> BEP20 only
+    "deal_question_enabled": True,
+    "paused": False,              # pause NEW deals (ongoing deals continue)
+}
+bot_settings: dict = {}
+
+
+def load_settings() -> None:
+    """Load admin settings from disk (defaults when missing/corrupt)."""
+    global bot_settings
+    try:
+        with open(SETTINGS_FILE) as f:
+            data = json.load(f)
+        bot_settings = {**DEFAULT_SETTINGS,
+                        **{k: v for k, v in data.items() if k in DEFAULT_SETTINGS}}
+    except Exception:
+        bot_settings = dict(DEFAULT_SETTINGS)
+
+
+def save_settings() -> None:
+    """Atomically persist admin settings to disk."""
+    try:
+        tmp = SETTINGS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(bot_settings, f)
+        os.replace(tmp, SETTINGS_FILE)
+    except Exception as e:
+        logger.error(f"Failed to save settings: {e}")
+
+
+def get_setting(key: str):
+    """Read one admin setting (falls back to default)."""
+    if not bot_settings:
+        load_settings()
+    return bot_settings.get(key, DEFAULT_SETTINGS[key])
+
+
+def fee_text_short() -> str:
+    """Human-readable escrow fee, e.g. '3% (minimum 3 USDT)'."""
+    return f"{get_setting('escrow_fee_pct'):g}% (minimum {get_setting('escrow_fee_min'):g} USDT)"
+
+
+def withdraw_fee(chain: str) -> float:
+    """Withdraw fee for a chain ('tron' -> TRC20, 'bsc' -> BEP20)."""
+    if chain == "bsc":
+        return float(get_setting("withdraw_fee_bep20"))
+    return float(get_setting("withdraw_fee_trc20"))
+
+
+# ---- Pause: block NEW deals while paused (ongoing deals continue) ----
+# Shawn (2026-10-13): admin can pause new deals from the DM admin panel.
+_pause_notice_at: dict[int, float] = {}
+
+
+def _deal_is_ongoing(state: dict | None) -> bool:
+    """True if this chat has a real deal in progress (not a fresh/empty group)."""
+    if not state:
+        return False
+    if state.get("payout_done") or state.get("refund_done"):
+        return False
+    if state.get("stage") not in (None, "role_selection"):
+        return True
+    if state.get("members") or state.get("buyer") or state.get("seller"):
+        return True
+    return False
+
+
+async def _reject_if_paused(chat_id: int, state: dict | None) -> bool:
+    """If the bot is paused and there's no ongoing deal here, notify
+    (rate-limited) and return True so the caller stops the new deal."""
+    if not get_setting("paused") or _deal_is_ongoing(state):
+        return False
+    now = time.time()
+    if now - _pause_notice_at.get(chat_id, 0) > 600:
+        _pause_notice_at[chat_id] = now
+        try:
+            await bot.send_message(
+                chat_id,
+                "⏸️ <b>Baloch OTC is paused right now.</b>\n"
+                "New deals are temporarily disabled — please try again later.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    return True
 
 # Payment addresses (displayed as reference in messages)
 BEP20_ADDRESS = "0xf1a0fade24678e3331eaf915840cc6cf6a831d80"
@@ -392,7 +490,8 @@ def generate_order_id(chat_id: int, prefix: str = "deal") -> str:
 
 
 def calculate_fee(amount: float, fee_payer: str) -> tuple[float, float, float]:
-    fee = max(3.0, amount * 0.03)
+    fee = max(float(get_setting("escrow_fee_min")),
+              amount * float(get_setting("escrow_fee_pct")) / 100.0)
     if fee_payer == "buyer":
         return round(amount + fee, 2), round(amount, 2), round(fee, 2)
     elif fee_payer == "seller":
@@ -900,7 +999,7 @@ Rules:
 - NEVER deflect a question with "select your role", "tap Buyer/Seller", "use the buttons", "type /start", or "start the deal". Answer the question first; mention next steps only if genuinely relevant.
 - Give complete answers: short for simple questions, thorough when the question needs detail. Never cut an answer short.
 - {greet_rule}
-- You may explain: how escrow works; fees — escrow fee is 3% of the deal amount (minimum 3 USDT), paid by buyer / seller / split as agreed; withdraw fee 3.5 USDT on TRC20, 1 USDT on BEP20; deals under 500 USDT go BEP20 only (cheap gas); blockchain gas is covered by the admin; safety tips; what happens next at this stage; timelines.
+- You may explain: how escrow works; fees — escrow fee is {fee_text_short()} of the deal amount, paid by buyer / seller / split as agreed; withdraw fee {get_setting('withdraw_fee_trc20'):g} USDT on TRC20, {get_setting('withdraw_fee_bep20'):g} USDT on BEP20; deals under {get_setting('bep20_only_threshold'):g} USDT go BEP20 only (cheap gas); blockchain gas is covered by the admin; safety tips; what happens next at this stage; timelines.
 - Greetings (salam/hello/hi): only on the first message, per the rule above.
 - You NEVER take deal actions yourself: never release, refund, confirm a payment, file a dispute, or change addresses. If the user asks for an action, guide them to the right button in the group (Release To Seller / Refund to Buyer / Dispute).
 - NEVER claim money was sent, released, refunded, or confirmed.
@@ -1389,7 +1488,7 @@ async def show_payment_info_chain(chat_id: int, chain: str = "tron"):
     # Shawn (2026-10-12): small deals (< 500 USDT) -> BEP20 ONLY.
     # Payout always follows the chain the deposit arrived on.
     deal_amount = state.get("amount", buyer_amount)
-    bep20_only = bool(bsc_address) and deal_amount < BEP20_ONLY_BELOW
+    bep20_only = bool(bsc_address) and deal_amount < float(get_setting("bep20_only_threshold"))
     if bep20_only:
         state["deposit_address"] = bsc_address
         state["chain"] = "bsc"
@@ -1409,8 +1508,8 @@ async def show_payment_info_chain(chat_id: int, chain: str = "tron"):
             f"Buyer needs to pay: <b>{buyer_amount} USDT</b>\n"
             f"Seller will receive: <b>{seller_amount} USDT</b>\n"
             f"Escrow Fee: <b>{fee} USDT</b>\n\n"
-            f"<b>Baloch Escrow fee: 3% (minimum $3)</b>\n\n"
-            f"💡 <i>Small deal (&lt; 500 USDT) → <b>BEP20 only</b>: "
+            f"<b>Baloch Escrow fee: {fee_text_short()}</b>\n\n"
+            f"💡 <i>Small deal (&lt; {get_setting('bep20_only_threshold'):g} USDT) → <b>BEP20 only</b>: "
             f"gas ~$0.15 vs ~$2+ on TRON.</i>\n\n"
             f"Send <b>exactly {buyer_amount} USDT</b> to this address:\n\n"
             f"<b>USDT BEP20</b>\n"
@@ -1433,7 +1532,7 @@ async def show_payment_info_chain(chat_id: int, chain: str = "tron"):
             f"Buyer needs to pay: <b>{buyer_amount} USDT</b>\n"
             f"Seller will receive: <b>{seller_amount} USDT</b>\n"
             f"Escrow Fee: <b>{fee} USDT</b>\n\n"
-            f"<b>Baloch Escrow fee: 3% (minimum $3)</b>\n\n"
+            f"<b>Baloch Escrow fee: {fee_text_short()}</b>\n\n"
             f"Send <b>exactly {buyer_amount} USDT</b> to <b>ONE</b> of these addresses:\n\n"
             f"<b>USDT TRC20</b>\n"
             f"<code>{tron_address}</code>\n"
@@ -1697,7 +1796,7 @@ async def show_payment_info_cryptomus(chat_id: int):
         f"Buyer needs to pay: <b>{buyer_amount} USDT</b>\n"
         f"Seller will receive: <b>{seller_amount} USDT</b>\n"
         f"Escrow Fee: <b>{fee} USDT</b>\n\n"
-        f"<b>Baloch Escrow fee: 3% (minimum $3)</b>\n\n"
+        f"<b>Baloch Escrow fee: {fee_text_short()}</b>\n\n"
     )
     if payment_url:
         payment_msg += (
@@ -2146,6 +2245,10 @@ async def do_deal_confirm(chat_id: int, user: types.User, action: str):
         return
 
     if state.get("buyer_confirmed") and state.get("seller_confirmed"):
+        if not get_setting("deal_question_enabled"):
+            # Admin disabled the deal question -> skip straight to fee selection.
+            await ask_deal_question(chat_id, len(DEAL_QUESTIONS))
+            return
         await bot.send_message(
             chat_id,
             f"<b>Deal Confirmed by both parties!</b>\n\n"
@@ -2430,7 +2533,7 @@ async def do_fee_option_buyer_confirm(chat_id: int, user: types.User, action: st
             f"<b>SELLER FEE PAYMENT</b>\n"
             f"{'=' * 30}\n\n"
             f"Seller needs to pay: <b>{state['seller_fee']}</b> USDT\n\n"
-            f"<b>Baloch Escrow fees: 3% (minimum $3)</b>\n\n"
+            f"<b>Baloch Escrow fees: {fee_text_short()}</b>\n\n"
         )
         if fee_url:
             fee_msg += f"Tap the button below to pay securely through Cryptomus:\n{fee_url}\n\n"
@@ -3241,6 +3344,8 @@ async def on_bot_added(event: types.ChatMemberUpdated):
         chat_id = event.chat.id
         group_title = event.chat.title
         if is_baloch_deal_group(group_title):
+            if await _reject_if_paused(chat_id, deal_states.get(chat_id)):
+                return
             if chat_id not in deal_states:
                 deal_states[chat_id] = {"stage": "role_selection", "members": {}, "conversation_history": []}
             await send_role_prompt(chat_id)
@@ -3360,6 +3465,8 @@ async def _do_start_command(message: types.Message):
     # Don't send a confusing role prompt mid-deal — only in role_selection stage
     # or if no deal has started yet (no stage = fresh group).
     existing = deal_states.get(chat_id)
+    if await _reject_if_paused(chat_id, existing):
+        return
     if existing and existing.get("stage") not in ("role_selection", None):
         # Allow /start to RESET a stuck/broken deal back to role selection.
         # (Shawn: "aisa ho k insan easily escrow use kr skay" — no dead-ends.)
@@ -3421,32 +3528,249 @@ _private_chat_at: dict[int, float] = {}
 _private_greeted: set[int] = set()
 
 
+# ==============================================
+# ADMIN PANEL (DM only, @Balochbuyer)
+# ==============================================
+# Shawn (2026-10-13): admin starts the bot in DM and gets buttons to modify
+# fees, limits, and bot behavior. Changes apply instantly, no restart needed.
+_admin_pending: dict[int, str] = {}  # admin user_id -> setting key awaiting a value
+
+# pending key -> (settings key, label, min, max)
+_ADMIN_SETTINGS_META = {
+    "fee_pct": ("escrow_fee_pct", "Escrow fee %", 0, 100),
+    "fee_min": ("escrow_fee_min", "Minimum escrow fee (USDT)", 0, 100000),
+    "wd_tron": ("withdraw_fee_trc20", "TRC20 withdraw fee (USDT)", 0, 100),
+    "wd_bsc": ("withdraw_fee_bep20", "BEP20 withdraw fee (USDT)", 0, 100),
+    "chain": ("bep20_only_threshold", "BEP20-only threshold (USDT)", 0, 10000000),
+}
+
+
+def _admin_menu_text() -> str:
+    s = bot_settings or DEFAULT_SETTINGS
+    return (
+        "🔧 <b>Admin Panel</b>\n\n"
+        f"💰 Escrow fee: <b>{float(s['escrow_fee_pct']):g}%</b> (min <b>{float(s['escrow_fee_min']):g}</b> USDT)\n"
+        f"💸 Withdraw fee: TRC20 <b>{float(s['withdraw_fee_trc20']):g}</b> / "
+        f"BEP20 <b>{float(s['withdraw_fee_bep20']):g}</b> USDT\n"
+        f"⛓ BEP20-only below: <b>{float(s['bep20_only_threshold']):g}</b> USDT\n"
+        f"❓ Deal question: <b>{'ON' if s['deal_question_enabled'] else 'OFF'}</b>\n"
+        f"⏸ New deals: <b>{'PAUSED' if s['paused'] else 'ACTIVE'}</b>"
+    )
+
+
+def _admin_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Fee %", callback_data="adm_set_fee_pct"),
+         InlineKeyboardButton(text="💰 Min fee", callback_data="adm_set_fee_min")],
+        [InlineKeyboardButton(text="💸 WD TRC20", callback_data="adm_set_wd_tron"),
+         InlineKeyboardButton(text="💸 WD BEP20", callback_data="adm_set_wd_bsc")],
+        [InlineKeyboardButton(text="⛓ BEP20-only limit", callback_data="adm_set_chain")],
+        [InlineKeyboardButton(text="❓ Question ON/OFF", callback_data="adm_toggle_q"),
+         InlineKeyboardButton(text="⏸ Pause/Resume", callback_data="adm_toggle_pause")],
+        [InlineKeyboardButton(text="📊 Stats", callback_data="adm_stats"),
+         InlineKeyboardButton(text="📋 Active deals", callback_data="adm_deals")],
+    ])
+
+
+def _admin_stats_text() -> str:
+    active = 0
+    volume = 0.0
+    done = 0
+    fees_earned = 0.0
+    for st in deal_states.values():
+        if not isinstance(st, dict):
+            continue
+        try:
+            fee = float(st.get("fee") or 0)
+        except (TypeError, ValueError):
+            fee = 0.0
+        amt = 0.0
+        for k in ("buyer_amount", "amount"):
+            try:
+                amt = float(st.get(k) or 0)
+            except (TypeError, ValueError):
+                amt = 0.0
+            if amt:
+                break
+        if st.get("payout_done") or st.get("refund_done"):
+            done += 1
+            fees_earned += fee
+        elif st.get("buyer") or st.get("seller") or amt or st.get("stage") not in (None, "role_selection"):
+            active += 1
+            volume += amt
+    return (
+        "📊 <b>Stats</b> (from bot memory)\n\n"
+        f"🟢 Active deals: <b>{active}</b>\n"
+        f"💵 Active volume: <b>{volume:,.2f}</b> USDT\n"
+        f"✅ Completed deals: <b>{done}</b>\n"
+        f"💰 Escrow fees earned: <b>{fees_earned:,.2f}</b> USDT\n\n"
+        f"⚙️ Current fee: <b>{fee_text_short()}</b>"
+    )
+
+
+def _admin_deals_text() -> str:
+    lines = []
+    for cid, st in deal_states.items():
+        if not isinstance(st, dict):
+            continue
+        if st.get("payout_done") or st.get("refund_done"):
+            continue
+        if not (st.get("buyer") or st.get("seller") or st.get("stage") not in (None, "role_selection")):
+            continue
+        amt = 0.0
+        for k in ("buyer_amount", "amount"):
+            try:
+                amt = float(st.get(k) or 0)
+            except (TypeError, ValueError):
+                amt = 0.0
+            if amt:
+                break
+        stage = st.get("stage", "?")
+        amt_txt = f"{amt:,.2f} USDT" if amt else "—"
+        lines.append(f"• <code>{cid}</code> — {stage} — {amt_txt}")
+    if not lines:
+        return "📋 <b>Active deals</b>\n\nNo active deals right now."
+    shown = "\n".join(lines[:20])
+    more = f"\n<i>...and {len(lines) - 20} more</i>" if len(lines) > 20 else ""
+    return "📋 <b>Active deals</b>\n\n" + shown + more
+
+
+async def _admin_show_menu(chat_id: int, message: types.Message | None = None) -> None:
+    """Show (or refresh) the admin menu, editing in place when possible."""
+    if message is not None:
+        try:
+            await message.edit_text(_admin_menu_text(), parse_mode="HTML", reply_markup=_admin_menu_kb())
+            return
+        except Exception:
+            pass
+    await bot.send_message(chat_id, _admin_menu_text(), parse_mode="HTML", reply_markup=_admin_menu_kb())
+
+
+async def _admin_setting_input(message: types.Message, text: str) -> None:
+    """Admin typed a new value for a pending setting."""
+    uid = message.from_user.id
+    key = _admin_pending.get(uid)
+    meta = _ADMIN_SETTINGS_META.get(key or "")
+    if not meta:
+        _admin_pending.pop(uid, None)
+        return
+    skey, label, mn, mx = meta
+    try:
+        val = float(text.replace(",", "").strip())
+    except ValueError:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Cancel", callback_data="adm_menu")]])
+        await message.answer(
+            f"⚠️ Please send a <b>number</b> for <b>{label}</b> (or tap ❌ Cancel).",
+            parse_mode="HTML", reply_markup=kb)
+        return
+    if not (mn <= val <= mx):
+        await message.answer(f"⚠️ Value must be between {mn:g} and {mx:g}.", parse_mode="HTML")
+        return
+    if not bot_settings:
+        load_settings()
+    bot_settings[skey] = val
+    save_settings()
+    _admin_pending.pop(uid, None)
+    await message.answer(
+        f"✅ <b>{label}</b> updated to <b>{val:g}</b>.\n\n" + _admin_menu_text(),
+        parse_mode="HTML", reply_markup=_admin_menu_kb())
+
+
+@dp.callback_query(F.data.startswith("adm_"))
+async def handle_admin_panel(callback: CallbackQuery):
+    """Admin panel buttons (DM only)."""
+    if not _is_admin_user(callback.from_user):
+        await callback.answer("Admin only.", show_alert=True)
+        return
+    await callback.answer()
+    data = callback.data
+    uid = callback.from_user.id
+    chat_id = callback.message.chat.id
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="adm_menu")]])
+
+    if data in ("adm_menu", "adm_cancel"):
+        _admin_pending.pop(uid, None)
+        await _admin_show_menu(chat_id, callback.message)
+    elif data.startswith("adm_set_"):
+        key = data[len("adm_set_"):]
+        meta = _ADMIN_SETTINGS_META.get(key)
+        if not meta:
+            return
+        _admin_pending[uid] = key
+        skey, label, mn, mx = meta
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Cancel", callback_data="adm_menu")]])
+        try:
+            await callback.message.edit_text(
+                f"✏️ <b>{label}</b>\nCurrent: <b>{float(get_setting(skey)):g}</b>\n\n"
+                f"Reply with the new value (number):",
+                parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            await bot.send_message(
+                chat_id,
+                f"✏️ <b>{label}</b>\nCurrent: <b>{float(get_setting(skey)):g}</b>\n\n"
+                f"Reply with the new value (number):",
+                parse_mode="HTML", reply_markup=kb)
+    elif data == "adm_toggle_q":
+        if not bot_settings:
+            load_settings()
+        bot_settings["deal_question_enabled"] = not bool(get_setting("deal_question_enabled"))
+        save_settings()
+        await _admin_show_menu(chat_id, callback.message)
+    elif data == "adm_toggle_pause":
+        if not bot_settings:
+            load_settings()
+        bot_settings["paused"] = not bool(get_setting("paused"))
+        save_settings()
+        await _admin_show_menu(chat_id, callback.message)
+    elif data == "adm_stats":
+        try:
+            await callback.message.edit_text(_admin_stats_text(), parse_mode="HTML", reply_markup=back_kb)
+        except Exception:
+            await bot.send_message(chat_id, _admin_stats_text(), parse_mode="HTML", reply_markup=back_kb)
+    elif data == "adm_deals":
+        try:
+            await callback.message.edit_text(_admin_deals_text(), parse_mode="HTML", reply_markup=back_kb)
+        except Exception:
+            await bot.send_message(chat_id, _admin_deals_text(), parse_mode="HTML", reply_markup=back_kb)
+
+
 @dp.message(F.text & (F.chat.type == "private"))
 async def on_private_message(message: types.Message):
     """Talk with anyone in personal chat — any language, like a human admin.
-    Informational only: deal actions still happen in deal groups via buttons."""
+    Informational only: deal actions still happen in deal groups via buttons.
+    The admin (@Balochbuyer) gets the admin panel on /start."""
     if _is_service_account(message.from_user):
         return
     text = (message.text or "").strip()
     if not text:
         return
+    user = message.from_user
+    is_admin = _is_admin_user(user)
     if text.startswith("/"):
         # Friendly /start in private (group /start is handled elsewhere)
         if text.split("@")[0].split(" ")[0] == "/start":
-            await message.answer(
-                "👋 <b>Salam! I'm the Baloch OTC escrow assistant.</b>\n\n"
-                "Ask me anything about escrow — how it works, fees, safety — "
-                "in any language. Deals happen in deal groups; I'm here so "
-                "everything is easy to understand. 🙂",
-                parse_mode="HTML",
-            )
+            if is_admin:
+                await _admin_show_menu(message.chat.id)
+            else:
+                await message.answer(
+                    "👋 <b>Salam! I'm the Baloch OTC escrow assistant.</b>\n\n"
+                    "Ask me anything about escrow — how it works, fees, safety — "
+                    "in any language. Deals happen in deal groups; I'm here so "
+                    "everything is easy to understand. 🙂",
+                    parse_mode="HTML",
+                )
+        return
+    if is_admin and user.id in _admin_pending:
+        await _admin_setting_input(message, text)
         return
     if len(text) > 1000:
         return
     now = time.time()
     if now - _private_chat_at.get(message.chat.id, 0) < 8:
         return  # light anti-spam; 1-on-1 should still feel instant
-    user = message.from_user
     display = f"@{user.username}" if user.username else (user.first_name or "User")
     first_contact = message.chat.id not in _private_greeted
     reply = await ai_chat_reply(text, {}, display, first_contact=first_contact)
@@ -3857,7 +4181,7 @@ async def universal_stage_handler(message: types.Message):
         state["stage"] = "address_confirmation"
 
         pchain = state.get("chain", "tron")
-        pwfee = WITHDRAW_FEE.get(pchain, 3.0)
+        pwfee = withdraw_fee(pchain)
         pnet = round(state["seller_amount"] - pwfee, 2)
         await message.answer(
             f"Buyer paid: <b>{state['buyer_amount']}</b> USDT\n"
@@ -3892,7 +4216,7 @@ async def universal_stage_handler(message: types.Message):
         refund_amount = round(state["buyer_amount"] - deduct, 2)
 
         rchain = state.get("chain", "tron")
-        rwfee = WITHDRAW_FEE.get(rchain, 3.0)
+        rwfee = withdraw_fee(rchain)
         rnet = round(refund_amount - rwfee, 2)
         await message.answer(
             f"Refund amount: <b>{refund_amount} USDT</b>\n"
@@ -4430,6 +4754,14 @@ async def main():
     if restored:
         deal_states.update(restored)
         logger.info(f"Restored {len(restored)} deal(s) from disk")
+    # ---- Admin settings (fees/limits configurable from DM admin panel) ----
+    load_settings()
+    logger.info(f"Settings: escrow_fee={fee_text_short()}, "
+                f"wd_trc20={get_setting('withdraw_fee_trc20'):g}, "
+                f"wd_bep20={get_setting('withdraw_fee_bep20'):g}, "
+                f"bep20_only_below={get_setting('bep20_only_threshold'):g}, "
+                f"question={'on' if get_setting('deal_question_enabled') else 'off'}, "
+                f"paused={get_setting('paused')}")
     for r_chat_id, r_state in list(deal_states.items()):
         try:
             if r_state.get("payout_in_progress") or r_state.get("refund_in_progress"):
