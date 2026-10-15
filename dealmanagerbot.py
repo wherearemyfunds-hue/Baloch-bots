@@ -1014,7 +1014,7 @@ Rules:
 - {greet_rule}
 - You may explain: how escrow works; fees — escrow fee is {fee_text_short()} of the deal amount, paid by buyer / seller / split as agreed; withdraw fee {get_setting('withdraw_fee_trc20'):g} USDT on TRC20, {get_setting('withdraw_fee_bep20'):g} USDT on BEP20; deals under {get_setting('bep20_only_threshold'):g} USDT go BEP20 only (cheap gas); blockchain gas is covered by the admin; safety tips; what happens next at this stage; timelines.
 - Greetings (salam/hello/hi): only on the first message, per the rule above.
-- You NEVER take deal actions yourself: never release, refund, confirm a payment, file a dispute, or change addresses. If the user asks for an action, guide them to the right button in the group (Release To Seller / Refund to Buyer / Dispute).
+- You NEVER take deal actions yourself: never release, refund, confirm a payment, file a dispute, or change addresses. If the user asks for an action, guide them to the right button in the group (Release To Seller / Release Partial / Refund to Buyer / Dispute).
 - NEVER claim money was sent, released, refunded, or confirmed.
 - NEVER ask for private keys, seed phrases, or passwords.
 - If they report a buyer/seller problem: advise keeping all proof safe and tapping Dispute.
@@ -1350,6 +1350,7 @@ async def send_action_buttons_to_all(chat_id: int):
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Release To Seller", callback_data="release")],
+        [InlineKeyboardButton(text="Release Partial", callback_data="release_partial")],
         [InlineKeyboardButton(text="Refund to Buyer", callback_data="refund")],
         [InlineKeyboardButton(text="⚠️ Dispute", callback_data="dispute")],
     ])
@@ -1358,6 +1359,7 @@ async def send_action_buttons_to_all(chat_id: int):
         chat_id,
         f"<b>Quick Actions:</b>\n\n"
         f"<i>• {buyer_name} (Buyer) → tap <b>Release To Seller</b> (or type <b>release</b>)\n"
+        f"• {buyer_name} (Buyer) → tap <b>Release Partial</b> to release part of the amount\n"
         f"• {seller_name} (Seller) → tap <b>Refund to Buyer</b> (or type <b>refund</b>)\n"
         f"• Anyone → tap <b>⚠️ Dispute</b> (or type <b>dispute</b>) if there's a problem\n"
         f"• Admin → can use release or refund</i>",
@@ -2971,9 +2973,16 @@ async def do_release(chat_id: int, user: types.User):
         InlineKeyboardButton(text="Yes", callback_data="release_confirm"),
         InlineKeyboardButton(text="No", callback_data="release_cancel"),
     ]])
+    released_total = round(state.get("released_total", 0), 2)
+    remaining = round(state.get("seller_amount", 0) - released_total, 2)
+    prompt = "Are you ready to release payment to seller?"
+    if released_total > 0:
+        # A partial was already released: the full button now releases only the remainder.
+        prompt = (f"Are you ready to release the remaining <b>{remaining}</b> USDT to seller?\n"
+                  f"(Already released: {released_total} USDT)")
     await bot.send_message(
         chat_id,
-        "Are you ready to release payment to seller?\n"
+        prompt + "\n"
         "Tap <b>Yes</b> / <b>No</b>, or reply: <b>confirm</b> / <b>cancel</b>",
         parse_mode="HTML",
         reply_markup=kb,
@@ -3003,6 +3012,11 @@ async def do_release_confirm(chat_id: int, user: types.User):
         await bot.send_message(chat_id, "Only the buyer or admin can confirm payment release.")
         return
     state.pop("awaiting", None)
+    # If a partial was already released, the full button releases only the remainder.
+    seller_amount = state.get("seller_amount", 0)
+    remaining = round(seller_amount - state.get("released_total", 0), 2)
+    if 0 < remaining < seller_amount:
+        state["pending_release_amount"] = remaining
     seller_name = await get_username(state["seller"], "Seller")
     state["stage"] = "payout_address"
     await bot.send_message(chat_id, f"{seller_name}, {payout_prompt_text(state.get('chain', 'tron'))}")
@@ -3020,6 +3034,149 @@ async def do_release_cancel(chat_id: int, user: types.User):
     state.pop("awaiting", None)
     state["stage"] = "work"
     await bot.send_message(chat_id, "❌ <b>Release cancelled.</b> No money moved. Use the buttons below whenever you're ready.", parse_mode="HTML")
+    await send_action_buttons_to_all(chat_id)
+
+
+# ----------------------------------------------
+# PARTIAL RELEASE PAYMENT
+# ----------------------------------------------
+
+async def do_release_partial(chat_id: int, user: types.User):
+    """Buyer/admin taps 'Release Partial' - ask how much to release."""
+    state = deal_states.get(chat_id, {})
+    if state.get("stage") != "work":
+        return
+    # Frozen deal: blocked for non-admins.
+    if _is_frozen_for_user(state, user):
+        await bot.send_message(chat_id, "🔒 <b>Deal is frozen due to an open dispute.</b> Release is blocked until admin resolves.", parse_mode="HTML")
+        return
+    if state.get("payout_done"):
+        await bot.send_message(chat_id, "<b>⚠️ Payout has already been sent for this deal. No duplicate payouts allowed.</b>", parse_mode="HTML")
+        return
+    if state.get("refund_done"):
+        await bot.send_message(chat_id, "<b>⚠️ This deal was already refunded. Release is not possible.</b>", parse_mode="HTML")
+        return
+    if state.get("awaiting"):
+        await bot.send_message(chat_id, "⏳ A confirmation is already pending — please tap <b>Yes</b>/<b>No</b> on it (or type <b>cancel</b>) before starting a new one.", parse_mode="HTML")
+        return
+    user_id = user.id
+    if not (user_id == state.get("buyer") or _is_admin_user(user)):
+        await bot.send_message(chat_id, "Only buyer or admin can release payment.")
+        return
+    seller_amount = state.get("seller_amount", 0)
+    released_total = round(state.get("released_total", 0), 2)
+    if released_total >= seller_amount:
+        await bot.send_message(chat_id, "<b>⚠️ Full amount has already been released for this deal.</b>", parse_mode="HTML")
+        return
+    remaining = round(seller_amount - released_total, 2)
+    state["awaiting"] = "partial_amount"
+    await bot.send_message(
+        chat_id,
+        f"💰 <b>Partial release</b>\n\n"
+        f"Full amount: <b>{seller_amount}</b> USDT\n"
+        f"Already released: <b>{released_total}</b> USDT\n"
+        f"Remaining: <b>{remaining}</b> USDT\n\n"
+        f"How much should be released to the seller now?\n"
+        f"Reply with the amount (less than the full amount; up to <b>{remaining}</b> USDT left — or type <b>cancel</b>).",
+        parse_mode="HTML",
+    )
+
+
+async def do_partial_amount(chat_id: int, user: types.User, text: str):
+    """Buyer typed the partial amount - validate it, then ask for Yes/No."""
+    state = deal_states.get(chat_id, {})
+    if state.get("awaiting") != "partial_amount":
+        return
+    cmd = _normalize_cmd(text)
+    if cmd in NO_WORDS:
+        await do_release_partial_cancel(chat_id, user)
+        return
+    user_id = user.id
+    if not (user_id == state.get("buyer") or _is_admin_user(user)):
+        return  # only the requester answers; everyone else is ignored
+    seller_amount = state.get("seller_amount", 0)
+    released_total = round(state.get("released_total", 0), 2)
+    remaining = round(seller_amount - released_total, 2)
+    try:
+        amount = round(float(text.strip().replace(",", "")), 2)
+    except ValueError:
+        await bot.send_message(chat_id, "❌ Please reply with a number, e.g. <b>50</b>", parse_mode="HTML")
+        return
+    if amount <= 0:
+        await bot.send_message(chat_id, "❌ Amount must be greater than 0.", parse_mode="HTML")
+        return
+    if amount >= seller_amount:
+        await bot.send_message(chat_id, f"❌ Partial amount must be <b>less than</b> the full amount ({seller_amount} USDT). For the full amount use <b>Release To Seller</b>.", parse_mode="HTML")
+        return
+    if amount > remaining:
+        await bot.send_message(chat_id, f"❌ Only <b>{remaining}</b> USDT is left in this deal. Enter a smaller amount.", parse_mode="HTML")
+        return
+    fee = withdraw_fee(state.get("chain", "tron"))
+    if round(amount - fee, 2) <= 0:
+        await bot.send_message(chat_id, f"❌ Amount is too small — the network fee is ~{fee} USDT.", parse_mode="HTML")
+        return
+    state["pending_release_amount"] = amount
+    state["awaiting"] = "partial_confirm"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Yes", callback_data="partial_confirm"),
+        InlineKeyboardButton(text="No", callback_data="partial_cancel"),
+    ]])
+    net = round(amount - fee, 2)
+    await bot.send_message(
+        chat_id,
+        f"Release <b>{amount}</b> USDT to the seller?\n"
+        f"(Seller will receive ~<b>{net}</b> USDT after network fee)\n"
+        f"Tap <b>Yes</b> / <b>No</b>, or reply: <b>confirm</b> / <b>cancel</b>",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+async def do_release_partial_confirm(chat_id: int, user: types.User):
+    """Buyer/admin confirmed the partial amount - ask the seller for the payout address."""
+    if chat_id not in deal_states:
+        return
+    state = deal_states[chat_id]
+    if _is_frozen_for_user(state, user):
+        await bot.send_message(chat_id, "🔒 <b>Deal is frozen due to an open dispute.</b> Release is blocked until admin resolves.", parse_mode="HTML")
+        return
+    if state.get("payout_done"):
+        await bot.send_message(chat_id, "Payout has already been processed for this deal.")
+        return
+    if state.get("refund_done"):
+        await bot.send_message(chat_id, "This deal was already refunded. Release is not possible.")
+        return
+    # Stale-button guard: only a live partial confirmation may proceed.
+    if state.get("awaiting") != "partial_confirm":
+        await bot.send_message(chat_id, "This confirmation is no longer active. Use the buttons above to start again.", parse_mode="HTML")
+        return
+    user_id = user.id
+    if not (user_id == state.get("buyer") or _is_admin_user(user)):
+        await bot.send_message(chat_id, "Only the buyer or admin can confirm payment release.")
+        return
+    if not state.get("pending_release_amount"):
+        state.pop("awaiting", None)
+        await bot.send_message(chat_id, "This confirmation is no longer active. Use the buttons above to start again.", parse_mode="HTML")
+        return
+    state.pop("awaiting", None)
+    seller_name = await get_username(state["seller"], "Seller")
+    state["stage"] = "payout_address"
+    await bot.send_message(chat_id, f"{seller_name}, {payout_prompt_text(state.get('chain', 'tron'))}")
+
+
+async def do_release_partial_cancel(chat_id: int, user: types.User):
+    """Buyer/admin cancels the partial release."""
+    if chat_id not in deal_states:
+        return
+    state = deal_states[chat_id]
+    user_id = user.id
+    if not (user_id == state.get("buyer") or _is_admin_user(user)):
+        await bot.send_message(chat_id, "Only the buyer or admin can cancel payment release.")
+        return
+    state.pop("awaiting", None)
+    state.pop("pending_release_amount", None)
+    state["stage"] = "work"
+    await bot.send_message(chat_id, "❌ <b>Partial release cancelled.</b> No money moved. Use the buttons below whenever you're ready.", parse_mode="HTML")
     await send_action_buttons_to_all(chat_id)
 
 
@@ -3055,7 +3212,8 @@ async def auto_payout(chat_id: int):
 
     chain = state.get("chain", "tron")
     to_address = state.get("payout_address", "")
-    amount = state.get("seller_amount", 0)
+    # Partial releases carry their own amount; the full flow falls back to seller_amount.
+    amount = state.pop("pending_release_amount", 0) or state.get("seller_amount", 0)
     wfee = withdraw_fee(chain)
     net = round(amount - wfee, 2)
     chain_label = "BNB Smart Chain (BEP20)" if chain == "bsc" else "TRON (TRC20)"
@@ -3114,26 +3272,46 @@ async def auto_payout(chat_id: int):
                           note=f"deal {state.get('deal_no', chat_id)}")
         except Exception:
             pass
-        state["payout_done"] = True
+        released_total = round(state.get("released_total", 0) + amount, 2)
+        state["released_total"] = released_total
         state["payout_txid"] = txid
         state["payout_net"] = net
         state["payout_auto"] = True
-        state["stage"] = "completed"
+        # Only a fully-paid deal counts as payout_done - partial payouts keep the deal open.
+        fully_paid = released_total >= state.get("seller_amount", 0)
+        if fully_paid:
+            state["payout_done"] = True
+            state["stage"] = "completed"
+        else:
+            state["stage"] = "work"
         state.pop("payout_in_progress", None)
         save_deal_states()
 
         seller_name = await get_username(state.get("seller", 0), "Seller")
-        await bot.send_message(
-            chat_id,
-            f"<b>Deal Completed!</b> ✅\n\n"
-            f"{seller_name} has been paid: <b>{net} USDT</b> ({chain_label})\n"
-            f"Address: <code>{to_address}</code>\n"
-            f"TxID: <code>{txid}</code>\n\n"
-            f"<b>Thanks for choosing and trusting Baloch OTC</b>\n"
-            f"<b>You can use Baloch OTC any time 24/7.</b>\n"
-            f"<b>Website: https://balochotc.com/</b>",
-            parse_mode="HTML",
-        )
+        if fully_paid:
+            await bot.send_message(
+                chat_id,
+                f"<b>Deal Completed!</b> ✅\n\n"
+                f"{seller_name} has been paid: <b>{net} USDT</b> ({chain_label})\n"
+                f"Address: <code>{to_address}</code>\n"
+                f"TxID: <code>{txid}</code>\n\n"
+                f"<b>Thanks for choosing and trusting Baloch OTC</b>\n"
+                f"<b>You can use Baloch OTC any time 24/7.</b>\n"
+                f"<b>Website: https://balochotc.com/</b>",
+                parse_mode="HTML",
+            )
+        else:
+            remaining = round(state.get("seller_amount", 0) - released_total, 2)
+            await bot.send_message(
+                chat_id,
+                f"💸 <b>Partial payout sent!</b>\n\n"
+                f"{seller_name} received: <b>{net} USDT</b> ({chain_label})\n"
+                f"Address: <code>{to_address}</code>\n"
+                f"TxID: <code>{txid}</code>\n\n"
+                f"Released so far: <b>{released_total}</b> / {state.get('seller_amount')} USDT\n"
+                f"Remaining: <b>{remaining}</b> USDT — use <b>Release Partial</b> or <b>Release To Seller</b> for the rest.",
+                parse_mode="HTML",
+            )
         await _send_deal_sticker(chat_id, "happy")
         await safe_notify_admin(
             f"✅ Auto-payout SENT\nDeal: {chat_id}\n"
@@ -3619,8 +3797,22 @@ async def route_text_command(message: types.Message) -> bool:
                 await do_refund_cancel(chat_id, user)
                 return True
             return False
+        if awaiting == "partial_amount":
+            await do_partial_amount(chat_id, user, message.text or "")
+            return True
+        if awaiting == "partial_confirm":
+            if cmd in YES_WORDS:
+                await do_release_partial_confirm(chat_id, user)
+                return True
+            if cmd in NO_WORDS:
+                await do_release_partial_cancel(chat_id, user)
+                return True
+            return False
         if cmd in ("release", "release payment", "release the payment"):
             await do_release(chat_id, user)
+            return True
+        if cmd in ("partial", "partial release", "release partial"):
+            await do_release_partial(chat_id, user)
             return True
         if cmd in ("refund", "refund to buyer", "refund buyer"):
             await do_refund(chat_id, user)
@@ -4616,7 +4808,8 @@ async def universal_stage_handler(message: types.Message):
         # Fully automatic: validated address -> send payout immediately.
         pchain = state.get("chain", "tron")
         pwfee = withdraw_fee(pchain)
-        pnet = round(state["seller_amount"] - pwfee, 2)
+        pamt = state.get("pending_release_amount", 0) or state["seller_amount"]
+        pnet = round(pamt - pwfee, 2)
         await message.answer(
             f"✅ Address received: <code>{address}</code>\n"
             f"Network: <b>{verification['type']}</b>\n"
@@ -5051,6 +5244,52 @@ async def handle_release_cancel(callback: CallbackQuery):
     state = deal_states.get(callback.message.chat.id, {})
     authorized = (callback.from_user.id == state.get("buyer") or _is_admin_user(callback.from_user))
     await do_release_cancel(callback.message.chat.id, callback.from_user)
+    if not authorized:
+        return
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# -- Release partial button --
+@dp.callback_query(F.data == "release_partial")
+async def handle_release_partial(callback: CallbackQuery):
+    await callback.answer()
+    # Only delete if the clicker is authorized (buyer or admin).
+    state = deal_states.get(callback.message.chat.id, {})
+    authorized = (callback.from_user.id == state.get("buyer") or _is_admin_user(callback.from_user))
+    await do_release_partial(callback.message.chat.id, callback.from_user)
+    if not authorized:
+        return
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# -- Partial confirm callback (legacy: old button messages still work) --
+@dp.callback_query(F.data == "partial_confirm")
+async def handle_partial_confirm(callback: CallbackQuery):
+    await callback.answer()
+    state = deal_states.get(callback.message.chat.id, {})
+    authorized = (callback.from_user.id == state.get("buyer") or _is_admin_user(callback.from_user))
+    await do_release_partial_confirm(callback.message.chat.id, callback.from_user)
+    if not authorized:
+        return
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# -- Partial cancel callback (legacy: old button messages still work) --
+@dp.callback_query(F.data == "partial_cancel")
+async def handle_partial_cancel(callback: CallbackQuery):
+    await callback.answer()
+    state = deal_states.get(callback.message.chat.id, {})
+    authorized = (callback.from_user.id == state.get("buyer") or _is_admin_user(callback.from_user))
+    await do_release_partial_cancel(callback.message.chat.id, callback.from_user)
     if not authorized:
         return
     try:
