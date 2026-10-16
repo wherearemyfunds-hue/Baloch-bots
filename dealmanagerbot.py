@@ -2560,54 +2560,69 @@ async def do_deal_question_answer(chat_id: int, user: types.User, answer_data: s
 # ----------------------------------------------
 
 async def do_fee_select(chat_id: int, user: types.User, fee_payer: str):
-    """Buyer types 'buyer' / 'seller' / 'half'."""
+    """Buyer OR seller proposes who pays the fee ('buyer' / 'seller' / 'half').
+
+    Whoever proposes, the OTHER party confirms with yes/no. No more
+    "Only the buyer can select" dead-end when the seller answers first.
+    """
     state = deal_states.get(chat_id)
     if not state or state.get("stage") != "fee_selection":
         return
-    if user.id != state["buyer"]:
-        await bot.send_message(chat_id, "Only the buyer can select who pays the fee.")
-        return
+    user_id = user.id
+    if user_id != state.get("buyer") and user_id != state.get("seller"):
+        return  # only the two deal parties may propose
+    proposer = "buyer" if user_id == state.get("buyer") else "seller"
+    confirmer = "seller" if proposer == "buyer" else "buyer"
+    confirmer_id = state.get(confirmer)
 
     amount = state["amount"]
     buyer_amount, seller_amount, fee = calculate_fee(amount, fee_payer)
 
+    state["temp_fee_payer"] = fee_payer
+    state["temp_buyer_amount"] = buyer_amount
+    state["temp_seller_amount"] = seller_amount
+    state["temp_fee"] = fee
+    state["temp_fee_proposer"] = proposer
+    state["stage"] = "fee_confirmation"
+    proposer_name = await get_username(user_id, "Proposer")
+    confirmer_name = await get_username(confirmer_id, "User")
     if fee_payer == "buyer":
-        state["fee_payer"] = fee_payer
-        state["buyer_amount"] = buyer_amount
-        state["seller_amount"] = seller_amount
-        state["fee"] = fee
-        state["stage"] = "payment"
-        await show_payment_info(chat_id)
+        pays_desc = "the <b>buyer</b> pays the fee"
+    elif fee_payer == "seller":
+        pays_desc = "the <b>seller</b> pays the fee"
     else:
-        state["temp_fee_payer"] = fee_payer
-        state["temp_buyer_amount"] = buyer_amount
-        state["temp_seller_amount"] = seller_amount
-        state["temp_fee"] = fee
-        state["stage"] = "fee_confirmation"
-        seller_name = await get_username(state["seller"], "Seller")
-        label = "half " if fee_payer == "half" else ""
-        await bot.send_message(
-            chat_id,
-            f"{seller_name}, the buyer selected that you pay the {label}fee. Do you agree?\n"
-            f"Reply: <b>yes</b> / <b>no</b>",
-            parse_mode="HTML",
-        )
+        pays_desc = "the fee is <b>split half/half</b>"
+    await bot.send_message(
+        chat_id,
+        f"{confirmer_name}, {proposer_name} proposed that {pays_desc}. Do you agree?\n"
+        f"Reply: <b>yes</b> / <b>no</b>",
+        parse_mode="HTML",
+    )
 
 
 async def do_fee_confirm(chat_id: int, user: types.User, action: str):
-    """Seller types 'yes' / 'no' to the fee proposal."""
+    """The non-proposing party types 'yes' / 'no' to the fee proposal."""
     state = deal_states.get(chat_id, {})
     if state.get("stage") != "fee_confirmation":
         return
-    if user.id != state["seller"]:
-        await bot.send_message(chat_id, "Only seller can confirm.")
+    proposer = state.get("temp_fee_proposer", "buyer")
+    if proposer == "buyer":
+        confirmer_id, confirmer_label = state.get("seller"), "seller"
+    else:
+        confirmer_id, confirmer_label = state.get("buyer"), "buyer"
+    if user.id != confirmer_id:
+        await bot.send_message(chat_id, f"Only the {confirmer_label} can confirm.")
         return
 
     if action == "no":
+        for k in ("temp_fee_payer", "temp_buyer_amount", "temp_seller_amount",
+                  "temp_fee", "temp_fee_proposer"):
+            state.pop(k, None)
         state["stage"] = "fee_selection"
         await bot.send_message(
             chat_id,
-            "Who will pay the escrow fee?\nReply: <b>buyer</b> / <b>seller</b> / <b>half</b>",
+            "Who will pay the escrow fee?\nReply: <b>buyer</b> / <b>seller</b> / <b>half</b>\n"
+            "(Buyer or seller - whoever answers, the other confirms.)",
             parse_mode="HTML",
         )
     else:
@@ -2615,14 +2630,19 @@ async def do_fee_confirm(chat_id: int, user: types.User, action: str):
         state["buyer_amount"] = state.pop("temp_buyer_amount")
         state["seller_amount"] = state.pop("temp_seller_amount")
         state["fee"] = state.pop("temp_fee")
-        state["stage"] = "fee_option"
-        seller_name = await get_username(state["seller"], "Seller")
-        await bot.send_message(
-            chat_id,
-            f"{seller_name}, how would you like to pay the fee?\n"
-            f"Reply: <b>include</b> (fee included in deal amount) / <b>separate</b> (pay fee upfront separately)",
-            parse_mode="HTML",
-        )
+        state.pop("temp_fee_proposer", None)
+        if state["fee_payer"] == "buyer":
+            state["stage"] = "payment"
+            await show_payment_info(chat_id)
+        else:
+            state["stage"] = "fee_option"
+            seller_name = await get_username(state["seller"], "Seller")
+            await bot.send_message(
+                chat_id,
+                f"{seller_name}, how would you like to pay the fee?\n"
+                f"Reply: <b>include</b> (fee included in deal amount) / <b>separate</b> (pay fee upfront separately)",
+                parse_mode="HTML",
+            )
 
 
 async def do_fee_include(chat_id: int, user: types.User):
@@ -3411,8 +3431,9 @@ async def auto_payout(chat_id: int):
                 f"Address: <code>{to_address}</code>\n"
                 f"TxID: <code>{txid}</code>\n\n"
                 f"Released so far: <b>{released_total}</b> / {state.get('seller_amount')} USDT\n"
-                f"Remaining: <b>{remaining}</b> USDT — use <b>Release Partial</b> or <b>Release To Seller</b> for the rest.",
+                f"Remaining: <b>{remaining}</b> USDT — use the buttons below for the rest.",
                 parse_mode="HTML",
+                reply_markup=_action_buttons_kb(),
             )
         await _send_deal_sticker(chat_id, "happy")
         await safe_notify_admin(
