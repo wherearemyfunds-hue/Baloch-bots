@@ -48,7 +48,7 @@ from telethon.tl.functions.messages import (
     EditExportedChatInviteRequest,
     GetExportedChatInvitesRequest,
 )
-from telethon.tl.types import ChatAdminRights, ChatBannedRights
+from telethon.tl.types import ChatAdminRights, ChatBannedRights, ChannelParticipantsAdmins
 
 # ==================== BASE DIRECTORY (absolute paths) ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -302,6 +302,14 @@ def _mark_active(chat_id: int, deal_no: int, title: str):
         "title": title,
         "addr_gen": g.get("addr_gen", 0) + 1,
     })
+    # RACE FIX: a reused group must not be nuked by a stale pending_cleanup
+    # flag - the cleanup loop would revoke the NEW deal's fresh invite link,
+    # which is exactly the "this invite link has expired" bug.
+    pc = pool.get("pending_cleanup", [])
+    key = str(chat_id)
+    if key in pc:
+        pc.remove(key)
+        logger.info(f"mark_active: dropped stale pending_cleanup for {chat_id} (reused)")
     _save_pool(pool)
 
 
@@ -415,16 +423,18 @@ async def _prepare_spare_group(entity, new_title: str) -> bool:
         return False
     await _clear_group_history(entity)
     await _kick_non_service(entity)
-    # Preserve the active deal's link (if any) — users never see "expired".
-    _keep = None
+    # Revoke ALL old invite links - a reused spare always gets a freshly
+    # exported link afterwards, so nobody ever taps an "expired" link
+    # from a previous deal.
+    await _revoke_invite_links(entity)
     try:
         _pool = _load_pool()
         _g = _pool.get("groups", {}).get(str(_full_chat_id(entity.id)), {})
-        if isinstance(_g, dict):
-            _keep = _g.get("active_link")
+        if isinstance(_g, dict) and "active_link" in _g:
+            _g.pop("active_link", None)
+            _save_pool(_pool)
     except Exception:
         pass
-    await _revoke_invite_links(entity, keep_link=_keep)
     return True
 
 
@@ -436,14 +446,46 @@ def _load_deal_states_file() -> dict:
         return {}
 
 
-async def _recycle_group_to_spare(chat_id: int, title: str) -> bool:
+async def _kick_non_admins(channel):
+    """Kick everyone except service accounts, bots, and channel admins.
+
+    Used by the admin-triggered bulk cleanup: human admins stay, everyone
+    else goes, so the group is empty but still manageable.
+    """
+    try:
+        keep = await _service_ids()
+        try:
+            async for u in user_client.iter_participants(channel, filter=ChannelParticipantsAdmins):
+                keep.add(u.id)
+        except Exception as e:
+            logger.warning(f"admin list fetch failed: {e}")
+        n = 0
+        async for u in user_client.iter_participants(channel):
+            if u.id in keep or getattr(u, "bot", False):
+                continue
+            try:
+                await user_client(EditBannedRequest(
+                    channel, u.id,
+                    ChatBannedRights(until_date=None, view_messages=True)))
+                n += 1
+            except Exception as e:
+                logger.warning(f"kick {u.id} failed: {e}")
+        logger.info(f"kicked {n} non-admin users from recycled group")
+    except Exception as e:
+        logger.warning(f"kick non-admins failed: {e}")
+
+
+async def _recycle_group_to_spare(chat_id: int, title: str, keep_admins: bool = False) -> bool:
     try:
         entity = await user_client.get_entity(chat_id)
     except Exception as e:
         logger.error(f"recycle: get_entity {chat_id} failed: {e}")
         return False
     await _clear_group_history(entity)
-    await _kick_non_service(entity)
+    if keep_admins:
+        await _kick_non_admins(entity)
+    else:
+        await _kick_non_service(entity)
     # Deal is over — revoke all links and clear the stored active link.
     await _revoke_invite_links(entity)
     try:
@@ -550,11 +592,23 @@ async def cleanup_loop():
             if not pending and not link_reqs:
                 await asyncio.sleep(600)
                 continue
+            deal_states = _load_deal_states_file()
             for cid_str in list(pending):
                 try:
                     cid = int(cid_str)
                 except (ValueError, TypeError):
                     pending.remove(cid_str)
+                    continue
+                g = pool.get("groups", {}).get(cid_str)
+                if isinstance(g, dict) and g.get("status") == "spare":
+                    # Already recycled - drop the stale flag.
+                    pending.remove(cid_str)
+                    continue
+                st = deal_states.get(cid_str)
+                if st and st.get("payment_confirmed_at"):
+                    # Paid after being flagged - never recycle; drop the flag.
+                    pending.remove(cid_str)
+                    logger.info(f"cleanup: {cid} paid after flagging, skipping")
                     continue
                 title = pool.get("groups", {}).get(cid_str, {}).get(
                     "title", GROUP_BASE_NAME)
@@ -596,6 +650,102 @@ async def cleanup_loop():
         except Exception as e:
             logger.error(f"cleanup loop error: {e}")
         await asyncio.sleep(600)  # check every 10 min
+
+
+# ==================== BULK CLEANUP (admin-triggered) ====================
+
+async def _bulk_cleanup_unused_groups():
+    """Immediately recycle EVERY unpaid/unused deal group (admin-triggered).
+
+    Paid deals (payment_confirmed_at) are never touched. Groups with
+    activity in the last 60 minutes are skipped for safety.
+    Returns (cleaned, skipped_paid, skipped_active, error).
+    """
+    if not USER_CLIENT_AVAILABLE:
+        return (0, 0, 0, "user client unavailable")
+    if not await ensure_client_connected(user_client, "NEW"):
+        return (0, 0, 0, "could not connect user client")
+    pool = _load_pool()
+    # --- discover deal groups not yet tracked ---
+    try:
+        async for d in user_client.iter_dialogs():
+            ent = d.entity
+            if not getattr(ent, "megagroup", False):
+                continue
+            title = getattr(ent, "title", "") or ""
+            if not title.startswith(GROUP_BASE_NAME):
+                continue
+            cid = _full_chat_id(ent.id)
+            if str(cid) not in pool["groups"]:
+                created = getattr(ent, "date", None)
+                pool["groups"][str(cid)] = {
+                    "created_at": created.timestamp() if created else time.time(),
+                    "status": "spare" if title.endswith("\u267b\ufe0f") else "active",
+                    "deal_no": None,
+                    "title": title,
+                    "addr_gen": 0,
+                }
+    except Exception as e:
+        logger.error(f"bulk cleanup discovery failed: {e}")
+    deal_states = _load_deal_states_file()
+    now = time.time()
+    cleaned, skipped_paid, skipped_active = 0, 0, 0
+    for cid_str, g in list(pool["groups"].items()):
+        if g.get("status") == "spare":
+            continue
+        cid = int(cid_str)
+        st = deal_states.get(cid_str)
+        if st and st.get("payment_confirmed_at"):
+            skipped_paid += 1
+            continue  # paid deal - never touch
+        try:
+            msgs = await user_client.get_messages(cid, limit=1)
+        except Exception:
+            continue
+        last_ts = msgs[0].date.timestamp() if msgs else g.get("created_at", 0)
+        if now - last_ts < 3600:
+            skipped_active += 1
+            continue  # active within the last hour - safety skip
+        title = g.get("title") or GROUP_BASE_NAME
+        logger.info(f"bulk cleanup: recycling {cid} '{title}'")
+        if await _recycle_group_to_spare(cid, title, keep_admins=True):
+            g["status"] = "spare"
+            cleaned += 1
+        else:
+            logger.warning(f"bulk cleanup: {cid} failed, left as-is")
+    _save_pool(pool)
+    return (cleaned, skipped_paid, skipped_active, None)
+
+
+@bot_client.on(events.NewMessage(pattern=r"^/cleanup_groups$"))
+async def cleanup_groups_handler(event):
+    """Admin-only: immediately recycle all unpaid/unused deal groups."""
+    try:
+        admin_ok = False
+        try:
+            admin_ent = await bot_client.get_entity(SUPPORT_CONTACT)
+            admin_ok = event.sender_id == admin_ent.id
+        except Exception:
+            pass
+        if not admin_ok:
+            await event.respond("\u26d4 <b>Admin only.</b>", parse_mode="html")
+            return
+        prog = await event.respond("\U0001f9f9 <b>Scanning deal groups...</b>", parse_mode="html")
+        cleaned, skipped_paid, skipped_active, err = await _bulk_cleanup_unused_groups()
+        if err:
+            await prog.edit(f"\u274c <b>Cleanup failed:</b> {html.escape(err)}", parse_mode="html")
+            return
+        await prog.edit(
+            f"\u2705 <b>Cleanup done!</b>\n\n"
+            f"\U0001f9f9 Recycled to spare: <b>{cleaned}</b>\n"
+            f"\U0001f4b0 Skipped (paid deals): <b>{skipped_paid}</b>\n"
+            f"\u23f3 Skipped (active in last hour): <b>{skipped_active}</b>\n\n"
+            f"Recycled groups will be reused for new deals with fresh links.\n"
+            f"Admins were kept; all other users were removed.",
+            parse_mode="html",
+        )
+    except Exception as e:
+        logger.error(f"cleanup_groups handler failed: {e}")
 
 
 # ==================== RATE LIMITING ====================
