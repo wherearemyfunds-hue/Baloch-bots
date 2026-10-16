@@ -45,7 +45,12 @@ if [ "$LOCAL" != "$REMOTE" ]; then
   git reset --hard origin/main || { echo "Reset failed!"; exit 1; }
 
   # Self-update: taake is script ke future fixes bhi agle run se lag jayen
-  cp "$REPO_DIR/auto_deploy.sh" /root/auto_deploy.sh
+  # NOTE: cp ki jagah atomic mv - chalti hui script ko cp se overwrite
+  # karne par bash purani line offsets par NAYI content parhta hai aur
+  # "command not found" / syntax errors se crash hota hai. mv naya inode
+  # banata hai, chalti script purani file par sahi rehti hai.
+  cp "$REPO_DIR/auto_deploy.sh" /tmp/auto_deploy.sh.new
+  mv /tmp/auto_deploy.sh.new /root/auto_deploy.sh
   chmod +x /root/auto_deploy.sh
 
   # Env files safe tareeqe se load karo (seed phrase me spaces hote hain,
