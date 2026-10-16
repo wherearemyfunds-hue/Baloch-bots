@@ -2559,24 +2559,49 @@ async def do_deal_question_answer(chat_id: int, user: types.User, answer_data: s
 # FEE SELECTION & OPTIONS (text version)
 # ----------------------------------------------
 
-async def do_fee_select(chat_id: int, user: types.User, fee_payer: str):
+async def do_fee_select(chat_id: int, user: types.User, fee_payer: str,
+                    auto_apply: bool = False):
     """Buyer OR seller proposes who pays the fee ('buyer' / 'seller' / 'half').
 
     Whoever proposes, the OTHER party confirms with yes/no. No more
     "Only the buyer can select" dead-end when the seller answers first.
+
+    auto_apply=True: fee was already agreed by BOTH parties in the batch Q&A -
+    apply it directly WITHOUT asking again.
     """
     state = deal_states.get(chat_id)
     if not state or state.get("stage") != "fee_selection":
         return
+    amount = state["amount"]
+    buyer_amount, seller_amount, fee = calculate_fee(amount, fee_payer)
+
+    if auto_apply:
+        # Already agreed - apply silently, never re-ask WHO pays.
+        state["fee_payer"] = fee_payer
+        state["buyer_amount"] = buyer_amount
+        state["seller_amount"] = seller_amount
+        state["fee"] = fee
+        if fee_payer == "buyer":
+            state["stage"] = "payment"
+            await show_payment_info(chat_id)
+        else:
+            # WHO is settled; seller still picks HOW (include/separate).
+            state["stage"] = "fee_option"
+            seller_name = await get_username(state["seller"], "Seller")
+            await bot.send_message(
+                chat_id,
+                f"{seller_name}, how would you like to pay the fee?\n"
+                f"Reply: <b>include</b> (fee included in deal amount) / <b>separate</b> (pay fee upfront separately)",
+                parse_mode="HTML",
+            )
+        return
+
     user_id = user.id
     if user_id != state.get("buyer") and user_id != state.get("seller"):
         return  # only the two deal parties may propose
     proposer = "buyer" if user_id == state.get("buyer") else "seller"
     confirmer = "seller" if proposer == "buyer" else "buyer"
     confirmer_id = state.get(confirmer)
-
-    amount = state["amount"]
-    buyer_amount, seller_amount, fee = calculate_fee(amount, fee_payer)
 
     state["temp_fee_payer"] = fee_payer
     state["temp_buyer_amount"] = buyer_amount
@@ -3324,9 +3349,10 @@ async def auto_payout(chat_id: int):
         save_deal_states()
         await bot.send_message(
             chat_id,
-            f"⚠️ Automatic payout failed ({reason}). "
-            f"Admin will send <b>{net} USDT</b> manually shortly.",
+            f"⚠️ Automatic payout failed ({reason}).\n"
+            f"@{ADMIN_USERNAME} please send <b>{net} USDT</b> manually shortly.",
             parse_mode="HTML",
+            reply_markup=_action_buttons_kb(),
         )
         await safe_notify_admin(
             f"💸 MANUAL PAYOUT NEEDED (auto failed)\nDeal: {chat_id}\n"
@@ -3486,9 +3512,10 @@ async def auto_refund(chat_id: int):
         save_deal_states()
         await bot.send_message(
             chat_id,
-            f"⚠️ Automatic refund failed ({reason}). "
-            f"Admin will send <b>{net} USDT</b> manually shortly.",
+            f"⚠️ Automatic refund failed ({reason}).\n"
+            f"@{ADMIN_USERNAME} please send <b>{net} USDT</b> manually shortly.",
             parse_mode="HTML",
+            reply_markup=_action_buttons_kb(),
         )
         await safe_notify_admin(
             f"💸 MANUAL REFUND NEEDED (auto failed)\nDeal: {chat_id}\n"
@@ -5068,10 +5095,10 @@ async def ask_deal_question(chat_id: int, question_index: int):
         # (Shawn: "aisa ho k insan easily escrow use kr skay" — no repeated questions.)
         fee_pref = state.get("fee_preference")
         if fee_pref in ("buyer", "seller", "half"):
-            # Auto-apply the already-confirmed fee preference.
+            # Auto-apply the already-confirmed fee preference - NEVER ask again.
             state["stage"] = "fee_selection"
             buyer_user = types.User(id=state["buyer"], is_bot=False, first_name="Buyer")
-            await do_fee_select(chat_id, buyer_user, fee_pref)
+            await do_fee_select(chat_id, buyer_user, fee_pref, auto_apply=True)
             return
         # Fallback: fee preference not set (old flow) -> ask
         state["stage"] = "fee_selection"
