@@ -193,6 +193,29 @@ def send_usdt(to_address: str, amount_usdt: float) -> dict:
     return send_usdt_from(_get_master_key(), to_address, amount_usdt)
 
 
+def _wait_tron_success(client, txid: str, timeout: int = 120) -> bool:
+    """Poll for the transaction receipt; True only if on-chain result is SUCCESS.
+
+    A broadcast txid alone does NOT mean the transfer worked (e.g. empty
+    sender balance => mined but FAILED).
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            info = client.get_transaction_info(txid)
+        except Exception:
+            info = None
+        if info:
+            receipt = info.get("receipt") or {}
+            result = str(receipt.get("result", "")).upper()
+            if result == "SUCCESS":
+                return True
+            if result:
+                return False  # FAILED / REVERT etc.
+        time.sleep(3)
+    return False  # timeout: unconfirmed
+
+
 def send_usdt_from(priv_key: PrivateKey, to_address: str, amount_usdt: float) -> dict:
     """
     Send USDT (TRC20) from a specific private key to address.
@@ -212,6 +235,11 @@ def send_usdt_from(priv_key: PrivateKey, to_address: str, amount_usdt: float) ->
         )
         result = txn.broadcast()
         txid = result.get("txid", "")
+        logger.info(f"TRON USDT submitted: {amount_usdt} -> {to_address}, txid={txid}")
+        # Verify on-chain success - broadcast alone does NOT mean it worked.
+        if not _wait_tron_success(client, txid):
+            logger.error(f"TRON USDT FAILED/unconfirmed on-chain: {txid}")
+            return {"ok": False, "error": "transaction failed or unconfirmed on-chain", "txid": txid}
         logger.info(f"USDT sent: {amount_usdt} -> {to_address}, txid={txid}")
         try:
             import tx_log
@@ -285,6 +313,19 @@ def send_usdt_from_with_gas(priv_key: PrivateKey, to_address: str, amount_usdt: 
     This is the 'just works' version — user never manually sends TRX.
     """
     from_addr = priv_key.public_key.to_base58check_address()
+    # Check the sender's USDT balance BEFORE funding gas: if the transfer is
+    # doomed (insufficient USDT), fail fast without wasting hot-wallet TRX.
+    try:
+        _client = _get_client()
+        _contract = _client.get_contract(USDT_CONTRACT)
+        _raw = int(_contract.functions.balanceOf(from_addr))
+        _bal = _raw / (10 ** USDT_DECIMALS)
+    except Exception as e:
+        logger.warning(f"TRON pre-send balance check failed ({e}); proceeding anyway")
+        _bal = None
+    if _bal is not None and _bal < amount_usdt:
+        logger.error(f"TRON payout blocked: balance {_bal} < {amount_usdt}; no gas spent")
+        return {"ok": False, "error": f"insufficient USDT balance ({_bal}) for {amount_usdt} payout"}
     if not ensure_gas(from_addr):
         return {"ok": False, "error": "Could not fund gas (TRX). Hot wallet may be empty."}
     result = send_usdt_from(priv_key, to_address, amount_usdt)
