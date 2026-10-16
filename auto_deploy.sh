@@ -7,6 +7,26 @@ REPO_URL="https://github.com/wherearemyfunds-hue/Baloch-bots.git"
 REPO_DIR="/root/baloch-bots"
 VERSION_FILE="/root/.bot_version"
 
+# Kill a bot reliably: SIGTERM, wait up to 10s for it to die, then SIGKILL.
+# A half-dead telethon process keeps the .session sqlite file locked, which
+# makes the fresh instance crash with "database is locked" - leaving NO bot
+# running at all.
+kill_bot() {
+  local pattern="$1"
+  pkill -f "$pattern" 2>/dev/null
+  for i in $(seq 1 10); do
+    pgrep -f "$pattern" >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  pkill -9 -f "$pattern" 2>/dev/null
+  sleep 1
+  if pgrep -f "$pattern" >/dev/null 2>&1; then
+    echo "WARNING: $pattern still alive after SIGKILL!"
+    return 1
+  fi
+  return 0
+}
+
 # Pehli baar: repo clone karo
 if [ ! -d "$REPO_DIR" ]; then
   echo "[$(date)] Cloning repo..."
@@ -57,16 +77,14 @@ if [ "$LOCAL" != "$REMOTE" ]; then
   # Deal Manager Bot
   cp dealmanagerbot.py /root/dealmanagerbot.py
   python3 -m py_compile /root/dealmanagerbot.py || { echo "Syntax failed!"; exit 1; }
-  pkill -f dealmanagerbot.py
-  sleep 2
+  kill_bot dealmanagerbot.py
   set -a; source /root/.secrets/deal_manager.env; set +a
   nohup python3 /root/dealmanagerbot.py > /root/dealbot.log 2>&1 &
 
   # Escrow Bot
   cp dealcreaterbot.py /root/dealcreaterbot.py
   python3 -m py_compile /root/dealcreaterbot.py || { echo "Syntax failed!"; exit 1; }
-  pkill -f dealcreaterbot.py
-  sleep 2
+  kill_bot dealcreaterbot.py
   set -a; source /root/.secrets/escrow_bot.env; set +a
   nohup python3 /root/dealcreaterbot.py > /root/escrowbot.log 2>&1 &
 
@@ -74,8 +92,7 @@ if [ "$LOCAL" != "$REMOTE" ]; then
   if [ -f walletbot.py ]; then
     cp walletbot.py /root/walletbot.py
     python3 -m py_compile /root/walletbot.py || { echo "Wallet syntax failed!"; exit 1; }
-    pkill -f walletbot.py
-    sleep 2
+    kill_bot walletbot.py
     if [ -f /root/.secrets/wallet_bot.env ]; then
       set -a; source /root/.secrets/wallet_bot.env; set +a
       nohup python3 /root/walletbot.py > /root/walletbot.log 2>&1 &
