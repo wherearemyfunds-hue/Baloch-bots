@@ -41,8 +41,13 @@ from telethon.tl.functions.channels import (
     EditAdminRequest,
     EditTitleRequest,
     EditBannedRequest,
-    EditAboutRequest,
 )
+try:
+    from telethon.tl.functions.channels import EditAboutRequest
+    _HAS_EDIT_ABOUT = True
+except ImportError:
+    EditAboutRequest = None
+    _HAS_EDIT_ABOUT = False
 from telethon.tl.functions.messages import (
     ExportChatInviteRequest,
     ImportChatInviteRequest,
@@ -425,7 +430,10 @@ async def _prepare_spare_group(entity, new_title: str) -> bool:
     # Also refresh the about/description - otherwise the preview shows the
     # OLD deal number (e.g. title "Deal 3135" but about "Deal #3118"), which
     # looks like a wrong/expired group to users.
+    # (Skipped on old telethon without EditAboutRequest.)
     try:
+        if not _HAS_EDIT_ABOUT:
+            raise RuntimeError("EditAboutRequest not available in this telethon")
         _m = re.search(r"(\d+)\s*$", new_title)
         _num = _m.group(1) if _m else ""
         if _num:
