@@ -1338,6 +1338,18 @@ async def handle_payment_detected(chat_id: int, actual_amount: float, difference
         logger.error(f"Error handling payment detection for chat {chat_id}: {e}")
 
 
+def _action_buttons_kb():
+    """Shared Quick Actions keyboard: Release To Seller / Release Partial / Refund to Buyer / Dispute.
+    Cancel handlers attach this to the cancellation notice itself so the panel is
+    never sent twice (no doubled buttons)."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Release To Seller", callback_data="release")],
+        [InlineKeyboardButton(text="Release Partial", callback_data="release_partial")],
+        [InlineKeyboardButton(text="Refund to Buyer", callback_data="refund")],
+        [InlineKeyboardButton(text="⚠️ Dispute", callback_data="dispute")],
+    ])
+
+
 async def send_action_buttons_to_all(chat_id: int):
     """Send role-specific quick actions: HYBRID — buttons for payment
     actions (primary), typed commands as fallback.
@@ -1348,12 +1360,7 @@ async def send_action_buttons_to_all(chat_id: int):
     buyer_name = await get_username(state.get("buyer", 0), "Buyer")
     seller_name = await get_username(state.get("seller", 0), "Seller")
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Release To Seller", callback_data="release")],
-        [InlineKeyboardButton(text="Release Partial", callback_data="release_partial")],
-        [InlineKeyboardButton(text="Refund to Buyer", callback_data="refund")],
-        [InlineKeyboardButton(text="⚠️ Dispute", callback_data="dispute")],
-    ])
+    kb = _action_buttons_kb()
 
     await bot.send_message(
         chat_id,
@@ -3033,8 +3040,7 @@ async def do_release_cancel(chat_id: int, user: types.User):
         return
     state.pop("awaiting", None)
     state["stage"] = "work"
-    await bot.send_message(chat_id, "❌ <b>Release cancelled.</b> No money moved. Use the buttons below whenever you're ready.", parse_mode="HTML")
-    await send_action_buttons_to_all(chat_id)
+    await bot.send_message(chat_id, "❌ <b>Release cancelled.</b> No money moved. Use the buttons below whenever you're ready.", parse_mode="HTML", reply_markup=_action_buttons_kb())
 
 
 # ----------------------------------------------
@@ -3176,8 +3182,7 @@ async def do_release_partial_cancel(chat_id: int, user: types.User):
     state.pop("awaiting", None)
     state.pop("pending_release_amount", None)
     state["stage"] = "work"
-    await bot.send_message(chat_id, "❌ <b>Partial release cancelled.</b> No money moved. Use the buttons below whenever you're ready.", parse_mode="HTML")
-    await send_action_buttons_to_all(chat_id)
+    await bot.send_message(chat_id, "❌ <b>Partial release cancelled.</b> No money moved. Use the buttons below whenever you're ready.", parse_mode="HTML", reply_markup=_action_buttons_kb())
 
 
 # ----------------------------------------------
@@ -3551,8 +3556,7 @@ async def do_refund_cancel(chat_id: int, user: types.User):
         return
     state.pop("awaiting", None)
     state["stage"] = "work"
-    await bot.send_message(chat_id, "❌ <b>Refund cancelled.</b> No money moved. Use the buttons below whenever you're ready.", parse_mode="HTML")
-    await send_action_buttons_to_all(chat_id)
+    await bot.send_message(chat_id, "❌ <b>Refund cancelled.</b> No money moved. Use the buttons below whenever you're ready.", parse_mode="HTML", reply_markup=_action_buttons_kb())
 
 
 # ----------------------------------------------
