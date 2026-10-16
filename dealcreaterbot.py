@@ -41,6 +41,7 @@ from telethon.tl.functions.channels import (
     EditAdminRequest,
     EditTitleRequest,
     EditBannedRequest,
+    EditAboutRequest,
 )
 from telethon.tl.functions.messages import (
     ExportChatInviteRequest,
@@ -421,6 +422,20 @@ async def _prepare_spare_group(entity, new_title: str) -> bool:
     except Exception as e:
         logger.error(f"spare rename failed: {e}")
         return False
+    # Also refresh the about/description - otherwise the preview shows the
+    # OLD deal number (e.g. title "Deal 3135" but about "Deal #3118"), which
+    # looks like a wrong/expired group to users.
+    try:
+        _m = re.search(r"(\d+)\s*$", new_title)
+        _num = _m.group(1) if _m else ""
+        if _num:
+            await user_client(EditAboutRequest(
+                channel=entity,
+                about=f"{GROUP_BASE_NAME} #{_num} - Secure Transaction Group",
+            ))
+            logger.info(f"spare about updated to deal #{_num}")
+    except Exception as e:
+        logger.warning(f"spare about update failed: {e}")
     await _clear_group_history(entity)
     await _kick_non_service(entity)
     # Revoke ALL old invite links - a reused spare always gets a freshly
