@@ -226,6 +226,17 @@ def send_usdt_from(priv_key_hex: str, to_address: str, amount_usdt: float) -> di
         signed = acct.sign_transaction(tx)
         tx_hash = w3.eth.send_raw_transaction(_signed_raw_bytes(signed))
         txid = w3.to_hex(tx_hash)
+        logger.info(f"BSC USDT submitted: {amount_usdt} -> {to_address}, txid={txid}")
+        # A txid alone does NOT mean the transfer worked (e.g. empty sender
+        # balance => the tx is mined but FAILS). Verify the receipt status.
+        try:
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            if receipt.get("status") != 1:
+                logger.error(f"BSC USDT FAILED on-chain: {txid}")
+                return {"ok": False, "error": "transaction failed on-chain", "txid": txid}
+        except Exception as e:
+            logger.error(f"BSC USDT unconfirmed on-chain: {txid}: {e}")
+            return {"ok": False, "error": f"unconfirmed on-chain, check explorer before retrying: {e}", "txid": txid}
         logger.info(f"BSC USDT sent: {amount_usdt} -> {to_address}, txid={txid}")
         try:
             import tx_log
@@ -250,6 +261,19 @@ def send_usdt_from_with_gas(priv_key_hex: str, from_address: str,
     Send USDT from a derived address, auto-funding BNB for gas if needed.
     After payout, sweeps leftover BNB back to hot wallet (no waste!).
     """
+    # Check the sender's USDT balance BEFORE funding gas: if the transfer is
+    # doomed (insufficient USDT), fail fast without wasting hot-wallet BNB.
+    try:
+        from web3 import Web3
+        _c = _usdt_contract()
+        _raw = _c.functions.balanceOf(Web3.to_checksum_address(from_address)).call()
+        _bal = int(_raw) / (10 ** USDT_DECIMALS)
+    except Exception as e:
+        logger.warning(f"BSC pre-send balance check failed ({e}); proceeding anyway")
+        _bal = None
+    if _bal is not None and _bal < amount_usdt:
+        logger.error(f"BSC payout blocked: balance {_bal} < {amount_usdt}; no gas spent")
+        return {"ok": False, "error": f"insufficient USDT balance ({_bal}) for {amount_usdt} payout"}
     if not ensure_gas(from_address):
         return {"ok": False, "error": "Could not fund gas (BNB). Hot wallet may be empty."}
     result = send_usdt_from(priv_key_hex, to_address, amount_usdt)
