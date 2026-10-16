@@ -150,6 +150,35 @@ def withdraw_fee(chain: str) -> float:
     return float(get_setting("withdraw_fee_trc20"))
 
 
+# ----------------------------------------------
+# INTERNAL LEDGER - perfect per-deal accounting.
+# Additive only: money flow is unchanged. Entries live in deal state,
+# so they persist with the existing save_deal_states().
+# ----------------------------------------------
+def ledger_add(state: dict, entry_type: str, amount: float, **kwargs) -> dict:
+    """Append an entry to the deal's internal ledger."""
+    entry = {"type": entry_type, "amount": round(float(amount), 2), "at": time.time()}
+    for k, v in kwargs.items():
+        if v is not None:
+            entry[k] = v
+    state.setdefault("ledger", []).append(entry)
+    return entry
+
+
+def ledger_expected_balance(state: dict) -> float:
+    """Funds the deal SHOULD hold: deposits minus releases/refunds.
+    Compare with the on-chain balance to catch manual movements."""
+    bal = 0.0
+    for e in state.get("ledger", []):
+        t = e.get("type")
+        if t == "deposit":
+            bal += e.get("amount", 0)
+        elif t in ("release", "partial_release", "refund"):
+            bal -= e.get("amount", 0)
+    return round(bal, 2)
+
+
+
 # ---- Pause: block NEW deals while paused (ongoing deals continue) ----
 # Shawn (2026-10-13): admin can pause new deals from the DM admin panel.
 _pause_notice_at: dict[int, float] = {}
@@ -1250,6 +1279,8 @@ async def handle_payment_detected(chat_id: int, actual_amount: float, difference
             state["deposit_address"] = state.get(
                 "bsc_deposit_address" if chain == "bsc" else "tron_deposit_address",
                 state.get("deposit_address"))
+        # Internal ledger: record what actually arrived on-chain.
+        ledger_add(state, "deposit", actual_amount, chain=chain or state.get("chain", "tron"))
         # NOTE: do NOT cancel monitors here — the detecting monitor is calling us,
         # and cancelling the current task would abort this confirmation flow.
         # Sibling monitors exit on their own once stage leaves payment_monitoring
@@ -2899,6 +2930,48 @@ async def do_dispute_resolve(chat_id: int, user: types.User):
     await safe_notify_admin(f"[DISPUTE RESOLVED]\nChat: {chat_id}")
 
 
+async def do_ledger(chat_id: int, user: types.User):
+    """Admin-only: show the deal's internal ledger with expected vs on-chain balance."""
+    if chat_id not in deal_states:
+        return
+    if not _is_admin_user(user):
+        return  # silent for non-admins
+    state = deal_states[chat_id]
+    entries = state.get("ledger", [])
+    chain = state.get("chain", "tron")
+    if not entries:
+        await bot.send_message(chat_id, "📒 <b>Ledger is empty</b> for this deal (no deposits recorded yet).", parse_mode="HTML")
+        return
+    lines = []
+    for e in entries[-25:]:
+        tx = e.get("txid", "")
+        short = f" <code>{tx[:12]}...</code>" if tx else ""
+        lines.append(f"\u2022 {e.get('type', '?')}: <b>{e.get('amount', 0)}</b> USDT{short}")
+    expected = ledger_expected_balance(state)
+    addr = state.get("bsc_deposit_address", "") if chain == "bsc" else state.get("tron_deposit_address", "")
+    onchain = None
+    if addr:
+        try:
+            loop = asyncio.get_event_loop()
+            if chain == "bsc":
+                import bsc_pay
+                onchain = await loop.run_in_executor(None, bsc_pay.get_usdt_balance, addr)
+            else:
+                import tron_pay
+                onchain = await loop.run_in_executor(None, tron_pay.get_usdt_balance, addr)
+            onchain = round(onchain or 0, 2)
+        except Exception:
+            onchain = None
+    msg = "📒 <b>Deal Ledger</b>\n\n" + "\n".join(lines)
+    msg += f"\n\nExpected (ledger): <b>{expected}</b> USDT"
+    msg += f"\nOn-chain: <b>{onchain}</b> USDT" if onchain is not None else "\nOn-chain: <i>unavailable</i>"
+    if onchain is not None and abs(expected - onchain) > 0.01:
+        msg += "\n\n⚠️ <b>MISMATCH!</b> Funds may have been moved manually."
+    else:
+        msg += "\n✅ Balances match."
+    await bot.send_message(chat_id, msg, parse_mode="HTML")
+
+
 async def do_dispute(chat_id: int, user: types.User):
     """Anyone raises a dispute. FREEZES the deal: release/refund blocked until admin resolves."""
     if chat_id not in deal_states:
@@ -3246,6 +3319,27 @@ async def auto_payout(chat_id: int):
         return
 
     loop = asyncio.get_event_loop()
+
+    # Internal-ledger guard: verify the deal address really holds the funds
+    # before attempting payout (catches manual withdrawals).
+    try:
+        _chk_addr = state.get("bsc_deposit_address", "") if chain == "bsc" else state.get("tron_deposit_address", "")
+        _chk_bal = None
+        if _chk_addr:
+            if chain == "bsc":
+                import bsc_pay as _bpay
+                _chk_bal = await loop.run_in_executor(None, _bpay.get_usdt_balance, _chk_addr)
+            else:
+                import tron_pay as _tpay
+                _chk_bal = await loop.run_in_executor(None, _tpay.get_usdt_balance, _chk_addr)
+        if _chk_bal is not None and round(_chk_bal, 2) < net:
+            await _fail(f"insufficient deal balance ({round(_chk_bal, 2)} < {net} USDT) - funds may have been moved manually")
+            return
+    except Exception as _e:
+        # RPC hiccup: log and continue with the previous behaviour (never block
+        # a legitimate payout just because the balance check failed).
+        logger.warning(f"[AutoPayout] balance pre-check failed: {_e}")
+
     try:
         if chain == "bsc":
             import bsc_pay
@@ -3290,6 +3384,9 @@ async def auto_payout(chat_id: int):
         else:
             state["stage"] = "work"
         state.pop("payout_in_progress", None)
+        # Internal ledger: record what actually left the deal address (net).
+        ledger_add(state, "partial_release" if not fully_paid else "release",
+                   net, gross=amount, fee=wfee, txid=txid, to=to_address)
         save_deal_states()
 
         seller_name = await get_username(state.get("seller", 0), "Seller")
@@ -3420,6 +3517,9 @@ async def auto_refund(chat_id: int):
         state["refund_auto"] = True
         state["stage"] = "refunded"
         state.pop("refund_in_progress", None)
+        save_deal_states()
+        # Internal ledger: record the refund (net) that left the deal address.
+        ledger_add(state, "refund", net, gross=amount, fee=wfee, txid=txid, to=to_address)
         save_deal_states()
 
         buyer_name = await get_username(state.get("buyer", 0), "Buyer")
@@ -3826,6 +3926,9 @@ async def route_text_command(message: types.Message) -> bool:
             return True
         if cmd in ("resolve dispute", "close dispute", "unfreeze deal"):
             await do_dispute_resolve(chat_id, user)
+            return True
+        if cmd in ("ledger", "deal ledger", "hisab", "hisaab"):
+            await do_ledger(chat_id, user)
             return True
         return False
 
