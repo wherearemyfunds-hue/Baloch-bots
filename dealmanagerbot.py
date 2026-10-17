@@ -724,6 +724,38 @@ async def send_role_prompt(chat_id: int, user_display: str = ""):
 # AI-POWERED DEAL ANALYSIS (CORE INTELLIGENCE)
 # ==============================================
 
+def _deterministic_fee_preference(text: str, sender_role: str) -> str | None:
+    """Deterministic fee-payer extraction. Overrides LLM when explicit.
+
+    The LLM once misread "Buyer pay fee" as seller. Explicit keyword
+    patterns are more reliable for clear statements - trust them over
+    the LLM guess.
+    """
+    t = text.lower()
+    # "buyer pay/pays/will pay fee" -> buyer
+    if re.search(r'\bbuyer\b[^.]{0,25}\bpay(?:s|ing)?\b[^.]{0,25}\bfee\b', t):
+        return "buyer"
+    # "seller pay/pays/will pay fee" -> seller
+    if re.search(r'\bseller\b[^.]{0,25}\bpay(?:s|ing)?\b[^.]{0,25}\bfee\b', t):
+        return "seller"
+    # "i'll/i will/i pay the fee" -> whoever is speaking
+    if re.search(r"\bi(?:'ll| will)?\s+pay\s+(?:the\s+)?fee\b", t):
+        return sender_role if sender_role in ("buyer", "seller") else None
+    # "fee on me" -> speaker
+    if re.search(r'\bfee\s+on\s+me\b', t):
+        return sender_role if sender_role in ("buyer", "seller") else None
+    # "half/50-50/split fee" -> half
+    if re.search(r'\b(half|50[\s\-/]*50|fifty[\s\-/]*fifty|split)\b[^.]{0,25}\bfee\b', t):
+        return "half"
+    if re.search(r'\bfee\b[^.]{0,25}\b(half|50[\s\-/]*50|split)\b', t):
+        return "half"
+    # "fee: buyer" / "fee - seller" patterns
+    m = re.search(r'\bfee\s*[:\-]\s*(buyer|seller|half)\b', t)
+    if m:
+        return m.group(1)
+    return None
+
+
 async def ai_analyze_deal_message(message_text: str, sender_role: str, conversation_context: str = "") -> dict:
     """
     AI analyzes a deal message. Fast, concise prompt for minimal latency.
@@ -734,7 +766,7 @@ Context: {ctx}
 Message: "{message_text}"
 Return JSON only:
 {{"is_deal_related":bool,"amount":number|null,"description":str|null,"deadline":str|null,"documents":list|null,"fee_preference":"buyer"|"seller"|"half"|null,"proof_of_completion":str|null,"account_age":str|null,"account_geo":str|null,"account_documents":list|null,"additional_info":str|null,"is_agreement":bool,"is_rejection":bool,"is_counter_offer":bool,"summary":"1 line"}}
-Rules: only extract EXPLICIT info, null if not mentioned. is_agreement=true if accepting/agreeing. is_rejection=true if declining/disagreeing."""
+Rules: only extract EXPLICIT info, null if not mentioned. is_agreement=true if accepting/agreeing. is_rejection=true if declining/disagreeing. fee_preference: read WHO pays very carefully - "Buyer pay fee" means buyer, "Seller pay fee" means seller."""
 
     try:
         response = await asyncio.wait_for(
@@ -757,6 +789,12 @@ Rules: only extract EXPLICIT info, null if not mentioned. is_agreement=true if a
             if m:
                 raw = m.group(0)
         result = json.loads(raw)
+        # Deterministic override: explicit "X pay fee" beats LLM guess.
+        _det_fee = _deterministic_fee_preference(message_text, sender_role)
+        if _det_fee:
+            if result.get("fee_preference") != _det_fee:
+                logger.info(f"Fee override: LLM said {result.get('fee_preference')}, deterministic says {_det_fee}")
+            result["fee_preference"] = _det_fee
         logger.info(f"AI deal analysis: {result}")
         return result
     except asyncio.TimeoutError:
