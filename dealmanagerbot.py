@@ -732,6 +732,11 @@ def _deterministic_fee_preference(text: str, sender_role: str) -> str | None:
     the LLM guess.
     """
     t = text.lower()
+    # Bare "buyer" / "seller" / "half" alone = answering "who pays the fee?"
+    # (e.g. after Price, user just writes "buyer"). Highest priority.
+    _bare = t.strip().strip(".,!?:;").strip().strip(chr(34)).strip(chr(39)).strip()
+    if _bare in ("buyer", "seller", "half"):
+        return _bare
     # "buyer pay/pays/will pay fee" -> buyer
     if re.search(r'\bbuyer\b[^.]{0,25}\bpay(?:s|ing)?\b[^.]{0,25}\bfee\b', t):
         return "buyer"
