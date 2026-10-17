@@ -804,10 +804,18 @@ Rules: only extract EXPLICIT info, null if not mentioned. is_agreement=true if a
         return result
     except asyncio.TimeoutError:
         logger.warning("AI analysis timed out, using fallback")
-        return _fallback_deal_extraction(message_text)
+        _fb = _fallback_deal_extraction(message_text)
+        _det = _deterministic_fee_preference(message_text, sender_role)
+        if _det:
+            _fb["fee_preference"] = _det
+        return _fb
     except Exception as e:
         logger.error(f"AI deal analysis error: {e}")
-        return _fallback_deal_extraction(message_text)
+        _fb = _fallback_deal_extraction(message_text)
+        _det = _deterministic_fee_preference(message_text, sender_role)
+        if _det:
+            _fb["fee_preference"] = _det
+        return _fb
 
 
 async def ai_interpret_deal_question(answer_text: str, q_index: int) -> str | None:
@@ -3244,7 +3252,7 @@ async def do_release_partial(chat_id: int, user: types.User):
         f"Already released: <b>{released_total}</b> USDT\n"
         f"Remaining: <b>{remaining}</b> USDT\n\n"
         f"How much should be released to the seller now?\n"
-        f"Reply with the amount (less than the full amount; up to <b>{remaining}</b> USDT left — or type <b>cancel</b>).",
+        f"Reply with the amount (must be <b>less than {remaining} USDT</b> remaining — or type <b>cancel</b>).",
         parse_mode="HTML",
     )
 
@@ -3542,7 +3550,9 @@ async def auto_refund(chat_id: int):
     to_address = state.get("refund_address", "")
     fee_separate = state.get("fee_separate", False)
     deduct = state["fee"] if not fee_separate else (0 if state.get("fee_payer") == "seller" else state["fee"] / 2)
-    amount = round(state.get("buyer_amount", 0) - deduct, 2)
+    # After a partial release, only the REMAINING amount can be refunded.
+    released_total = round(state.get("released_total", 0), 2)
+    amount = round(state.get("buyer_amount", 0) - deduct - released_total, 2)
     wfee = withdraw_fee(chain)
     net = round(amount - wfee, 2)
     chain_label = "BNB Smart Chain (BEP20)" if chain == "bsc" else "TRON (TRC20)"
@@ -3677,6 +3687,7 @@ async def do_refund(chat_id: int, user: types.User):
     """Seller/admin types 'refund' - ask for typed confirmation."""
     state = deal_states.get(chat_id, {})
     if state.get("stage") != "work":
+        await bot.send_message(chat_id, "Refund is only available while the deal is active.", parse_mode="HTML")
         return
     if _is_frozen_for_user(state, user):
         await bot.send_message(chat_id, "🔒 <b>Deal is frozen due to an open dispute.</b> Refund is blocked until admin resolves.", parse_mode="HTML")
@@ -5408,12 +5419,16 @@ async def handle_dispute(callback: CallbackQuery):
 @dp.callback_query(F.data == "release")
 async def handle_release(callback: CallbackQuery):
     await callback.answer()
+    chat_id = callback.message.chat.id
     # Only delete if the clicker is authorized (buyer or admin).
-    state = deal_states.get(callback.message.chat.id, {})
+    state = deal_states.get(chat_id, {})
     authorized = (callback.from_user.id == state.get("buyer") or _is_admin_user(callback.from_user))
-    await do_release(callback.message.chat.id, callback.from_user)
+    await do_release(chat_id, callback.from_user)
     if not authorized:
         return
+    # Only delete the button message if the release flow actually started.
+    if deal_states.get(chat_id, {}).get("awaiting") != "release_confirm":
+        return  # release did not start - keep the buttons visible
     try:
         await callback.message.delete()
     except Exception:
@@ -5454,12 +5469,16 @@ async def handle_release_cancel(callback: CallbackQuery):
 @dp.callback_query(F.data == "release_partial")
 async def handle_release_partial(callback: CallbackQuery):
     await callback.answer()
+    chat_id = callback.message.chat.id
     # Only delete if the clicker is authorized (buyer or admin).
-    state = deal_states.get(callback.message.chat.id, {})
+    state = deal_states.get(chat_id, {})
     authorized = (callback.from_user.id == state.get("buyer") or _is_admin_user(callback.from_user))
-    await do_release_partial(callback.message.chat.id, callback.from_user)
+    await do_release_partial(chat_id, callback.from_user)
     if not authorized:
         return
+    # Only delete the button message if the partial flow actually started.
+    if deal_states.get(chat_id, {}).get("awaiting") != "partial_amount":
+        return  # partial did not start - keep the buttons visible
     try:
         await callback.message.delete()
     except Exception:
@@ -5531,12 +5550,19 @@ async def handle_address_reject(callback: CallbackQuery):
 @dp.callback_query(F.data == "refund")
 async def handle_refund(callback: CallbackQuery):
     await callback.answer()
+    chat_id = callback.message.chat.id
     # Only delete if the clicker is authorized (seller or admin).
-    state = deal_states.get(callback.message.chat.id, {})
+    state = deal_states.get(chat_id, {})
     authorized = (callback.from_user.id == state.get("seller") or _is_admin_user(callback.from_user))
-    await do_refund(callback.message.chat.id, callback.from_user)
+    # do_refund sets awaiting="refund_confirm" when it actually starts the flow.
+    # Only delete the button message if the flow started - otherwise the user
+    # is left with no buttons and no explanation.
+    state.pop("_refund_started", None)
+    await do_refund(chat_id, callback.from_user)
     if not authorized:
         return
+    if deal_states.get(chat_id, {}).get("awaiting") != "refund_confirm":
+        return  # refund did not start - keep the buttons visible
     try:
         await callback.message.delete()
     except Exception:
