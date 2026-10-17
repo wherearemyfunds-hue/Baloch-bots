@@ -3125,7 +3125,7 @@ async def do_dispute(chat_id: int, user: types.User):
 async def do_release(chat_id: int, user: types.User):
     """Buyer/admin types 'release' - ask for typed confirmation."""
     state = deal_states.get(chat_id, {})
-    if state.get("stage") != "work":
+    if state.get("stage") not in ("work", "payout_pending", "refund_pending"):
         return
     # Frozen deal: blocked for non-admins.
     if _is_frozen_for_user(state, user):
@@ -3219,7 +3219,7 @@ async def do_release_cancel(chat_id: int, user: types.User):
 async def do_release_partial(chat_id: int, user: types.User):
     """Buyer/admin taps 'Release Partial' - ask how much to release."""
     state = deal_states.get(chat_id, {})
-    if state.get("stage") != "work":
+    if state.get("stage") not in ("work", "payout_pending", "refund_pending"):
         return
     # Frozen deal: blocked for non-admins.
     if _is_frozen_for_user(state, user):
@@ -3686,7 +3686,7 @@ async def do_address_reject(chat_id: int, user: types.User):
 async def do_refund(chat_id: int, user: types.User):
     """Seller/admin types 'refund' - ask for typed confirmation."""
     state = deal_states.get(chat_id, {})
-    if state.get("stage") != "work":
+    if state.get("stage") not in ("work", "payout_pending", "refund_pending"):
         await bot.send_message(chat_id, "Refund is only available while the deal is active.", parse_mode="HTML")
         return
     if _is_frozen_for_user(state, user):
