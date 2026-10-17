@@ -1314,12 +1314,26 @@ async def group_link_handler(event):
         )
 
         # ---------- STEP 3: export invite link ----------
+        # WAIT after revocation: Telegram's revoke propagates asynchronously.
+        # Exporting immediately can return the just-revoked link (still cached
+        # as active server-side), which then shows "expired" to the user.
+        # This was the recurring "expired link" bug on reused groups.
+        if reused_spare_id:
+            await asyncio.sleep(3)
         invite_link = None
         try:
             inv = await user_client(ExportChatInviteRequest(peer=created_group))
             invite_link = getattr(inv, "link", None)
         except Exception as e:
             logger.error(f"Failed to export invite link: {e}")
+        # Safety: if we got no link (or the export raced), retry once after a pause.
+        if not invite_link and reused_spare_id:
+            await asyncio.sleep(3)
+            try:
+                inv = await user_client(ExportChatInviteRequest(peer=created_group))
+                invite_link = getattr(inv, "link", None)
+            except Exception as e:
+                logger.error(f"Retry export invite link failed: {e}")
         if not invite_link:
             await bot_client.send_message(
                 user_id,
