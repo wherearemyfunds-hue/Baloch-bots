@@ -540,30 +540,87 @@ async def cb_a_deals(callback: types.CallbackQuery):
         await callback.message.answer("🤝 No deal escrow addresses yet.")
         return
     lines = ["🤝 <b>Deal Escrow Funds</b>\n"]
-    kb_rows = []
-    shown = 0
-    for cid, chain, addr, hd_index, stage in deals[-12:]:  # last 12
+    # --- RPC health check: one cheap call per chain. ---------------------
+    # Balance helpers return 0.0 on RPC errors (the public BSC endpoint
+    # rate-limits bursts with -32005 "limit exceeded"), and the dust filter
+    # below would then silently HIDE funded deals. If a chain's RPC is
+    # unreachable right now, list its deals as "unknown" instead of hiding
+    # them, with a clear warning.
+    def _bsc_ok():
+        try:
+            return int(bsc_pay._get_w3().eth.block_number) > 0
+        except Exception:
+            return False
+
+    def _tron_ok():
+        try:
+            client = tron_pay._get_client()
+            get_bn = getattr(client, "get_latest_block_number", None)
+            if get_bn is None:
+                return True  # client has no probe; don't block the listing
+            return int(get_bn()) > 0
+        except Exception:
+            return False
+
+    bsc_ok, tron_ok = await asyncio.gather(
+        loop.run_in_executor(None, _bsc_ok),
+        loop.run_in_executor(None, _tron_ok),
+    )
+    chain_ok = {"bsc": bsc_ok, "tron": tron_ok}
+    if not bsc_ok:
+        lines.append("⚠️ <i>BSC network not responding — BSC balances unknown (not zero).</i>\n")
+    if not tron_ok:
+        lines.append("⚠️ <i>TRON network not responding — TRON balances unknown (not zero).</i>\n")
+
+    def _read_bal(chain, addr):
+        # Returns (usdt_bal, gas_bal), or (None, None) if this chain's RPC
+        # is down right now.
+        if not chain_ok[chain]:
+            return None, None
         if chain == "bsc":
-            bal = await loop.run_in_executor(None, bsc_pay.get_usdt_balance, addr)
-            gas = await loop.run_in_executor(None, bsc_pay.get_bnb_balance, addr)
+            return bsc_pay.get_usdt_balance(addr), bsc_pay.get_bnb_balance(addr)
+        return tron_pay.get_usdt_balance(addr), tron_pay.get_trx_balance(addr)
+
+    # Collect every deal worth showing FIRST, then take the last 12.
+    # (The old code sliced the last 12 entries BEFORE the balance check,
+    # which could hide funded deals sitting outside that window.)
+    # Each entry: (message line, keyboard row or None)
+    entries = []
+    for cid, chain, addr, hd_index, stage in deals:
+        bal, gas = await loop.run_in_executor(None, _read_bal, chain, addr)
+        no_key = " 🔑❌" if hd_index is None else ""
+        if bal is None:
+            entries.append((
+                f"• {CHAIN_LABEL[chain]} Chat {cid} — <b>?</b> USDT | <i>network busy, balance unknown</i> ({stage}){no_key}\n"
+                f"  <code>{addr}</code>",
+                None,
+            ))
+            continue
+        if bal < 1.0:
+            continue  # hide empty/dust addresses (< 1 USDT)
+        if chain == "bsc":
             gas_warn = " ⚠️" if gas < 0.004 else ""
             gas_txt = f"{gas:.4f} BNB{gas_warn}"
         else:
-            bal = await loop.run_in_executor(None, tron_pay.get_usdt_balance, addr)
-            gas = await loop.run_in_executor(None, tron_pay.get_trx_balance, addr)
             gas_warn = " ⚠️" if gas < 5 else ""
             gas_txt = f"{gas:.1f} TRX{gas_warn}"
-        if bal < 1.0:
-            continue  # hide empty/dust addresses (< 1 USDT)
-        shown += 1
-        no_key = " 🔑❌" if hd_index is None else ""
-        lines.append(f"• {CHAIN_LABEL[chain]} Chat {cid} — <b>{bal:.2f}</b> USDT | <b>{gas_txt}</b> ({stage}){no_key}\n  <code>{addr}</code>")
-        kb_rows.append([InlineKeyboardButton(
-            text=f"💸 Withdraw {bal:.2f} ({CHAIN_LABEL[chain]}) {cid}",
-            callback_data=f"deal_wd_{chain}_{cid}")])
-    if not shown:
+        entries.append((
+            f"• {CHAIN_LABEL[chain]} Chat {cid} — <b>{bal:.2f}</b> USDT | <b>{gas_txt}</b> ({stage}){no_key}\n"
+            f"  <code>{addr}</code>",
+            [InlineKeyboardButton(
+                text=f"💸 Withdraw {bal:.2f} ({CHAIN_LABEL[chain]}) {cid}",
+                callback_data=f"deal_wd_{chain}_{cid}")],
+        ))
+    if not entries:
         await callback.message.answer("🤝 No deal addresses with ≥ 1 USDT balance.")
         return
+    kb_rows = []
+    for line, kb_row in entries[-12:]:
+        lines.append(line)
+        if kb_row:
+            kb_rows.append(kb_row)
+    if len(entries) > 12:
+        lines.append(f"\n<i>Showing last 12 of {len(entries)}.</i>")
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
     await callback.message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb)
 
