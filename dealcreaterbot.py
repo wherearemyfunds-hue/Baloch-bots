@@ -1314,24 +1314,35 @@ async def group_link_handler(event):
         )
 
         # ---------- STEP 3: export invite link ----------
-        # WAIT after revocation: Telegram's revoke propagates asynchronously.
-        # Exporting immediately can return the just-revoked link (still cached
-        # as active server-side), which then shows "expired" to the user.
-        # This was the recurring "expired link" bug on reused groups.
-        if reused_spare_id:
-            await asyncio.sleep(3)
+        # REUSED groups: a bare ExportChatInviteRequest returns the group's
+        # PERMANENT link - the same string _prepare_spare_group just revoked
+        # in bulk, and Telegram can keep serving that revoked string, so
+        # users kept seeing "this invite link has expired". Passing a title
+        # forces Telegram to mint a BRAND-NEW invite link instead, so a
+        # reused group always hands out a fresh, working link.
+        async def _export_invite():
+            if reused_spare_id:
+                try:
+                    inv = await user_client(ExportChatInviteRequest(
+                        peer=created_group, title=f"Deal {group_num}"))
+                    link = getattr(inv, "link", None)
+                    if link:
+                        return link
+                except Exception as e:
+                    logger.warning(f"Fresh invite export failed, falling back: {e}")
+            inv = await user_client(ExportChatInviteRequest(peer=created_group))
+            return getattr(inv, "link", None)
+
         invite_link = None
         try:
-            inv = await user_client(ExportChatInviteRequest(peer=created_group))
-            invite_link = getattr(inv, "link", None)
+            invite_link = await _export_invite()
         except Exception as e:
             logger.error(f"Failed to export invite link: {e}")
-        # Safety: if we got no link (or the export raced), retry once after a pause.
+        # Safety: if we got no link, retry once after a pause.
         if not invite_link and reused_spare_id:
             await asyncio.sleep(3)
             try:
-                inv = await user_client(ExportChatInviteRequest(peer=created_group))
-                invite_link = getattr(inv, "link", None)
+                invite_link = await _export_invite()
             except Exception as e:
                 logger.error(f"Retry export invite link failed: {e}")
         if not invite_link:
