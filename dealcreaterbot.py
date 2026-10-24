@@ -392,7 +392,9 @@ async def _revoke_invite_links(channel, keep_link: str = None):
 
     The active deal's link is never revoked, so users never see
     "this link expired" while the deal is running.
+    Returns the set of link strings that were revoked.
     """
+    revoked = set()
     try:
         cur = await user_client(ExportChatInviteRequest(peer=channel))
         link = getattr(cur, "link", None)
@@ -400,6 +402,7 @@ async def _revoke_invite_links(channel, keep_link: str = None):
             try:
                 await user_client(EditExportedChatInviteRequest(
                     peer=channel, link=link, revoked=True))
+                revoked.add(link)
             except Exception as e:
                 logger.warning(f"revoke primary link failed: {e}")
     except Exception as e:
@@ -414,19 +417,25 @@ async def _revoke_invite_links(channel, keep_link: str = None):
                     continue  # never revoke the active deal's link
                 await user_client(EditExportedChatInviteRequest(
                     peer=channel, link=iv.link, revoked=True))
+                revoked.add(iv.link)
             except Exception:
                 pass
     except Exception as e:
         logger.warning(f"revoke extra links failed: {e}")
+    return revoked
 
 
-async def _prepare_spare_group(entity, new_title: str) -> bool:
-    """Rename + wipe + revoke a spare group for reuse. Returns True on success."""
+async def _prepare_spare_group(entity, new_title: str):
+    """Rename + wipe + revoke a spare group for reuse.
+
+    Returns the set of invite links revoked during prep on success,
+    or None on failure.
+    """
     try:
         await user_client(EditTitleRequest(channel=entity, title=new_title))
     except Exception as e:
         logger.error(f"spare rename failed: {e}")
-        return False
+        return None
     # Also refresh the about/description - otherwise the preview shows the
     # OLD deal number (e.g. title "Deal 3135" but about "Deal #3118"), which
     # looks like a wrong/expired group to users.
@@ -449,7 +458,7 @@ async def _prepare_spare_group(entity, new_title: str) -> bool:
     # Revoke ALL old invite links - a reused spare always gets a freshly
     # exported link afterwards, so nobody ever taps an "expired" link
     # from a previous deal.
-    await _revoke_invite_links(entity)
+    revoked_links = await _revoke_invite_links(entity)
     try:
         _pool = _load_pool()
         _g = _pool.get("groups", {}).get(str(_full_chat_id(entity.id)), {})
@@ -458,7 +467,7 @@ async def _prepare_spare_group(entity, new_title: str) -> bool:
             _save_pool(_pool)
     except Exception:
         pass
-    return True
+    return revoked_links
 
 
 def _load_deal_states_file() -> dict:
@@ -1252,16 +1261,19 @@ async def group_link_handler(event):
         created_group = None
         group_id = None
         reused_spare_id = None
+        revoked_links = set()
 
         spare_chat_id = _get_spare_group()
         if spare_chat_id:
             try:
                 _ent = await user_client.get_entity(spare_chat_id)
                 logger.info(f"Trying spare group reuse: {spare_chat_id}")
-                if await _prepare_spare_group(_ent, group_title):
+                _revoked = await _prepare_spare_group(_ent, group_title)
+                if _revoked is not None:
                     created_group = _ent
                     group_id = _ent.id
                     reused_spare_id = spare_chat_id
+                    revoked_links = _revoked
                     logger.info(f"REUSED spare group '{group_title}' ({spare_chat_id})")
             except Exception as e:
                 logger.error(f"Spare reuse failed, creating new: {e}")
@@ -1314,37 +1326,61 @@ async def group_link_handler(event):
         )
 
         # ---------- STEP 3: export invite link ----------
-        # REUSED groups: a bare ExportChatInviteRequest returns the group's
-        # PERMANENT link - the same string _prepare_spare_group just revoked
-        # in bulk, and Telegram can keep serving that revoked string, so
-        # users kept seeing "this invite link has expired". Passing a title
-        # forces Telegram to mint a BRAND-NEW invite link instead, so a
-        # reused group always hands out a fresh, working link.
+        # REUSED groups: exporting through the creator account keeps
+        # returning the group's old PERMANENT link - the one revoked in
+        # bulk during spare prep - so users kept seeing "this invite link
+        # has expired". Fix: force Telegram to REGENERATE the permanent
+        # link (legacy_revoke_permanent), and never hand out a link that
+        # sits in the revoked set - every candidate is verified and the
+        # export retries until a live link comes back. If none does, the
+        # user gets the honest "invite link failed" message below instead
+        # of a dead link.
+        async def _revoked_now():
+            """Links currently known revoked for this group."""
+            bad = set(revoked_links)
+            try:
+                me = await user_client.get_me()
+                invs = await user_client(GetExportedChatInvitesRequest(
+                    peer=created_group, admin_id=me.id, limit=100))
+                for iv in getattr(invs, "invites", []) or []:
+                    if getattr(iv, "revoked", False) and getattr(iv, "link", None):
+                        bad.add(iv.link)
+            except Exception as e:
+                logger.warning(f"revoked-link scan failed: {e}")
+            return bad
+
         async def _export_invite():
-            if reused_spare_id:
-                try:
-                    inv = await user_client(ExportChatInviteRequest(
-                        peer=created_group, title=f"Deal {group_num}"))
+            if not reused_spare_id:
+                inv = await user_client(ExportChatInviteRequest(peer=created_group))
+                return getattr(inv, "link", None)
+            attempts = (
+                {"legacy_revoke_permanent": True},  # regenerate permanent link
+                {"title": f"Deal {group_num}"},     # mint a brand-new link
+                {},                                 # bare export (last resort)
+            )
+            for _round in range(3):
+                bad = await _revoked_now()
+                for kwargs in attempts:
+                    try:
+                        inv = await user_client(ExportChatInviteRequest(
+                            peer=created_group, **kwargs))
+                    except TypeError:
+                        continue  # telethon too old for this parameter
+                    except Exception as e:
+                        logger.warning(f"invite export {kwargs} failed: {e}")
+                        continue
                     link = getattr(inv, "link", None)
-                    if link:
+                    if link and link not in bad:
                         return link
-                except Exception as e:
-                    logger.warning(f"Fresh invite export failed, falling back: {e}")
-            inv = await user_client(ExportChatInviteRequest(peer=created_group))
-            return getattr(inv, "link", None)
+                    logger.warning(f"export returned revoked link, retrying: {link}")
+                await asyncio.sleep(2)
+            return None
 
         invite_link = None
         try:
             invite_link = await _export_invite()
         except Exception as e:
             logger.error(f"Failed to export invite link: {e}")
-        # Safety: if we got no link, retry once after a pause.
-        if not invite_link and reused_spare_id:
-            await asyncio.sleep(3)
-            try:
-                invite_link = await _export_invite()
-            except Exception as e:
-                logger.error(f"Retry export invite link failed: {e}")
         if not invite_link:
             await bot_client.send_message(
                 user_id,
