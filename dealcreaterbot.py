@@ -51,10 +51,14 @@ except ImportError:
 from telethon.tl.functions.messages import (
     ExportChatInviteRequest,
     ImportChatInviteRequest,
+    CheckChatInviteRequest,
     EditExportedChatInviteRequest,
     GetExportedChatInvitesRequest,
 )
-from telethon.tl.types import ChatAdminRights, ChatBannedRights, ChannelParticipantsAdmins
+from telethon.tl.types import (
+    ChatAdminRights, ChatBannedRights, ChannelParticipantsAdmins,
+    ChannelParticipantsKicked,
+)
 
 # ==================== BASE DIRECTORY (absolute paths) ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -387,6 +391,32 @@ async def _kick_non_service(channel):
         logger.warning(f"kick sweep failed: {e}")
 
 
+async def _unban_all(channel):
+    """Lift every ban in the group.
+
+    Recycle kicks use permanent bans, so a reused group accumulates
+    banned users from its past lives - and a banned user can never open
+    a fresh invite link for this group (Telegram shows it as expired).
+    A reused group must start with a clean ban list. Safe right after
+    the kick sweep: kicked users still cannot return, because every
+    old invite link is revoked and the new one is minted afterwards.
+    """
+    try:
+        n = 0
+        async for u in user_client.iter_participants(
+                channel, filter=ChannelParticipantsKicked):
+            try:
+                await user_client(EditBannedRequest(
+                    channel, u.id, ChatBannedRights(until_date=None)))
+                n += 1
+            except Exception:
+                pass
+        if n:
+            logger.info(f"unbanned {n} past-life users from recycled group")
+    except Exception as e:
+        logger.warning(f"unban sweep failed: {e}")
+
+
 async def _revoke_invite_links(channel, keep_link: str = None):
     """Revoke all invite links EXCEPT keep_link (the active deal's link).
 
@@ -455,6 +485,7 @@ async def _prepare_spare_group(entity, new_title: str):
         logger.warning(f"spare about update failed: {e}")
     await _clear_group_history(entity)
     await _kick_non_service(entity)
+    await _unban_all(entity)
     # Revoke ALL old invite links - a reused spare always gets a freshly
     # exported link afterwards, so nobody ever taps an "expired" link
     # from a previous deal.
@@ -1349,6 +1380,18 @@ async def group_link_handler(event):
                 logger.warning(f"revoked-link scan failed: {e}")
             return bad
 
+        async def _link_opens(link):
+            """Ground-truth check: ask Telegram the way a user's app does
+            when the link is tapped (messages.checkChatInvite). Catches
+            links that look fine in the export list but are dead on tap."""
+            try:
+                h = link.split("/")[-1].replace("+", "")
+                await user_client(CheckChatInviteRequest(h))
+                return True
+            except Exception as e:
+                logger.warning(f"invite link does not open on check: {e}")
+                return False
+
         async def _export_invite():
             if not reused_spare_id:
                 inv = await user_client(ExportChatInviteRequest(peer=created_group))
@@ -1370,9 +1413,9 @@ async def group_link_handler(event):
                         logger.warning(f"invite export {kwargs} failed: {e}")
                         continue
                     link = getattr(inv, "link", None)
-                    if link and link not in bad:
+                    if link and link not in bad and await _link_opens(link):
                         return link
-                    logger.warning(f"export returned revoked link, retrying: {link}")
+                    logger.warning(f"export returned dead link, retrying: {link}")
                 await asyncio.sleep(2)
             return None
 
