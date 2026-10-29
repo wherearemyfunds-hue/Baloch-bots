@@ -112,6 +112,7 @@ NEW_SESSION = os.path.join(BASE_DIR, "escrow_new_user_session")
 OLD_SESSION = os.path.join(BASE_DIR, "escrow_old_user_session")
 BOT_SESSION = os.path.join(BASE_DIR, "escrow_bot_session")
 USERS_FILE = os.path.join(BASE_DIR, "known_users.json")
+ANIMATION_FILE = os.path.join(BASE_DIR, "escrow_animation.mp4")
 
 # Global flag: True if the NEW user client session is valid and can create groups.
 # Set during startup; when False the bot still responds but group creation is unavailable.
@@ -1190,6 +1191,13 @@ async def start_handler(event):
             [Button.inline("🔗 Get Escrow Group Link", b"get_group_link")],
             [Button.inline("❌ Cancel", b"cancel_main")],
         ]
+        # Welcome animation, sent above the welcome text. Optional file:
+        # if it is missing or fails, /start still sends the welcome message.
+        try:
+            if os.path.exists(ANIMATION_FILE):
+                await event.respond(file=ANIMATION_FILE)
+        except Exception as anim_e:
+            logger.error(f"Welcome animation failed: {anim_e}")
         await event.respond(
             "<b>🔒 Welcome to Baloch Escrow Bot!</b>\n\n"
             "<b>If you want to start an Escrow deal, click the button below to create a secure group.</b>\n\n"
